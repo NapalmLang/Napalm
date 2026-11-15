@@ -802,7 +802,43 @@ if (n === 1) {
 `do...while` executes its body at least once. `if` and `while` use Napalm's
 truthiness rules, not JS's.
 
-### 6.2 Classic for
+### 6.2 unless and until
+
+`unless` and `until` are syntactic sugar for `if` and `while` with the
+condition negated:
+
+```napalm
+unless (user.isAdmin) {
+    throw "forbidden";
+}
+
+let attempts = 0;
+until (connect() || attempts >= 3) {
+    attempts++;
+}
+
+do {
+    line = input.next();
+} until (line === null);
+```
+
+| Sugar | Equivalent |
+| --- | --- |
+| `unless (c) A` | `if (!(c)) A` |
+| `unless (c) A else B` | `if (!(c)) A else B` |
+| `until (c) A` | `while (!(c)) A` |
+| `do A until (c)` | `do A while (!(c))` |
+
+- The negation follows the same truthiness rules as `!`: `unless (x)` runs
+  its body when `x` is `false` or `null`.
+- `unless` accepts `else`, and can be chained with `else if`/`else unless`.
+  For readability, prefer `if` whenever an `else` branch is needed.
+- `break` and `continue` behave the same in `until` as in `while`.
+- They are pure parser desugarings: they generate exactly the same code as
+  their `if`/`while` equivalents, with no runtime cost.
+- As with `if` and `while`, the parentheses around the condition are required.
+
+### 6.3 Classic for
 
 ```napalm
 let total = 0;
@@ -822,7 +858,7 @@ There are no `break label`/`continue label` labels.
 it is in JavaScript with `let`. To capture a different value each time, pass it
 to a function that creates the closure.
 
-### 6.3 for...of and for...in
+### 6.4 for...of and for...in
 
 ```napalm
 for (const value of [10, 20]) {
@@ -3704,7 +3740,7 @@ Do not use the following as though they were available features:
 - `#private` fields, object descriptors, and the JS prototype API.
 - Wren syntax `construct`, `is`, `..`/`...` ranges, trailing block closures
   on calls, and imports such as `import "x" for Name`.
-- `fn` declarations, `else unless`, and Deferred APIs from old scripts.
+- `fn` declarations and Deferred APIs from old scripts.
 
 The presence of a token or internal test does not mean the public parser
 accepts it as a Napalm program.
@@ -3870,7 +3906,7 @@ they are engine-specific benchmarks.
 
 | File | Observed difference |
 | --- | --- |
-| [index.napalm](scripts/index.napalm) | Mixes `fn`, `else unless`, uninstalled JS methods, Promise executor, and Deferred. Its use of `|>` is now valid, but the other historical constructs still prevent the file from compiling unchanged. |
+| [index.napalm](scripts/index.napalm) | Mixes `fn`, uninstalled JS methods, Promise executor, and Deferred. Its use of `|>` is now valid, but the other historical constructs still prevent the file from compiling unchanged. |
 | [trycatch.napalm](scripts/trycatch.napalm) | Uses `fn` declarations; the manual's exception examples use `function`. |
 | [defer.napalm](scripts/defer.napalm) | The `errdefer (error)` binding must be written with bars. |
 

@@ -52,6 +52,47 @@ fn napalm_destructuring_assignments_parameters_and_captures() {
 }
 
 #[test]
+fn napalm_unless_and_until_negate_if_and_while() {
+    run_napalm(r#"
+        const events = [];
+        function classify(n) {
+            unless (n > 0) return "non-positive";
+            unless (n % 2 == 0) {
+                return "odd";
+            } else unless (n > 10) {
+                return "small even";
+            } else {
+                return "big even";
+            }
+        }
+        let n = 0;
+        until (n >= 3) n++;
+        let countdown = 3;
+        until (countdown == 0) {
+            events.add(countdown);
+            countdown--;
+        }
+        let once = 0;
+        do { once++; } until (true);
+        let loops = 0;
+        do {
+            loops++;
+        }
+        until (loops >= 4)
+        unless (null) events.add("falsy");
+        const result = [classify(-1), classify(3), classify(4), classify(12), n, events, once, loops];
+    "#, "[non-positive, odd, small even, big even, 3, [3, 2, 1, falsy], 1, 4]");
+}
+
+#[test]
+fn napalm_unless_and_until_require_parenthesized_conditions() {
+    for source in ["unless x { }", "until x { }", "do { } until x;", "do { } until"] {
+        let parsed = crate::napalm_front_main::parse("bad.nap", source);
+        assert!(parsed.has_errors(), "accepted invalid syntax: {source}");
+    }
+}
+
+#[test]
 fn napalm_destructuring_rejects_invalid_patterns_and_const_writes() {
     for source in [
         "const [...rest, last] = [1, 2];",

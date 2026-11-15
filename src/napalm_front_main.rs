@@ -1874,8 +1874,14 @@ impl<'a> Parser<'a> {
         if self.at("switch") {
             return self.error("`switch` is recognized JavaScript/TypeScript syntax but is not lowered yet");
         }
-        let kind = if self.eat("if") {
+        let kind = if self.at("if") || self.at("unless") {
+            // `unless (c)` is sugar for `if (!(c))`, including its `else` branch.
+            let negate = self.eat("unless");
+            if !negate {
+                self.bump();
+            }
             let condition = self.condition()?;
+            let condition = if negate { negated(condition) } else { condition };
             let then_branch = Box::new(self.statement()?);
             self.lines();
             let else_branch = if self.eat("else") {
@@ -1888,8 +1894,14 @@ impl<'a> Parser<'a> {
                 then_branch,
                 else_branch,
             }
-        } else if self.eat("while") {
+        } else if self.at("while") || self.at("until") {
+            // `until (c)` is sugar for `while (!(c))`.
+            let negate = self.eat("until");
+            if !negate {
+                self.bump();
+            }
             let condition = self.condition()?;
+            let condition = if negate { negated(condition) } else { condition };
             StmtKind::While {
                 condition,
                 body: Box::new(self.statement()?),
@@ -1898,8 +1910,12 @@ impl<'a> Parser<'a> {
         } else if self.eat("do") {
             let body = Box::new(self.statement()?);
             self.lines();
-            self.expect("while")?;
+            let negate = self.eat("until");
+            if !negate {
+                self.expect("while")?;
+            }
             let condition = self.condition()?;
+            let condition = if negate { negated(condition) } else { condition };
             self.eat(";");
             StmtKind::DoWhile { body, condition }
         } else if self.eat("for") {
@@ -5593,6 +5609,18 @@ fn promote_shared_initializer(expr: &mut Expr) {
         }
         _ => {}
     }
+}
+
+/// Logical negation used by `unless`/`until`, which desugar to `if`/`while`.
+fn negated(condition: Expr) -> Expr {
+    let span = condition.span;
+    Expr::new(
+        ExprKind::Unary {
+            operator: UnaryOp::Not,
+            operand: Box::new(condition),
+        },
+        span,
+    )
 }
 
 fn invoke(receiver: Expr, name: &str, args: Vec<Expr>, span: Span) -> Expr {

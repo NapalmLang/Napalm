@@ -75,11 +75,18 @@ test('Initialize, incremental sync, unknown request, shutdown, exit', onlyIfPres
     {jsonrpc: '2.0', method: 'exit'},
   ];
   const {responses} = await runServer(packets.map((item) => encodeFrame(item)));
-  assert.deepEqual(responses.map((item) => item.id), [1, 'no-method', 3]);
-  assert.equal(responses[0].result.capabilities.positionEncoding, 'utf-16');
-  assert.equal(responses[0].result.capabilities.textDocumentSync.change, 2);
-  assert.equal(responses[1].error.code, -32601);
-  assert.equal(responses[2].result, null);
+  assert.deepEqual(responses.filter((item) => Object.hasOwn(item, 'id')).map((item) => item.id), [1, 'no-method', 3]);
+  const publications = responses.filter((item) => item.method === 'textDocument/publishDiagnostics');
+  assert.equal(publications.length, 3);
+  assert.equal(publications[0].params.uri, uri);
+  assert.equal(publications[0].params.version, 1);
+  assert.equal(publications[1].params.version, 2);
+  assert.deepEqual(publications[2].params.diagnostics, []);
+  const requests = responses.filter((item) => Object.hasOwn(item, 'id'));
+  assert.equal(requests[0].result.capabilities.positionEncoding, 'utf-16');
+  assert.equal(requests[0].result.capabilities.textDocumentSync.change, 2);
+  assert.equal(requests[1].error.code, -32601);
+  assert.equal(requests[2].result, null);
 });
 
 test('Malformed JSON yields parse error, then the server recovers', onlyIfPresent, async () => {
@@ -104,4 +111,29 @@ test('Exit without shutdown uses the required nonzero exit code', onlyIfPresent,
   const packets = [encodeFrame({jsonrpc: '2.0', method: 'exit'})];
   const {responses} = await runServer(packets, {expectedExit: 1});
   assert.deepEqual(responses, []);
+});
+
+test('Lexer publishes UTF-16 diagnostics for unsaved documents and clears them', onlyIfPresent, async () => {
+  const uri = 'file:///project/lexical.napalm';
+  const messages = [
+    {jsonrpc: '2.0', id: 1, method: 'initialize', params: {capabilities: {}}},
+    {jsonrpc: '2.0', method: 'textDocument/didOpen', params: {
+      textDocument: {uri, languageId: 'napalm', version: 1, text: 'const a = "A😀é\n'},
+    }},
+    {jsonrpc: '2.0', method: 'textDocument/didChange', params: {
+      textDocument: {uri, version: 2}, contentChanges: [{text: 'const a = "A😀é";\n'}],
+    }},
+    {jsonrpc: '2.0', method: 'textDocument/didClose', params: {textDocument: {uri}}},
+    {jsonrpc: '2.0', id: 2, method: 'shutdown'},
+    {jsonrpc: '2.0', method: 'exit'},
+  ];
+  const {responses} = await runServer(messages.map(encodeFrame));
+  const diagnostics = responses.filter((item) => item.method === 'textDocument/publishDiagnostics');
+  assert.equal(diagnostics.length, 3);
+  assert.equal(diagnostics[0].params.version, 1);
+  assert.equal(diagnostics[0].params.diagnostics[0].code, 'NAPALM-LEX-001');
+  assert.equal(diagnostics[0].params.diagnostics[0].range.end.character, 15);
+  assert.equal(diagnostics[1].params.version, 2);
+  assert.deepEqual(diagnostics[1].params.diagnostics, []);
+  assert.deepEqual(diagnostics[2].params.diagnostics, []);
 });

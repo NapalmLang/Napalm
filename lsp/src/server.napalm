@@ -1,6 +1,7 @@
 // JSON-RPC 2.0 / LSP 3.17 lifecycle and text-document synchronization.
 import {sendFrame, logError} from "./transport";
-import {createDocumentStore, openDocument, changeDocument, closeDocument} from "./documents";
+import {tokenize} from "./lexer";
+import {createDocumentStore, openDocument, changeDocument, closeDocument, getDocument} from "./documents";
 
 export function createServerState() {
     return {
@@ -20,6 +21,35 @@ function respondError(id, code, message) {
 
 export function reportParseError() {
     respondError(null, -32700, "Parse error");
+}
+
+// Diagnostics operate exclusively on the editor's unsaved document snapshot.
+// Semantic/parser diagnostics will be added by later Napalm frontend passes.
+function publishLexicalDiagnostics(uri, version, source) {
+    const found = tokenize(source);
+    const diagnostics = [];
+    for (const diagnostic of found.diagnostics) {
+        diagnostics.push({
+            range: diagnostic.range,
+            severity: diagnostic.severity,
+            code: diagnostic.code,
+            source: "napalm-lexer",
+            message: diagnostic.message
+        });
+    }
+    sendFrame({
+        jsonrpc: "2.0",
+        method: "textDocument/publishDiagnostics",
+        params: {uri: uri, version: version, diagnostics: diagnostics}
+    });
+}
+
+function clearLexicalDiagnostics(uri) {
+    sendFrame({
+        jsonrpc: "2.0",
+        method: "textDocument/publishDiagnostics",
+        params: {uri: uri, diagnostics: []}
+    });
 }
 
 function validateRequestId(id) {
@@ -104,6 +134,13 @@ export function handleMessage(state, request) {
                 changeDocument(state["documents"], params);
             } else {
                 closeDocument(state["documents"], params);
+            }
+            const uri = params["textDocument"]["uri"];
+            if (method === "textDocument/didClose") {
+                clearLexicalDiagnostics(uri);
+            } else {
+                const document = getDocument(state["documents"], uri);
+                publishLexicalDiagnostics(uri, document["version"], document["text"]);
             }
             if (hasId) respond(id, null);
         } catch (error) {

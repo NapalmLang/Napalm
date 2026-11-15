@@ -236,6 +236,14 @@ fn byte_span_to_char_range(source: &str, span: Span) -> std::ops::Range<usize> {
 // Source type retention and static assignment checking
 // =============================================================================
 
+/// Static type of an unannotated variable or field from its initializer.
+/// A `null` initializer is a placeholder for a value assigned later, so the
+/// binding stays `any` instead of being constrained to `null`.
+fn infer_binding_type_annotation(initializer: &Expr) -> Option<TypeAnnotation> {
+    infer_surface_type_annotation(initializer)
+        .filter(|annotation| !matches!(annotation.kind, TypeAnnotationKind::Null))
+}
+
 fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
     use TypeAnnotationKind as K;
 
@@ -1134,7 +1142,7 @@ impl<'ast> Analyzer<'ast> {
                 } else {
                     let source_type = annotation
                         .clone()
-                        .or_else(|| initializer.as_ref().and_then(infer_surface_type_annotation));
+                        .or_else(|| initializer.as_ref().and_then(infer_binding_type_annotation));
                     let binding = self.declare_typed(name, source_type);
                     self.analysis.bindings[binding.0 as usize].shared = *shared;
                     if let Some(initializer) = initializer {
@@ -1976,7 +1984,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
             let source_type = annotation
                 .clone()
-                .or_else(|| initializer.as_ref().and_then(infer_surface_type_annotation));
+                .or_else(|| initializer.as_ref().and_then(infer_binding_type_annotation));
             if source_type.as_ref().is_some_and(|a| invalid_structural_annotation(a, &self.interface_types)) {
                 self.diagnostics.push(Diagnostic::error("NAPALM-T002", "unsupported field type in object interface", name.span));
             }
@@ -2314,7 +2322,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     )
                 })
                 .or_else(|| {
-                    field.initializer.as_ref().and_then(infer_surface_type_annotation).map(
+                    field.initializer.as_ref().and_then(infer_binding_type_annotation).map(
                         |annotation| {
                             resolve_type_annotation(
                                 &annotation,
@@ -3303,7 +3311,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             resolve_type_annotation(annotation, self.context.top_level_classes, self.context.interface_types)
         } else if initializer.is_some() {
             let actual = semantic_source_type(self.builder.value_type(value));
-            if matches!(actual, Type::Top) {
+            if matches!(actual, Type::Null) {
+                // `let x = null` is a placeholder for a value assigned later,
+                // not a `null`-only binding: without an annotation it is `any`.
+                Type::Top
+            } else if matches!(actual, Type::Top) {
                 self.context
                     .analysis
                     .binding(binding)
@@ -8626,6 +8638,33 @@ class Child is Parent {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "NAPALM-T001"));
+    }
+
+    #[test]
+    fn null_initialized_bindings_default_to_any() {
+        let source = r#"
+            let topLevel = null;
+            topLevel = "text";
+            {
+                let directory = null;
+                directory = "parent";
+                directory = 1;
+                directory = null;
+            }
+            function find() {
+                let found = null;
+                for (const item of [1, 2]) { found = `item ${item}`; }
+                found = [found];
+                return found;
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(
+            output.diagnostics.iter().all(|diagnostic| diagnostic.code != "NAPALM-T001"),
+            "unexpected type diagnostics: {:#?}",
+            output.diagnostics
+        );
     }
 
     #[test]

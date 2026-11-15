@@ -10,7 +10,7 @@
 
 use crate::napalm_collections::{HashMap, HashSet};
 use crate::napalm_mx_ir::*;
-use crate::napalm_mx_optimizer::{
+use crate::napalm_mx_ir_optimizer::{
     replace_expr_uses, Optimize, QueryOptimization,
 };
 
@@ -6115,7 +6115,7 @@ fn plan_table(query: &Query, id: PlanId) -> Option<TableId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::napalm_mx_optimizer::{MxOptimizer, Optimize};
+    use crate::napalm_mx_ir_optimizer::{MxOptimizer, Optimize};
 
     fn run_pass<P: QueryOptimization + 'static>(
         pass: P,

@@ -12,6 +12,10 @@ Napalm is the continuation of WrenJIT with a TypeScript-inspired syntax and a dy
 
 For the complete, current language reference and runnable examples, see [DOCUMENTATION.md](DOCUMENTATION.md).
 
+The embedded database frontend (`[[[ ... ]]]`, targeting SurrealMX) is documented
+in [MX.md](docs/MX.md). Parsing and lowering to MX IR are implemented; execution
+is still pending.
+
 Variable types are optional: the compiler checks known incompatible assignments. Object interfaces also install persistent runtime contracts, enforced through every alias and in the JIT. See [object interfaces](docs/INTERFACES.md). Napalm does **not** promise compatibility with the full TypeScript/JavaScript language, Node.js, or browser APIs.
 
 ## Stats

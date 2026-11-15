@@ -16,6 +16,8 @@ mod generators;
 #[logos(skip r"[ \t\r]+")]
 #[logos(skip(r"//[^\r\n]*", allow_greedy = true))]
 enum Kind {
+    #[token("[[[", mx_block)]
+    MxBlock,
     #[token("/*", comment)]
     Comment,
     #[token("\n")]
@@ -33,6 +35,16 @@ enum Kind {
     #[regex(r"===|!==|>>>|\?\?=|&&=|\|\|=|\*\*=|\?\.|\?\?|\.\.\.|\|>|==|!=|<=|>=|=>|\+\+|--|\+=|-=|\*=|/=|%=|\*\*|&&|\|\||<<|>>|[{}()\[\],;:.?+*/%~!&|^=<>@-]")]
     Symbol,
     Eof,
+}
+
+fn mx_block(lex: &mut logos::Lexer<'_, Kind>) -> bool {
+    if let Some(end) = crate::napalm_mx_front::block_end(lex.remainder()) {
+        lex.bump(end);
+        true
+    } else {
+        lex.bump(lex.remainder().len());
+        false
+    }
 }
 
 fn comment(lex: &mut logos::Lexer<'_, Kind>) -> bool {
@@ -74,6 +86,11 @@ fn quoted_end(bytes: &[u8], start: usize, depth: usize) -> Option<usize> {
 fn interpolation_end(bytes: &[u8], mut i: usize, depth: usize) -> Option<usize> {
     let mut braces = 0;
     while i < bytes.len() {
+        if bytes[i..].starts_with(b"[[[") {
+            let body = std::str::from_utf8(&bytes[i + 3..]).ok()?;
+            i += 3 + crate::napalm_mx_front::block_end(body)?;
+            continue;
+        }
         match bytes[i] {
             b'\'' | b'"' | b'`' => i = quoted_end(bytes, i, depth)?,
             b'/' if bytes[i..].starts_with(b"//") => {
@@ -497,6 +514,11 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Ok(kind) => tokens.push(Tok { kind, span }),
+                Err(_) if source[span.as_range()].starts_with("[[[") => diagnostics.push(Diagnostic::error(
+                    "MX-L002",
+                    "unterminated MX block; expected `]]]`",
+                    span,
+                )),
                 Err(_) => diagnostics.push(Diagnostic::error(
                     "NAPALM-L001",
                     "invalid token or unterminated string/comment",
@@ -3439,6 +3461,14 @@ impl<'a> Parser<'a> {
     }
 
     fn prefix(&mut self) -> Result<Expr> {
+        if self.peek().kind == Kind::MxBlock {
+            let span = self.peek().span;
+            self.pos += 1;
+            return match crate::napalm_mx_front::parse(&self.source[span.start + 3..span.end - 3], span.start + 3) {
+                Ok(block) => Ok(Expr::new(ExprKind::Mx(Box::new(block)), span)),
+                Err(diagnostic) => { self.diagnostics.push(diagnostic); Err(()) }
+            };
+        }
         if self.at("yield") {
             return self.generator_yield();
         }
@@ -5181,6 +5211,7 @@ fn rewrite_enum_member_references(
     current_member: &str,
 ) {
     match &mut expr.kind {
+        ExprKind::Mx(_) => {}
         ExprKind::Name(name) if name.value != current_member && members.contains(name.value.as_str()) => {
             let member = name.value.clone();
             let span = name.span;

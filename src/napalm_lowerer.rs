@@ -391,7 +391,8 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
         | ExprKind::Subscript { .. }
         | ExprKind::DestructureGet { .. }
         | ExprKind::DestructureRest { .. }
-        | ExprKind::OptionalChain { .. } => None,
+        | ExprKind::OptionalChain { .. }
+        | ExprKind::Mx(_) => None,
     }
 }
 
@@ -1257,6 +1258,7 @@ impl<'ast> Analyzer<'ast> {
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
         match &expr.kind {
+            ExprKind::Mx(_) => {}
             ExprKind::Null | ExprKind::Bool(_) | ExprKind::Number(_) | ExprKind::String(_) => {}
             ExprKind::InterpolatedString(parts) => {
                 for part in parts {
@@ -4651,6 +4653,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn lower_expr(&mut self, expr: &Expr) -> ValueId {
         self.set_source(expr.span);
         match &expr.kind {
+            ExprKind::Mx(_) => {
+                self.error("MX-B001", "MX blocks require the database execution backend; use napalm_mx_lowerer::lower to compile their AST to MX IR", expr.span);
+                self.builder.const_null()
+            }
             ExprKind::Null => self.builder.const_null(),
             ExprKind::Bool(value) => self.builder.const_bool(*value),
             ExprKind::Number(value) => self.builder.const_num(*value),
@@ -7578,7 +7584,7 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
                 collect_fields_expr(arg, instance, statics)
             }
         }
-        ExprKind::Null
+        ExprKind::Mx(_) | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)
         | ExprKind::String(_)
@@ -7872,7 +7878,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                 arity: 1,
             });
         }
-        ExprKind::Null
+        ExprKind::Mx(_) | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)
         | ExprKind::String(_)
@@ -8045,7 +8051,7 @@ fn collect_strings_expr<'ast>(expr: &'ast Expr, out: &mut BumpVec<'_, &'ast [u8]
                 collect_strings_expr(arg, out)
             }
         }
-        ExprKind::Null
+        ExprKind::Mx(_) | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)
         | ExprKind::Name(_)
@@ -8237,6 +8243,7 @@ fn collect_written_bindings_expr(
         ExprKind::Closure(_)
         | ExprKind::AsyncClosure(_)
         | ExprKind::ConcurrentClosure(_)
+        | ExprKind::Mx(_)
         | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)

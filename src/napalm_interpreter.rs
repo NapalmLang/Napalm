@@ -24848,8 +24848,8 @@ let result = r1 + r2 + r3 + r4 + r5;
             ("matrix[-3, -2]", "2"),
             ("matrix[0, 1] == matrix[0][1]", "true"),
             ("[[1], [2, 3]][1, -1]", "3"),
-            ("[[[10, 20]], [[30, 40]]][1, 0, 1]", "40"),
-            ("[[[10, 20]]][0, 0]", "[10, 20]"),
+            ("[ [[10, 20]], [[30, 40]]][1, 0, 1]", "40"),
+            ("[ [[10, 20]]][0, 0]", "[10, 20]"),
             ("[[null, true, \"text\"]][0, 0]", "null"),
             ("[[null, true, \"text\"]][0, 1]", "true"),
             ("[[null, true, \"text\"]][0, 2]", "text"),
@@ -24879,14 +24879,14 @@ let result = r1 + r2 + r3 + r4 + r5;
             var row = matrix[0]
             var assigned = (matrix[0, 1] = 20)
             matrix[-1, -1] = 40
-            var cube = [[[5]]]
+            var cube = [ [[5]]]
             cube[0, 0, 0] = 50
             var slice = matrix[0, 0..1]
             slice[0] = 999
             System.gc()
             // List literals carry element contracts: a fresh List<Num> can only
             // be stored where a List<Num> element is expected.
-            var refs = [[[0]]]
+            var refs = [ [[0]]]
             refs[0, 0] = [60]
             System.gc()
             return assigned + row[1] + matrix[1, 1] + cube[0, 0, 0] + refs[0, 0, 0] + matrix[0, 0]
@@ -24973,7 +24973,7 @@ let result = r1 + r2 + r3 + r4 + r5;
             };
             let source = format!(
                 "var matrix = {}{initial}{}\n{assignment}var result = matrix[{indices}]\n",
-                "[".repeat(dimensions), "]".repeat(dimensions),
+                "[ ".repeat(dimensions), "]".repeat(dimensions),
             );
             let (program, entry, manifest) = compile_napalm_module(&source);
             for jit_enabled in [false, true] {

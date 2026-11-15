@@ -234,7 +234,7 @@
         },
         {
           "name": "support.type.builtin.napalm",
-          "match": "(?<![.\\w$])\\b(?:Number|String|Boolean|Null|Array|List|Map|Set|Range|Bytes|ByteBuffer|Date|File|FileInfo|FileWatcher|InputStream|OutputStream|Promise|Event|Emitter|Channel|Receiver|Generator|Fiber)\\b"
+          "match": "(?<![.\\w$])\\b(?:Number|String|Boolean|Null|Array|List|Map|Set|Range|Bytes|ByteBuffer|Date|File|FileInfo|FileWatcher|InputStream|OutputStream|Package|Promise|Event|Emitter|Channel|Receiver|Generator|Fiber)\\b"
         }
       ]
     },

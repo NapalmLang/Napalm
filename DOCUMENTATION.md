@@ -61,6 +61,7 @@ presented as existing features.
 41. [Fs](#41-fs)
 42. [Path](#42-path)
 43. [Uri](#43-uri)
+44. [Package (.orange)](#44-package)
 
 ### How to Read the Examples
 
@@ -491,6 +492,7 @@ carry generic or contract information include it:
 | `new Emitter<number>()`, its `.event` | `Emitter<Number>`, `Event<Number>` |
 | Channel / Receiver | `Channel`, `Receiver` (with `<T>` when typed) |
 | `Fs.stat(path)`, `Fs.open(path, mode)` | `FileInfo`, `File` |
+| `Package.package(name)` | `Package` |
 | Date, Proxy, Range, Fiber, Generator, Module | `Date`, `Proxy`, `Range`, `Fiber`, `Generator`, `Module` |
 | native decorator | `NativeDecorator` |
 
@@ -4554,3 +4556,86 @@ System.print(Uri.toFilePath(Uri.parse(uri))); // /tmp/hello world.txt
 ```
 
 See [scripts/path.napalm](scripts/path.napalm) for Path and Uri examples.
+
+## 44. Package
+
+`.orange` is the official Napalm package format; dependencies are distributed
+as `.orange` files. A package is always a tar archive compressed as a single
+Zstandard frame at level 18, the highest ratio before decompression speed drops
+noticeably. Neither the format nor the level is configurable.
+
+The `.orange` extension is mandatory on disk and optional in paths passed to
+`Package`: `Package.unpackage("deps/http")` reads `deps/http.orange`, and
+`Package.package("http.orange")` is the same as `Package.package("http")`. Any
+other extension gets `.orange` appended, so `Package.unpackage("http.tar.zst")`
+looks for `http.tar.zst.orange`. Relative paths are resolved against the working
+directory. Like `Fs`, every operation is blocking.
+
+### 44.1 Static Methods
+
+| Method | Result and behavior |
+| --- | --- |
+| `Package.package(name)` | Returns a new `Package` builder. `name` is a file name without path separators; choose the output folder with `setPackageDest`. Nothing is written until `finish()`. |
+| `Package.unpackage(path, dest = "./")` | Extracts the package into `dest`, creating it if needed and overwriting existing files. Returns an Array of the extracted file paths, each joined with `dest` as `Path.join` would. |
+
+### 44.2 Builder Methods
+
+`Package` supports type annotations and `instanceof`. Every method except
+`finish()` returns the same builder, so calls can be chained.
+
+| Method | Behavior |
+| --- | --- |
+| `addFile(path)` | Adds a regular file to the root of the archive, under its file name. |
+| `addFiles(paths)` | Adds an Array of files as `addFile` does. If any path is invalid, none of them is added. |
+| `addFolder(path)` | Adds a folder and everything inside it, keeping its path (see below). |
+| `setPackageDest(folder)` | Folder where `finish()` writes `<name>.orange`. Defaults to `"./"`; created if missing. |
+| `finish()` | Writes the package and returns its path. Can be called again to rebuild it. |
+
+`addFolder` stores the folder at its path relative to the working directory,
+with leading `..` components removed. When nothing is left, for example for
+`"./"`, `"../"`, or an ancestor of the working directory, or when the folder is
+on another drive, the folder's own name is used:
+
+| Working directory | `addFolder(...)` | Stored in the archive as |
+| --- | --- | --- |
+| `/work/app` | `"src/lib"` | `src/lib/...` |
+| `/work/app` | `"../../package/zeta"` | `package/zeta/...` |
+| `/work/app` | `"./"` | `app/...` |
+| `/work/app` | `"../"` | `work/...` |
+| `/work/app` | `"/srv/shared/pkg"` | `srv/shared/pkg/...` |
+| `C:\work\app` | `"D:\deps\zeta"` | `zeta/...` |
+
+Paths are checked when they are added: a missing path, a folder passed to
+`addFile`, a file passed to `addFolder`, or two entries that would share the
+same archive path all throw. Paths are resolved when added, so a later
+`Process.chdir` does not change what `finish()` reads. `finish()` reads the
+folders at that moment, in name order, including empty folders. A package with
+nothing added cannot be finished.
+
+### 44.3 Format and Safety
+
+- Packages are reproducible: identical inputs produce byte-identical `.orange`
+  files. Tar headers carry no owners or timestamps, so extracted files get the
+  current time.
+- `finish()` writes `<dest>/.<name>.orange.partial` first and renames it into
+  place, so an interrupted build never leaves a truncated package. A previous
+  build of the same package inside a packaged folder is left out.
+- Only regular files and folders are allowed. `finish()` throws on symlinks or
+  special files inside a packaged folder; a symlink passed directly to
+  `addFile` is stored as the file it points to.
+- `unpackage` throws on links, special files, and entries that would land
+  outside `dest`. Entries already extracted before the error stay on disk.
+
+```napalm
+const created = Package.package("http")
+    .addFiles(["README.md", "LICENSE"])
+    .addFolder("src")
+    .setPackageDest("dist")
+    .finish();
+System.print(created); // dist/http.orange
+
+const files = Package.unpackage("dist/http", "vendor/http");
+System.print(files.length); // number of extracted files
+```
+
+See [scripts/package.napalm](scripts/package.napalm) for a complete example.

@@ -10,13 +10,13 @@ use std::env;
 const MAX_PATH_INPUT: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Flavor {
+pub(super) enum Flavor {
     Posix,
     Windows,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum PathRoot {
+pub(super) enum PathRoot {
     Relative,
     Posix,
     WinRooted,
@@ -25,14 +25,14 @@ enum PathRoot {
 }
 
 #[derive(Clone, Debug)]
-struct LexPath {
-    flavor: Flavor,
-    root: PathRoot,
-    components: Vec<String>,
+pub(super) struct LexPath {
+    pub(super) flavor: Flavor,
+    pub(super) root: PathRoot,
+    pub(super) components: Vec<String>,
 }
 
 impl LexPath {
-    fn is_absolute(&self) -> bool {
+    pub(super) fn is_absolute(&self) -> bool {
         match &self.root {
             PathRoot::Relative => false,
             PathRoot::Drive { absolute, .. } => *absolute,
@@ -81,13 +81,24 @@ impl LexPath {
         parent.render()
     }
 
-    fn basename(&self) -> &str {
+    pub(super) fn basename(&self) -> &str {
         self.components.last().map(String::as_str).unwrap_or_else(|| {
             if matches!(&self.root, PathRoot::Relative) { "." } else { "" }
         })
     }
 
-    fn comparable_root(&self, other: &LexPath) -> bool {
+    /// Number of leading components shared with `other`. Windows components
+    /// compare ASCII case-insensitively. Callers check `comparable_root` first.
+    pub(super) fn common_prefix_len(&self, other: &LexPath) -> usize {
+        self.components.iter().zip(&other.components)
+            .take_while(|(left, right)| match other.flavor {
+                Flavor::Windows => left.eq_ignore_ascii_case(right),
+                Flavor::Posix => left == right,
+            })
+            .count()
+    }
+
+    pub(super) fn comparable_root(&self, other: &LexPath) -> bool {
         match (&self.root, &other.root) {
             (PathRoot::Posix, PathRoot::Posix) => true,
             (PathRoot::WinRooted, PathRoot::WinRooted) => true,
@@ -111,7 +122,7 @@ fn windows_path(text: &str) -> bool {
         || text.contains('\\')
 }
 
-fn parse_path(text: &str) -> Result<LexPath, String> {
+pub(super) fn parse_path(text: &str) -> Result<LexPath, String> {
     if text.len() > MAX_PATH_INPUT {
         return Err("path exceeds maximum supported length".into());
     }
@@ -185,7 +196,7 @@ fn parse_path(text: &str) -> Result<LexPath, String> {
     Ok(path)
 }
 
-fn path_join(parts: &[String]) -> Result<String, String> {
+pub(super) fn path_join(parts: &[String]) -> Result<String, String> {
     let nonempty: Vec<&str> = parts.iter().map(String::as_str).filter(|s| !s.is_empty()).collect();
     if nonempty.is_empty() { return Ok(".".into()); }
     let windows = nonempty.iter().any(|part| windows_path(part));
@@ -202,13 +213,19 @@ fn path_join(parts: &[String]) -> Result<String, String> {
     Ok(parse_path(&combined)?.render())
 }
 
-fn current_directory() -> Result<String, String> {
+pub(super) fn current_directory() -> Result<String, String> {
     let cwd = env::current_dir().map_err(|err| format!("cannot resolve current directory: {err}"))?;
     cwd.into_os_string().into_string().map_err(|_| "current directory is not valid UTF-8".into())
 }
 
 fn path_resolve(parts: &[String]) -> Result<String, String> {
-    let mut path = current_directory()?;
+    path_resolve_from(current_directory()?, parts)
+}
+
+/// `Path.resolve` against an explicit absolute base instead of the process
+/// working directory.
+pub(super) fn path_resolve_from(base: String, parts: &[String]) -> Result<String, String> {
+    let mut path = base;
     for part in parts {
         if part.is_empty() { continue; }
         let incoming = parse_path(part)?;
@@ -245,15 +262,7 @@ fn path_relative(from: &str, to: &str) -> Result<String, String> {
     let left = parse_path(&path_resolve(&[from.into()])?)?;
     let right = parse_path(&path_resolve(&[to.into()])?)?;
     if !left.comparable_root(&right) { return Ok(right.render()); }
-    let mut common = 0;
-    while common < left.components.len() && common < right.components.len() {
-        let same = match right.flavor {
-            Flavor::Windows => left.components[common].eq_ignore_ascii_case(&right.components[common]),
-            Flavor::Posix => left.components[common] == right.components[common],
-        };
-        if !same { break; }
-        common += 1;
-    }
+    let common = left.common_prefix_len(&right);
     let mut output: Vec<String> = vec!["..".into(); left.components.len() - common];
     output.extend(right.components[common..].iter().cloned());
     if output.is_empty() { Ok(".".into()) }

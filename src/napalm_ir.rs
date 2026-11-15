@@ -579,10 +579,12 @@ pub enum BuiltinId {
     Process = 48,
     InputStream = 49,
     OutputStream = 50,
+    /// `.orange` package global and builder class.
+    Package = 51,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 52] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
@@ -597,6 +599,7 @@ impl BuiltinId {
         Self::Bytes, Self::ByteBuffer, Self::JSON, Self::Fs, Self::Path, Self::Uri,
         Self::FileInfo, Self::File,
         Self::Process, Self::InputStream, Self::OutputStream,
+        Self::Package,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -644,6 +647,7 @@ impl BuiltinId {
             Self::Process => "Process",
             Self::InputStream => "InputStream",
             Self::OutputStream => "OutputStream",
+            Self::Package => "Package",
         }
     }
     /// Module-layout key reserving this builtin. Native decorators use a hidden

@@ -100,6 +100,8 @@ mod fs_vm;
 mod json_vm;
 #[path = "napalm_process_vm.rs"]
 mod process_vm;
+#[path = "napalm_package_vm.rs"]
+mod package_vm;
 use crate::napalm_bytes::{NapalmBytes, NapalmByteBuffer};
 use crate::napalm_tracing_jit::{
     JitAction, SharedJitProfile, SharedJitRepository, SmallMapLiteralTraceInfo, TraceActivation,
@@ -3223,6 +3225,7 @@ enum HeapObject {
     File(Box<fs_vm::NapalmFile>),
     InputStream(process_vm::NativeInputStream),
     OutputStream(process_vm::NativeOutputStream),
+    Package(Box<package_vm::NapalmPackage>),
     List(Vec<Value>),
     Map(NapalmMap),
     Set { map: Value },
@@ -4224,6 +4227,7 @@ gc_descriptor!(GC_FILE_INFO, "Napalm.FileInfo", GcTraceLayout::Leaf);
 gc_descriptor!(GC_FILE, "Napalm.File", GcTraceLayout::Leaf);
 gc_descriptor!(GC_INPUT_STREAM, "Napalm.InputStream", GcTraceLayout::Leaf);
 gc_descriptor!(GC_OUTPUT_STREAM, "Napalm.OutputStream", GcTraceLayout::Leaf);
+gc_descriptor!(GC_PACKAGE, "Napalm.Package", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANGE, "Napalm.Range", GcTraceLayout::Leaf);
 gc_descriptor!(GC_DATE, "Napalm.Date", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANDOM, "Napalm.Random", GcTraceLayout::Leaf);
@@ -4263,6 +4267,7 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::File(_) => &GC_FILE,
         HeapObject::InputStream(_) => &GC_INPUT_STREAM,
         HeapObject::OutputStream(_) => &GC_OUTPUT_STREAM,
+        HeapObject::Package(_) => &GC_PACKAGE,
         HeapObject::List(_) => &GC_LIST,
         HeapObject::Map(_) => &GC_MAP,
         HeapObject::Proxy { .. } => &GC_PROXY,
@@ -4320,6 +4325,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::FileInfo(info) => std::mem::size_of::<fs_vm::NapalmFileInfo>() + info.external_bytes(),
         HeapObject::File(file) => std::mem::size_of::<fs_vm::NapalmFile>() + file.external_bytes(),
         HeapObject::InputStream(_) | HeapObject::OutputStream(_) => 0,
+        HeapObject::Package(package) => std::mem::size_of::<package_vm::NapalmPackage>() + package.external_bytes(),
         HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
         HeapObject::Map(map) => map.external_bytes(),
         HeapObject::Cell(_) => std::mem::size_of::<RegisterWord>(),
@@ -4606,6 +4612,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         | HeapObject::File(_)
         | HeapObject::InputStream(_)
         | HeapObject::OutputStream(_)
+        | HeapObject::Package(_)
         | HeapObject::Random { .. }
         | HeapObject::Range { .. }
         | HeapObject::Date { .. }
@@ -6324,6 +6331,7 @@ impl HostContext<'_> {
                 Some(HeapObject::File(file)) => write!(out, "<File path={:?}>", file.path),
             Some(HeapObject::InputStream(_)) => out.write_str("<InputStream:stdin>"),
             Some(HeapObject::OutputStream(stream)) => write!(out, "<OutputStream:{}>", stream.label()),
+            Some(HeapObject::Package(package)) => write!(out, "<Package name={:?}>", package.name),
             Some(HeapObject::Proxy { .. }) => out.write_str("<proxy>"),
             Some(HeapObject::List(values)) => {
                 if !seen.insert(handle) { out.push_str("[...]"); return; }
@@ -7645,6 +7653,7 @@ pub enum NativeBuiltin {
     Process(ProcessNative),
     InputStream(InputStreamNative),
     OutputStream(OutputStreamNative),
+    Package(PackageNative),
     /// Instance protocol of class instances: property names, values and
     /// `[name, value]` pairs in field-slot order, and the property count.
     InstanceKeys,
@@ -7848,6 +7857,15 @@ pub enum OutputStreamNative {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[derive(serde::Serialize, serde::Deserialize)]
+pub enum PackageNative {
+    /// Static `Package.package(name)` and `Package.unpackage(path, dest?)`.
+    Package, Unpackage,
+    /// Builder instance methods.
+    AddFile, AddFiles, AddFolder, SetPackageDest, Finish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum BytesNative {
     BytesEmpty, BytesAlloc, BytesFromUtf8, BytesFromArray,
     BytesLength, BytesIsEmpty, BytesIndex, BytesSlice, BytesClone,
@@ -7903,9 +7921,11 @@ pub enum BuiltinClass {
     File,
     InputStream,
     OutputStream,
+    /// `.orange` package builder returned by `Package.package(name)`.
+    Package,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 34;
+const BUILTIN_CLASS_COUNT: usize = 35;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -7935,6 +7955,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::InputStream as u64),
         HeapObject::OutputStream(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::OutputStream as u64),
+        HeapObject::Package(_) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Package as u64),
         HeapObject::List(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::List as u64),
         HeapObject::Set { .. } =>
@@ -13011,6 +13033,7 @@ impl<'p> Interpreter<'p> {
             Some(HeapObject::Bytes(_)) | Some(HeapObject::ByteBuffer(_))
             | Some(HeapObject::FileInfo(_)) | Some(HeapObject::File(_))
             | Some(HeapObject::InputStream(_)) | Some(HeapObject::OutputStream(_))
+            | Some(HeapObject::Package(_))
             | Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
             | Some(HeapObject::Date { .. })
             | Some(HeapObject::Set { .. })
@@ -16212,6 +16235,7 @@ impl Interpreter<'_> {
             NativeBuiltin::Process(native) => self.execute_process_native(op, native, args),
             NativeBuiltin::InputStream(native) => self.execute_input_stream_native(op, native, receiver, args),
             NativeBuiltin::OutputStream(native) => self.execute_output_stream_native(op, native, receiver, args),
+            NativeBuiltin::Package(native) => self.execute_package_native(op, native, receiver, args),
             NativeBuiltin::ProxyNew => {
                 let target = arg(0);
                 let handler = arg(1);
@@ -17452,6 +17476,7 @@ impl Interpreter<'_> {
                     (BuiltinId::File, Some(HeapObject::File(_))) => true,
                     (BuiltinId::InputStream, Some(HeapObject::InputStream(_))) => true,
                     (BuiltinId::OutputStream, Some(HeapObject::OutputStream(_))) => true,
+                    (BuiltinId::Package, Some(HeapObject::Package(_))) => true,
                     _ => false,
                 }
             }
@@ -17686,6 +17711,7 @@ impl Interpreter<'_> {
                 Some(HeapObject::File(_)) => "File".to_owned(),
             Some(HeapObject::InputStream(_)) => "InputStream".to_owned(),
             Some(HeapObject::OutputStream(_)) => "OutputStream".to_owned(),
+            Some(HeapObject::Package(_)) => "Package".to_owned(),
             Some(HeapObject::List(_)) => {
                 let element = contracts.iter().find_map(|contract| match contract {
                     Type::List(Some(element)) => Some(&**element),
@@ -20064,7 +20090,8 @@ fn builtin_instance_type(builtin: BuiltinId) -> Option<Type> {
         | BuiltinId::FileInfo
         | BuiltinId::File
         | BuiltinId::InputStream
-        | BuiltinId::OutputStream => Type::Builtin(builtin, None),
+        | BuiltinId::OutputStream
+        | BuiltinId::Package => Type::Builtin(builtin, None),
         _ => return None,
     })
 }
@@ -20791,6 +20818,7 @@ impl Interpreter<'_> {
             Some(HeapObject::File(file)) => format!("<File path={:?}>", file.path),
             Some(HeapObject::InputStream(_)) => "<InputStream:stdin>".into(),
             Some(HeapObject::OutputStream(stream)) => format!("<OutputStream:{}>", stream.label()),
+            Some(HeapObject::Package(package)) => format!("<Package name={:?}>", package.name),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),
             Some(HeapObject::Proxy { .. }) => "<proxy>".into(),
@@ -24000,6 +24028,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_class_tests.rs");
     include!("tests/napalm_tests.rs");
     include!("tests/napalm_fs_tests.rs");
+    include!("tests/napalm_package_tests.rs");
     include!("tests/napalm_http_tests.rs");
     include!("tests/napalm_function_jit_tests.rs");
     include!("tests/napalm_shared_literal_tests.rs");

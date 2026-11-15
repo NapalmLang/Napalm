@@ -547,6 +547,8 @@ fn resolve_type_annotation_with(
             "File" => Type::Builtin(BuiltinId::File, None),
             "InputStream" => Type::Builtin(BuiltinId::InputStream, None),
             "OutputStream" => Type::Builtin(BuiltinId::OutputStream, None),
+            // `Package` is a common class name: a user class keeps priority.
+            "Package" if !classes.contains_key("Package") => Type::Builtin(BuiltinId::Package, None),
             "Function" | "Fn" => Type::Closure(None),
             "Map" => Type::Map,
             "Set" => Type::Set(None),
@@ -6638,6 +6640,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 ("Process", "cwd") => Some(Type::String),
                 ("Process", "args") => Some(Type::List(None)),
                 ("Process", "getenv") => Some(Type::Union(vec![Type::String, Type::Null])),
+                ("Package", "package") => Some(Type::Builtin(BuiltinId::Package, None)),
+                ("Package", "unpackage") => Some(Type::List(None)),
                 ("Path", "isAbsolute") => Some(Type::Bool),
                 ("Path", "join" | "resolve" | "normalize" | "dirname" | "basename" | "extension" | "relative") => Some(Type::String),
                 ("Uri", "fromFilePath" | "toFilePath") => Some(Type::String),

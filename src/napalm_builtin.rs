@@ -5,7 +5,7 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::napalm_interpreter::{
-    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, FileNative, PathNative, UriNative, ProcessNative, InputStreamNative, OutputStreamNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, FileNative, PathNative, UriNative, ProcessNative, InputStreamNative, OutputStreamNative, PackageNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
 use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
 
@@ -350,6 +350,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::File,
         BuiltinClass::InputStream,
         BuiltinClass::OutputStream,
+        BuiltinClass::Package,
         BuiltinClass::List,
         BuiltinClass::Map,
         BuiltinClass::Set,
@@ -651,6 +652,27 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("close", 0, FileNative::Close),
     ] {
         manifest.register_native(program, instance(BuiltinClass::File), name, MethodKind::Method, arity, NativeBuiltin::File(native));
+    }
+
+    // `.orange` packages: tar archives compressed with Zstandard level 18.
+    // `Package.package(name)` returns a builder; its mutators return the
+    // builder itself so calls chain, and `finish()` writes the package.
+    let package_static = static_(BuiltinId::Package);
+    manifest.register_native(program, package_static, "package",
+        MethodKind::Method, 1, NativeBuiltin::Package(PackageNative::Package));
+    for arity in [1, 2] {
+        manifest.register_native(program, package_static, "unpackage",
+            MethodKind::Method, arity, NativeBuiltin::Package(PackageNative::Unpackage));
+    }
+    for (name, arity, native) in [
+        ("addFile", 1, PackageNative::AddFile),
+        ("addFiles", 1, PackageNative::AddFiles),
+        ("addFolder", 1, PackageNative::AddFolder),
+        ("setPackageDest", 1, PackageNative::SetPackageDest),
+        ("finish", 0, PackageNative::Finish),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::Package), name,
+            MethodKind::Method, arity, NativeBuiltin::Package(native));
     }
 
     // Native immutable Bytes and mutable ByteBuffer. These are ordinary

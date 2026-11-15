@@ -52,6 +52,66 @@ fn napalm_destructuring_assignments_parameters_and_captures() {
 }
 
 #[test]
+fn napalm_default_parameters_in_functions_and_closures() {
+    run_napalm(r#"
+        function peek(distance = 0) { return distance; }
+        function greet(name: string = "world", punct: string = "!") { return name + punct; }
+        // Defaults run on every call, left to right, and may read earlier parameters.
+        function chain(a: number, b: number = a * 2, c = a + b) { return [a, b, c]; }
+        let calls = 0;
+        function counted(x = ++calls) { return x; }
+        counted(); counted(); counted(10);
+        // An explicit null also selects the default (omitted arguments are null).
+        function explicit(x: string = "d") { return x; }
+        // The parameter is an ordinary mutable binding.
+        function bump(x = 1) { x = x + 1; return x; }
+        const arrow = (x = 4) => x * x;
+        const block = (x: number = 2) => { return x + 1; };
+        const anonymous = function (x = "f") { return x; };
+        function* gen(limit = 3) { for (let i = 0; i < limit; i++) yield i; }
+        const generated = [];
+        for (const value of gen()) generated.push(value);
+        interface Pair { a: number; b: number; }
+        function product({ a, b }: Pair = { a: 3, b: 4 }) { return a * b; }
+        function sum({ a, b } = { a: 1, b: 2 }) { return a + b; }
+        const result = [
+            peek(), peek(3), greet(), greet("ana"), greet("bob", "?"),
+            chain(1), chain(1, 5), chain(1, 5, 0), calls, explicit(null),
+            bump(), bump(5), arrow(), arrow(3), block(), anonymous(), generated,
+            product(), product({ a: 2, b: 5 }), sum(), sum({ a: 10, b: 20 }),
+        ];
+    "#, "[0, 3, world!, ana!, bob?, [1, 2, 3], [1, 5, 6], [1, 5, 0], 2, d, 2, 6, 16, 9, 3, f, [0, 1, 2], 12, 10, 3, 30]");
+}
+
+#[test]
+fn napalm_default_parameters_in_methods_and_constructors() {
+    run_napalm(r#"
+        class Lexer {
+            constructor(public source: string = "", public pos: number = 0) {}
+            peek(distance = 0) { return this.pos + distance; }
+            static make(n: number = 5) { return n * 2; }
+        }
+        class A { peek(d = 0) { return d; } }
+        // `super.peek()` reaches A's own implementation, not this override.
+        class B extends A { peek(d = 10) { return super.peek() + d; } }
+        class P { constructor(public x: number, public y: number = x + 1) {} }
+        class Q extends P { tag = "q"; constructor(x = 3) { super(x); } }
+        class R extends P {}
+        // An explicitly declared shorter arity wins over the default adapter.
+        class S { m(a = 1) { return "full " + a; } m() { return "explicit"; } }
+        const lexer = new Lexer();
+        const q = new Q();
+        const b = new B();
+        const result = [
+            lexer.source === "", lexer.pos, lexer.peek(), lexer.peek(2), new Lexer("x", 5).pos,
+            Lexer.make(), Lexer.make(1), b.peek(), b.peek(1),
+            q.x, q.y, q.tag, new P(1).y, new P(1, 9).y, new R(4).y,
+            new S().m(), new S().m(2),
+        ];
+    "#, "[true, 0, 0, 2, 5, 10, 2, 10, 1, 3, 4, q, 2, 9, 5, explicit, full 2]");
+}
+
+#[test]
 fn napalm_unless_and_until_negate_if_and_while() {
     run_napalm(r#"
         const events = [];

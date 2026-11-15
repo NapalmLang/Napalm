@@ -1148,6 +1148,21 @@ pub struct ImportBinding {
 /// forwarding their arguments to the superclass constructor.
 pub const INHERITED_FIELD_INITIALIZER: &str = "<fields>";
 
+/// Name prefix of the synthetic parameter behind a defaulted `x = value`
+/// parameter. An omitted argument arrives as `null`, which selects the
+/// default; methods also answer every arity that only omits such trailing
+/// parameters.
+pub const DEFAULT_PARAMETER_PREFIX: &str = "<default:";
+
+/// Number of leading parameters a caller must pass: everything up to the
+/// last parameter without a default.
+pub fn required_parameter_count(params: &[Ident]) -> usize {
+    params
+        .iter()
+        .rposition(|param| !param.value.starts_with(DEFAULT_PARAMETER_PREFIX))
+        .map_or(0, |index| index + 1)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassDecl {
     pub name: Ident,

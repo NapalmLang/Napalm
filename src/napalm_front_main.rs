@@ -168,6 +168,13 @@ struct Parser<'a> {
     /// the corresponding FunctionBody is assembled. This keeps the existing AST
     /// parameter representation compact while preserving TypeScript annotations.
     parameter_types: HashMap<Span, TypeAnnotation>,
+    /// Declared type of a defaulted `name: T = value` parameter, keyed by its
+    /// synthetic parameter span. The call boundary accepts `T | null` (an
+    /// omitted argument arrives as `null`); the body binding itself is `T`.
+    parameter_default_types: HashMap<Span, TypeAnnotation>,
+    /// Number of synthesized parameter statements (defaults, destructuring)
+    /// prepended to the most recently parsed function body.
+    parameter_prefix_len: usize,
     /// Direct `this.name` writes in the current constructor (including lexical closures).
     constructor_properties: Option<Vec<Ident>>,
     synthetic_span: usize,
@@ -515,6 +522,8 @@ impl<'a> Parser<'a> {
             immutable: HashSet::default(),
             parameter_patterns: HashMap::default(),
             parameter_types: HashMap::default(),
+            parameter_default_types: HashMap::default(),
+            parameter_prefix_len: 0,
             constructor_properties: None,
             synthetic_span: source.len() + 1,
             generator: None,
@@ -2220,19 +2229,26 @@ impl<'a> Parser<'a> {
                 return self.error("rest parameters are not implemented yet");
             }
             let pattern = self.binding_pattern()?;
-            let param = match pattern {
-                BindingPattern::Ident(name) => name,
-                pattern => {
-                    if property { return self.error("parameter properties require a simple identifier"); }
-                    let span = pattern.span();
-                    self.parameter_patterns.insert(span, pattern);
-                    Spanned::new(compact_str::format_compact!("<parameter:{}>", span.start), span)
-                }
+            let property_name = match &pattern {
+                BindingPattern::Ident(name) => Some(name.clone()),
+                _ if property => return self.error("parameter properties require a simple identifier"),
+                _ => None,
             };
             // Optionality is a type-system marker: an omitted argument arrives as
             // `null`, so `x?: T` is checked as `T | null`.
             let optional = self.eat("?");
-            let annotation = self.variable_annotation()?.map(|annotation| {
+            let declared = self.variable_annotation()?;
+            let default = if self.eat("=") {
+                if optional {
+                    return self.error("a parameter cannot be both optional and have a default value");
+                }
+                self.lines();
+                Some(self.expr(1)?)
+            } else {
+                None
+            };
+            let defaulted = default.is_some();
+            let annotation = declared.clone().map(|annotation| {
                 if !optional || matches!(annotation.kind, TypeAnnotationKind::Null) {
                     return annotation;
                 }
@@ -2240,14 +2256,34 @@ impl<'a> Parser<'a> {
                 let null = TypeAnnotation::new(TypeAnnotationKind::Null, span);
                 TypeAnnotation::new(TypeAnnotationKind::Union(vec![annotation, null]), span)
             });
-            if let Some(annotation) = annotation.as_ref() {
+            let param = match (pattern, default) {
+                (BindingPattern::Ident(name), None) => name,
+                (pattern, default) => {
+                    // `x = value` reuses destructuring defaults: the argument is
+                    // bound to an untyped synthetic parameter (an omitted
+                    // argument arrives as `null`) and the body starts with
+                    // `let x: T = <parameter> ?? value`. Defaults are evaluated
+                    // on every call, in parameter order, so later defaults may
+                    // read earlier parameters; `T` is checked after the default
+                    // has been substituted.
+                    let pattern = match default {
+                        Some(value) => BindingPattern::Default { pattern: Box::new(pattern), value },
+                        None => pattern,
+                    };
+                    let span = pattern.span();
+                    if defaulted && let Some(declared) = declared.clone() {
+                        self.parameter_default_types.insert(span, declared);
+                    }
+                    self.parameter_patterns.insert(span, pattern);
+                    let prefix = if defaulted { DEFAULT_PARAMETER_PREFIX } else { "<parameter:" };
+                    Spanned::new(compact_str::format_compact!("{prefix}{}>", span.start), span)
+                }
+            };
+            if !defaulted && let Some(annotation) = annotation.as_ref() {
                 self.parameter_types.insert(param.span, annotation.clone());
             }
-            if self.eat("=") {
-                return self.error("default parameters are not implemented yet");
-            }
             if property {
-                properties.push((param.clone(), annotation));
+                properties.push((property_name.unwrap(), annotation));
             }
             params.push(param);
             self.lines();
@@ -2272,11 +2308,41 @@ impl<'a> Parser<'a> {
     fn parameter_bindings(&mut self, params: &[Ident]) -> Result<Vec<Stmt>> {
         let mut prefix = Vec::new();
         for param in params {
-            if let Some(pattern) = self.parameter_patterns.remove(&param.span) {
-                let source = Expr::new(ExprKind::Name(param.clone()), param.span);
-                self.expand_binding_pattern(pattern, source, false, &mut prefix)?;
+            let Some(pattern) = self.parameter_patterns.remove(&param.span) else { continue };
+            let source = Expr::new(ExprKind::Name(param.clone()), param.span);
+            match (pattern, self.parameter_default_types.remove(&param.span)) {
+                // `pattern: T = value`: the declared `T` constrains the value
+                // after the default has been substituted.
+                (BindingPattern::Default { pattern, value }, Some(annotation)) => {
+                    let span = param.span;
+                    let initializer = Expr::new(
+                        ExprKind::Logical { left: Box::new(source), operator: LogicalOp::Nullish, right: Box::new(value) },
+                        span,
+                    );
+                    let (name, rest) = match *pattern {
+                        BindingPattern::Ident(name) => (name, None),
+                        pattern => {
+                            // A fresh synthetic span: the pattern's own
+                            // temporaries already use `Span::empty(span.start)`.
+                            let temporary = Span::empty(self.synthetic_span);
+                            self.synthetic_span += 1;
+                            let name = compact_str::format_compact!("<parameter-default:{}>", span.start);
+                            (Spanned::new(name, temporary), Some(pattern))
+                        }
+                    };
+                    let binding = Expr::new(ExprKind::Name(name.clone()), span);
+                    prefix.push(Stmt {
+                        span,
+                        kind: StmtKind::Variable { shared: false, name, annotation: Some(annotation), initializer: Some(initializer) },
+                    });
+                    if let Some(pattern) = rest {
+                        self.expand_binding_pattern(pattern, binding, false, &mut prefix)?;
+                    }
+                }
+                (pattern, _) => self.expand_binding_pattern(pattern, source, false, &mut prefix)?,
             }
         }
+        self.parameter_prefix_len = prefix.len();
         Ok(prefix)
     }
 
@@ -4019,6 +4085,7 @@ impl<'a> Parser<'a> {
         let decorator_parameter = ast.ident("payloadParameter");
         let mut constructor = None;
         let mut constructor_properties = Vec::new();
+        let mut constructor_parameter_prefix = 0;
         // Instance properties with a field initializer / parameter property, and
         // plain declared fields that still need a constructor assignment.
         let mut initialized_properties = HashSet::<CompactString>::default();
@@ -4293,6 +4360,7 @@ impl<'a> Parser<'a> {
                     };
                     if is_constructor {
                         constructor_properties = self.constructor_properties.take().unwrap();
+                        constructor_parameter_prefix = self.parameter_prefix_len;
                     }
                     Some(body)
                 };
@@ -4612,7 +4680,9 @@ impl<'a> Parser<'a> {
                         None => return self.error("a derived constructor with fields must call super() directly before initializing fields"),
                     }
                 } else {
-                    0
+                    // Parameter properties read the parameters after their
+                    // defaults and destructuring have been applied.
+                    constructor_parameter_prefix
                 };
                 let mut constructor_initializers = Vec::with_capacity(
                     parameter_initializers.len() + initializers.len() + watch_initializers.len(),
@@ -6287,6 +6357,12 @@ mod napalm_syntax_tests {
             .diagnostics
             .iter()
             .any(|d| d.message.contains("rest parameters are not implemented yet")));
+
+        let optional_default = parse("future-syntax.np", "function f(x?: number = 1) { return x; }");
+        assert!(optional_default
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("cannot be both optional and have a default value")));
     }
 
     #[test]

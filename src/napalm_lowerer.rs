@@ -1493,6 +1493,15 @@ impl SymbolTable {
     }
 }
 
+/// What a default-parameter arity adapter forwards to.
+#[derive(Clone, Copy, Debug)]
+enum DefaultArityTarget {
+    /// The class's own full-arity method body (instance or static).
+    Method(FuncId),
+    /// The class's own full-arity constructor body (`<init>new`).
+    Initializer(FuncId),
+}
+
 #[derive(Clone, Debug)]
 struct MethodPlan {
     symbol: MethodSymbol,
@@ -2598,6 +2607,19 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                             }
                         }
                     }
+                    // Trailing defaulted parameters may be omitted. Dispatch is
+                    // by (name, arity), so every shorter arity gets an adapter
+                    // that pads with null (selecting the defaults) and forwards,
+                    // unless the class declares that arity explicitly.
+                    let required = if kind == MethodKind::Method {
+                        front::required_parameter_count(&params)
+                    } else {
+                        arity
+                    };
+                    let declared = |shorter: usize| class.methods.iter().any(|other| {
+                        other.is_static == method.is_static
+                            && method_signature_key(&other.signature) == Some((name.clone(), kind, shorter))
+                    });
                     if method.is_constructor {
                         plans.push(MethodPlan {
                             symbol: body_symbol,
@@ -2609,7 +2631,45 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                         plans.push(MethodPlan {
                             symbol, function: Some(factory), foreign: None, bind_static: true,
                         });
+                        for shorter in (required..arity).filter(|&shorter| !declared(shorter)) {
+                            let receiver = Type::Instance(ClassSet::singleton(class_plan.id));
+                            let label = format!("{}.<init>{name}/{shorter}<defaults>", class_plan.name);
+                            let initializer = self.compile_default_arity_adapter(
+                                module, label, FunctionKind::Method, receiver, shorter, arity,
+                                DefaultArityTarget::Initializer(function),
+                            );
+                            let init_symbol = self.program.intern_method(
+                                &compact_str::format_compact!("<init>{name}"), MethodKind::Method, shorter as u8,
+                            );
+                            plans.push(MethodPlan {
+                                symbol: init_symbol, function: Some(initializer), foreign: None, bind_static: false,
+                            });
+                            let factory =
+                                self.compile_constructor_factory(module, &class_plan, &name, shorter, Some(initializer));
+                            let symbol = self.program.intern_method(&name, MethodKind::Method, shorter as u8);
+                            plans.push(MethodPlan {
+                                symbol, function: Some(factory), foreign: None, bind_static: true,
+                            });
+                        }
                         continue;
+                    }
+                    for shorter in (required..arity).filter(|&shorter| !declared(shorter)) {
+                        let (function_kind, receiver) = if method.is_static {
+                            (FunctionKind::StaticMethod, Type::Class(ClassSet::singleton(class_plan.id)))
+                        } else {
+                            (FunctionKind::Method, Type::Instance(ClassSet::singleton(class_plan.id)))
+                        };
+                        let label = format!("{}.{name}/{shorter}<defaults>", class_plan.name);
+                        let adapter = self.compile_default_arity_adapter(
+                            module, label, function_kind, receiver, shorter, arity,
+                            DefaultArityTarget::Method(function),
+                        );
+                        plans.push(MethodPlan {
+                            symbol: self.program.intern_method(&name, kind, shorter as u8),
+                            function: Some(adapter),
+                            foreign: None,
+                            bind_static,
+                        });
                     }
                     plans.push(MethodPlan {
                         symbol,
@@ -2701,6 +2761,40 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             builder.emit1(Inst::CallDirect { conv: ir::CallConv::Napalm, callee, args }, Type::Top);
         }
         builder.ret(instance);
+        builder.finish()
+    }
+
+    /// `name/arity` of a method whose omitted trailing parameters have
+    /// defaults: pad the missing arguments with null (which selects each
+    /// default) and call this class's own full-arity implementation directly.
+    /// A direct call (rather than dynamic dispatch) keeps `super.m()` inside an
+    /// override of `m(x = ...)` from re-entering the override.
+    fn compile_default_arity_adapter(
+        &mut self,
+        module: ModuleId,
+        label: String,
+        kind: FunctionKind,
+        receiver: Type,
+        arity: usize,
+        target_arity: usize,
+        target: DefaultArityTarget,
+    ) -> FuncId {
+        let mut params = vec![receiver.clone()];
+        params.extend((0..arity).map(|_| Type::Top));
+        let (callee, returns_receiver) = match target {
+            DefaultArityTarget::Initializer(callee) => (callee, true),
+            DefaultArityTarget::Method(callee) => (callee, false),
+        };
+        let result = if returns_receiver { receiver } else { Type::Top };
+        let mut builder = Builder::new(self.program, module, label, kind, params, result);
+        let this = builder.param(0);
+        let mut args = vec![this];
+        args.extend((1..=arity).map(|index| builder.param(index)));
+        while args.len() <= target_arity {
+            args.push(builder.const_null());
+        }
+        let value = builder.emit1(Inst::CallDirect { conv: ir::CallConv::Napalm, callee, args }, Type::Top);
+        builder.ret(if returns_receiver { this } else { value });
         builder.finish()
     }
 

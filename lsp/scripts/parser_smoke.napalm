@@ -1,0 +1,138 @@
+// Run: napalm lsp/scripts/parser_smoke.napalm
+// Exercises the standalone Napalm parser without the Rust frontend.
+import {parse} from "../src/parser";
+import {tokenize} from "../src/lexer";
+
+function expect(value, message) {
+    if (!value) throw "parser smoke: " + message;
+}
+
+function clean(source) {
+    const lexed = tokenize(source);
+    expect(lexed.diagnostics.length === 0, "lexer rejected valid source: " + source);
+    const parsed = parse(source, lexed);
+    if (parsed.diagnostics.length > 0) {
+        System.print("Parser diagnostic: " + JSON.stringify(parsed.diagnostics[0]));
+    }
+    expect(parsed.diagnostics.length === 0, "parser rejected valid source: " + source);
+    expect(parsed.ast.kind === "Module", "module root");
+    return parsed.ast;
+}
+
+function kindOf(source) {
+    const body = clean(source).body;
+    expect(body.length > 0, "empty module");
+    return body[0];
+}
+
+const precedence = kindOf("const result = 1 + 2 * 3 ** 2;");
+expect(precedence.kind === "VariableDeclaration", "variable declaration");
+const expression = precedence.declarations[0].init;
+expect(expression.kind === "BinaryExpression" && expression.operator === "+", "addition root");
+expect(expression.right.operator === "*" && expression.right.right.operator === "**",
+    "operator precedence and right associativity");
+expect(expression.startByte === 15, "UTF-8 byte span start");
+
+const assignments = kindOf("a = b += c ?? fallback |> transform;");
+expect(assignments.expression.kind === "AssignmentExpression", "assignment expression");
+expect(assignments.expression.right.kind === "AssignmentExpression", "right-associative assignment");
+
+const functionAst = kindOf("async function compute<T>(items: List<T>): Promise<T> { return items[0]; }");
+expect(functionAst.kind === "FunctionDeclaration", "function declaration");
+expect(functionAst.async === true, "async function modifier");
+expect(functionAst.typeParameters.length === 1, "generic function");
+expect(functionAst.params[0].annotation.kind === "GenericType", "parameter type");
+expect(functionAst.body.body[0].kind === "ReturnStatement", "return statement");
+
+const nestedGeneric = kindOf("type Nested = Map<String, List<Number>>;");
+expect(nestedGeneric.kind === "TypeAliasDeclaration", "type alias");
+expect(nestedGeneric.annotation.kind === "GenericType", "outer generic type");
+expect(nestedGeneric.annotation.arguments[1].kind === "GenericType", "inner generic type");
+
+const classAst = kindOf(
+    "@memoize\nclass Counter<T> extends Base implements Named {\n" +
+    "  value: T;\n  constructor(value: T) { this.value = value; }\n" +
+    "  computed squared() { return this.value * this.value; }\n" +
+    "  get doubled() { return this.value + this.value; }\n" +
+    "}\n"
+);
+expect(classAst.kind === "DecoratedDeclaration", "decorated declaration");
+expect(classAst.declaration.kind === "ClassDeclaration", "class declaration");
+expect(classAst.declaration.members.length === 4, "class fields and methods");
+expect(classAst.declaration.members[2].memberKind === "computed", "computed property");
+expect(classAst.declaration.members[3].memberKind === "get", "getter");
+
+const moduleAst = clean(
+    "import DefaultThing, {one as first, two} from './thing';\n" +
+    "export const answer = 42;\n" +
+    "export {answer as result};\n" +
+    "export default function() { return 42; }\n"
+);
+expect(moduleAst.body.length === 4, "module statements");
+expect(moduleAst.body[0].kind === "ImportDeclaration", "import");
+expect(moduleAst.body[1].kind === "ExportDeclaration", "export declaration");
+expect(moduleAst.body[2].kind === "ExportNamedDeclaration", "export specifier");
+expect(moduleAst.body[3].kind === "ExportDefaultDeclaration", "export default");
+
+const controlAst = clean(
+    "let total = 0;\n" +
+    "for (let i = 0; i < 5; i++) { total += i; }\n" +
+    "for (const item of items) { total += item; }\n" +
+    "if (total > 0) { total++; } else { total--; }\n" +
+    "switch (total) { case 0: break; default: total++; }\n" +
+    "try { call(); } catch (error) { recover(error); } finally { cleanup(); }\n"
+);
+expect(controlAst.body.length === 6, "control flow statement count");
+expect(controlAst.body[1].kind === "ForStatement", "traditional for");
+expect(controlAst.body[2].kind === "ForOfStatement", "for of");
+expect(controlAst.body[3].kind === "IfStatement", "if / else");
+expect(controlAst.body[4].kind === "SwitchStatement", "switch");
+expect(controlAst.body[5].kind === "TryStatement", "try/catch/finally");
+
+const arrowAst = kindOf("const f = (a: Number, b: Number): Number => a + b;");
+expect(arrowAst.declarations[0].init.kind === "ArrowFunctionExpression", "typed arrow");
+expect(arrowAst.declarations[0].init.params.length === 2, "typed arrow params");
+
+const templateAst = kindOf("const greeting = `Hi ${user.name} ${`x=${n}`}`;");
+expect(templateAst.declarations[0].init.kind === "TemplateLiteral", "template expression");
+expect(templateAst.declarations[0].init.expressions.length === 2, "outer interpolation count");
+expect(templateAst.declarations[0].init.expressions[1].kind === "TemplateLiteral", "nested interpolation");
+
+const comprehension = kindOf("const squares = [n * n for n in numbers if n % 2 === 1];");
+expect(comprehension.declarations[0].init.kind === "ListComprehension", "list comprehension");
+expect(comprehension.declarations[0].init.clauses.length === 1, "comprehension clause");
+expect(comprehension.declarations[0].init.clauses[0].filters.length === 1, "comprehension filter");
+
+const lambda = kindOf("const f = |x, y| x + y;");
+expect(lambda.declarations[0].init.kind === "LambdaExpression", "bar lambda");
+expect(lambda.declarations[0].init.params.length === 2, "bar lambda parameters");
+
+const typePrecedence = kindOf("type Choice = A | B & C;");
+expect(typePrecedence.annotation.kind === "UnionType", "union type precedence");
+expect(typePrecedence.annotation.right.kind === "IntersectionType", "intersection binds tighter");
+
+const staticBlock = kindOf("class Initialization { static { setup(); } }");
+expect(staticBlock.members[0].kind === "StaticBlock", "static initialization block");
+
+const unicode = "const emoji = '😀';\r\nconst second = 1;";
+const unicodeAst = clean(unicode);
+expect(unicodeAst.body[1].range.start.line === 1, "CRLF line position");
+expect(unicodeAst.body[1].range.start.character === 0, "UTF-16 column reset");
+expect(unicodeAst.body[0].endByte > unicodeAst.body[0].range.end.character,
+    "UTF-8 byte offset differs from UTF-16 column");
+
+const recovered = parse("const a = ;\nconst b = 42;\nfunction f() { return 1; }");
+expect(recovered.diagnostics.length > 0, "invalid syntax diagnosed");
+let retainedB = false;
+let retainedFunction = false;
+for (const node of recovered.ast.body) {
+    if (node.kind === "VariableDeclaration" && node.declarations[0].id.name === "b") retainedB = true;
+    if (node.kind === "FunctionDeclaration" && node.id.name === "f") retainedFunction = true;
+}
+expect(retainedB && retainedFunction, "recovery preserves later declarations");
+
+const openBlock = parse("function incomplete(x) { if (x) { return x;");
+expect(openBlock.diagnostics.length > 0, "unterminated block diagnosed");
+expect(openBlock.ast.kind === "Module", "partial AST returned on error");
+
+System.print("Napalm parser smoke tests passed");

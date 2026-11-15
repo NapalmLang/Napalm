@@ -1,0 +1,1506 @@
+// Error-tolerant Napalm syntax parser, implemented entirely in Napalm.
+// The lexer owns source decoding; the parser preserves its UTF-8 and UTF-16 spans.
+// AST nodes are plain Maps to keep them serializable and suitable for editor tooling.
+import {tokenize, tokenText} from "./lexer";
+
+const MAX_PARSE_DEPTH = 192;
+const MAX_PARSE_DIAGNOSTICS = 200;
+const MAX_AST_NODES = 250_000;
+
+// Napalm sets do not accept iterable constructors. Populate explicitly.
+function createStringSet(values) {
+    const result = new Set();
+    for (const value of values) result.add(value);
+    return result;
+}
+
+const ASSIGNMENTS = createStringSet([
+    "=", "+=", "-=", "*=", "/=", "%=", "**=", "??=", "&&=", "||=",
+    "&=", "|=", "^=", "<<=", ">>=", ">>>="
+]);
+const PREFIX = createStringSet(["+", "-", "!", "~", "typeof", "void", "delete", "await", "yield", "launch"]);
+// The Rust frontend treats these words as contextual, not universally reserved.
+// They remain valid identifiers outside the grammar positions that use them.
+const CONTEXTUAL_IDENTIFIERS = createStringSet([
+    "from", "as", "type", "async", "abstract", "readonly", "computed",
+    "get", "set", "override", "private", "protected", "public", "static"
+]);
+const MODIFIERS = createStringSet([
+    "public", "private", "protected", "readonly", "abstract", "static", "override", "declare", "shared"
+]);
+
+function bindingPower(op) {
+    if (ASSIGNMENTS.has(op)) return 2;
+    if (op === "|>") return 4;
+    if (op === "??" || op === "||") return 5;
+    if (op === "&&") return 6;
+    if (op === "|") return 7;
+    if (op === "^") return 8;
+    if (op === "&") return 9;
+    if (op === "==" || op === "!=" || op === "===" || op === "!==") return 10;
+    if (op === "<" || op === "<=" || op === ">" || op === ">=" ||
+        op === "in" || op === "instanceof" || op === "is" ||
+        op === "implements" || op === "inherits") return 11;
+    if (op === "<<" || op === ">>" || op === ">>>") return 12;
+    if (op === "+" || op === "-") return 13;
+    if (op === "*" || op === "/" || op === "%") return 14;
+    if (op === "**") return 15;
+    return -1;
+}
+
+function newNode(kind, startByte, endByte, startPosition, endPosition, properties) {
+    const value = {
+        kind: kind,
+        startByte: startByte,
+        endByte: endByte,
+        range: {start: startPosition, end: endPosition}
+    };
+    for (const entry of properties) value[entry.key] = entry.value;
+    return value;
+}
+
+class Parser {
+    constructor(source, lexical) {
+        this.source = source;
+        this.bytes = Bytes.fromUtf8(source);
+        this.tokens = [];
+        this.positions = new Map();
+        this.index = 0;
+        this.diagnostics = [];
+        this.depth = 0;
+        this.statementDepth = 0;
+        this.typeDepth = 0;
+        this.typePrimaryDepth = 0;
+        this.patternDepth = 0;
+        this.nodes = 0;
+        this.pendingAngles = 0;
+        this.pendingAngleOffset = 0;
+        this.lastEnd = 0;
+
+        const input = lexical === null ? tokenize(source) : lexical;
+        for (const token of input.tokens) {
+            this.positions.set(token.startByte, token.range.start);
+            this.positions.set(token.endByte, token.range.end);
+            if (token.kind === "comment.line" || token.kind === "comment.block" ||
+                token.kind === "comment.shebang") continue;
+            token.text = tokenText(this.bytes, token);
+            this.tokens.push(token);
+        }
+        if (this.tokens.length === 0 || this.tokens[this.tokens.length - 1].kind !== "eof") {
+            throw "Parser needs a lexer EOF token";
+        }
+        this.lastEnd = 0;
+    }
+
+    current() {
+        if (this.pendingAngles > 0) {
+            const at = this.pendingAngleOffset;
+            return {text: ">", kind: "operator", startByte: at, endByte: at + 1};
+        }
+        return this.tokens[this.index];
+    }
+
+    peek(distance) {
+        if (this.pendingAngles > 0) {
+            if (distance === 0) return this.current();
+            if (distance < this.pendingAngles) return this.current();
+            distance -= this.pendingAngles;
+        }
+        let index = this.index + distance;
+        if (index < 0) index = 0;
+        if (index >= this.tokens.length) index = this.tokens.length - 1;
+        return this.tokens[index];
+    }
+
+    text(distance) { return this.peek(distance).text; }
+    at(text) { return this.text(0) === text; }
+    eof() { return this.nodes > MAX_AST_NODES || this.current().kind === "eof"; }
+
+    take() {
+        if (this.pendingAngles > 0) {
+            const token = this.current();
+            this.pendingAngles--;
+            this.pendingAngleOffset++;
+            this.lastEnd = token.endByte;
+            return token;
+        }
+        const token = this.current();
+        if (!this.eof()) this.index++;
+        this.lastEnd = token.endByte;
+        return token;
+    }
+
+    eat(text) {
+        if (!this.at(text)) return false;
+        this.take();
+        return true;
+    }
+
+    skipLines() {
+        while (this.at("\n") || this.current().kind === "newline") this.take();
+    }
+
+    // Continue only at explicit delimiters; malformed input must advance.
+    expect(text, message) {
+        if (this.eat(text)) return true;
+        const token = this.current();
+        this.error(message === null ? "Expected '" + text + "'" : message,
+            token.startByte, token.endByte, "NAPALM-PARSE-001");
+        return false;
+    }
+
+    position(byteOffset) {
+        const pos = this.positions.get(byteOffset);
+        if (pos !== null) return pos;
+        // Artificial recovery boundaries use the nearest preceding token.
+        let preceding = {line: 0, character: 0};
+        for (const token of this.tokens) {
+            if (token.startByte > byteOffset) break;
+            preceding = token.range.start;
+            if (token.endByte === byteOffset) return token.range.end;
+        }
+        return preceding;
+    }
+
+    node(kind, startByte, endByte, properties) {
+        this.nodes++;
+        if (this.nodes === MAX_AST_NODES + 1) {
+            this.error("AST node limit exceeded", startByte, endByte, "NAPALM-PARSE-003");
+        }
+        if (endByte < startByte) endByte = startByte;
+        return newNode(kind, startByte, endByte,
+            this.position(startByte), this.position(endByte), properties);
+    }
+
+    error(message, startByte, endByte, code) {
+        if (this.diagnostics.length >= MAX_PARSE_DIAGNOSTICS) return;
+        const token = this.current();
+        const start = startByte === null ? token.startByte : startByte;
+        const end = endByte === null ? token.endByte : endByte;
+        this.diagnostics.push({
+            code: code, message: message, severity: 1,
+            startByte: start, endByte: end,
+            range: {start: this.position(start), end: this.position(end)}
+        });
+    }
+
+    identifier(allowKeyword) {
+        const token = this.current();
+        if (token.kind === "identifier" ||
+            (token.kind === "keyword" && (allowKeyword || CONTEXTUAL_IDENTIFIERS.has(token.text)))) {
+            this.take();
+            return this.node("Identifier", token.startByte, token.endByte,
+                {name: token.text});
+        }
+        this.error("Expected an identifier", null, null, "NAPALM-PARSE-001");
+        if (!this.eof() && !this.at("}") && !this.at(")") && !this.at("]") &&
+            !this.at(";") && this.current().kind !== "newline") this.take();
+        return this.node("ErrorIdentifier", token.startByte, token.endByte, {name: ""});
+    }
+
+    separator() {
+        if (this.eat(";")) {
+            const end = this.lastEnd;
+            this.skipLines();
+            this.lastEnd = end;
+            return;
+        }
+        if (this.current().kind === "newline") {
+            const end = this.lastEnd;
+            this.skipLines();
+            this.lastEnd = end;
+            return;
+        }
+        if (this.at("}") || this.eof()) return;
+        if (this.at("else") || this.at("catch") || this.at("finally")) return;
+        this.error("Expected a semicolon or line break", null, null, "NAPALM-PARSE-001");
+        this.recoverStatement();
+    }
+
+    recoverStatement() {
+        const first = this.index;
+        while (!this.eof() && !this.at("}") && !this.at(";") &&
+            this.current().kind !== "newline") this.take();
+        if (this.eat(";")) return;
+        if (this.current().kind === "newline") this.skipLines();
+        if (this.index === first && !this.eof() && !this.at("}")) this.take();
+    }
+
+    statements(untilBrace) {
+        const body = [];
+        while (!this.eof()) {
+            this.skipLines();
+            if (this.eof() || (untilBrace && this.at("}"))) break;
+            if (this.at("}")) {
+                this.error("Unexpected closing brace", null, null, "NAPALM-PARSE-001");
+                this.take();
+                continue;
+            }
+            const checkpoint = this.index;
+            const statement = this.statement();
+            if (statement !== null) body.push(statement);
+            if (this.index === checkpoint && !this.eof()) {
+                this.error("Unable to parse statement", null, null, "NAPALM-PARSE-001");
+                this.recoverStatement();
+            }
+            if (this.nodes > MAX_AST_NODES) {
+                this.error("AST node limit exceeded", null, null, "NAPALM-PARSE-003");
+                break;
+            }
+        }
+        return body;
+    }
+
+    run() {
+        const body = this.statements(false);
+        const ast = this.node("Module", 0, this.bytes.length, {body: body});
+        return {ast: ast, diagnostics: this.diagnostics};
+    }
+
+    block() {
+        const start = this.current().startByte;
+        this.expect("{", null);
+        const body = this.statements(true);
+        const end = this.current().endByte;
+        if (!this.eat("}")) this.error("Unterminated block", start, end, "NAPALM-PARSE-001");
+        return this.node("BlockStatement", start, this.lastEnd, {body: body});
+    }
+
+    statement() {
+        if (this.statementDepth >= MAX_PARSE_DEPTH) {
+            const token = this.current();
+            this.error("Maximum statement nesting depth exceeded", token.startByte, token.endByte,
+                "NAPALM-PARSE-002");
+            if (!this.eof()) this.take();
+            return this.node("ErrorStatement", token.startByte, this.lastEnd, {});
+        }
+        this.statementDepth++;
+        const result = this.statementInner();
+        this.statementDepth--;
+        return result;
+    }
+
+    statementInner() {
+        this.skipLines();
+        const start = this.current().startByte;
+        const key = this.text(0);
+        if (key === "{") return this.block();
+        if (key === ";") { this.take(); return this.node("EmptyStatement", start, this.lastEnd, {}); }
+        if (key === "export") return this.exportDeclaration();
+        if (key === "import" && this.text(1) !== "(") return this.importDeclaration();
+        if (key === "interface") return this.interfaceDeclaration();
+        if (key === "type" && this.peek(1).kind === "identifier") return this.typeAlias();
+        if (key === "enum") return this.enumDeclaration();
+        if (key === "function" || this.functionHead()) return this.functionDeclaration(true);
+        if (key === "class" || (key === "abstract" && this.text(1) === "class")) {
+            return this.classDeclaration(true);
+        }
+        if (key === "const" || key === "let" || key === "var" || key === "shared") {
+            return this.variableDeclaration(true);
+        }
+        if (key === "if") return this.ifStatement();
+        if (key === "while") return this.whileStatement();
+        if (key === "do") return this.doWhileStatement();
+        if (key === "for") return this.forStatement();
+        if (key === "switch") return this.switchStatement();
+        if (key === "try") return this.tryStatement();
+        if (key === "return" || key === "throw" || key === "break" || key === "continue" ||
+            key === "defer" || key === "errdefer") return this.flowStatement();
+        if (key === "@") return this.decoratedDeclaration();
+        if (key === "declare" && this.text(1) !== "(") return this.declareStatement();
+        if (this.peek(0).kind === "identifier" && this.text(1) === ":") {
+            const label = this.identifier(false);
+            this.take();
+            const body = this.statement();
+            return this.node("LabeledStatement", start, this.lastEnd, {label: label, body: body});
+        }
+        const expression = this.expression(0, true);
+        this.separator();
+        return this.node("ExpressionStatement", start, this.lastEnd, {expression: expression});
+    }
+
+    functionHead() {
+        if (this.at("async") || this.at("concurrent")) {
+            return this.text(1) === "function" ||
+                ((this.text(1) === "async" || this.text(1) === "concurrent") && this.text(2) === "function");
+        }
+        return false;
+    }
+
+    variableDeclaration(terminator) {
+        const start = this.current().startByte;
+        const declarationKind = this.take().text;
+        const declarations = [];
+        while (!this.eof()) {
+            this.skipLines();
+            const itemStart = this.current().startByte;
+            const pattern = this.bindingPattern();
+            let annotation = null;
+            if (this.eat(":")) annotation = this.typeExpression();
+            let value = null;
+            if (this.eat("=")) value = this.expression(2, true);
+            declarations.push(this.node("VariableDeclarator", itemStart, this.lastEnd,
+                {id: pattern, annotation: annotation, init: value}));
+            if (!this.eat(",")) break;
+        }
+        if (terminator) this.separator();
+        return this.node("VariableDeclaration", start, this.lastEnd,
+            {declarationKind: declarationKind, declarations: declarations});
+    }
+
+    bindingPattern() {
+        if (this.patternDepth >= MAX_PARSE_DEPTH) {
+            const token = this.current();
+            this.error("Maximum binding pattern depth exceeded", token.startByte, token.endByte,
+                "NAPALM-PARSE-002");
+            if (!this.eof()) this.take();
+            return this.node("ErrorPattern", token.startByte, this.lastEnd, {});
+        }
+        this.patternDepth++;
+        const result = this.bindingPatternInner();
+        this.patternDepth--;
+        return result;
+    }
+
+    bindingPatternInner() {
+        const start = this.current().startByte;
+        if (this.eat("...")) {
+            const argument = this.bindingPattern();
+            return this.node("RestPattern", start, this.lastEnd, {argument: argument});
+        }
+        if (this.eat("[")) {
+            const elements = [];
+            while (!this.eof() && !this.at("]")) {
+                this.skipLines();
+                if (this.eat(",")) { elements.push(null); continue; }
+                let element = this.bindingPattern();
+                if (this.eat("=")) {
+                    const value = this.expression(2, true);
+                    element = this.node("AssignmentPattern", element.startByte, this.lastEnd,
+                        {left: element, right: value});
+                }
+                elements.push(element);
+                this.skipLines();
+                if (!this.eat(",")) break;
+            }
+            this.expect("]", null);
+            return this.node("ArrayPattern", start, this.lastEnd, {elements: elements});
+        }
+        if (this.eat("{")) {
+            const properties = [];
+            while (!this.eof() && !this.at("}")) {
+                this.skipLines();
+                if (this.at("}")) break;
+                const from = this.current().startByte;
+                if (this.eat("...")) {
+                    const argument = this.bindingPattern();
+                    properties.push(this.node("RestPattern", from, this.lastEnd,
+                        {argument: argument}));
+                } else {
+                    const key = this.propertyName();
+                    const value = this.eat(":") ? this.bindingPattern() :
+                        this.node("Identifier", key.startByte, key.endByte, {name: key.name});
+                    let bound = value;
+                    if (this.eat("=")) {
+                        const right = this.expression(2, true);
+                        bound = this.node("AssignmentPattern", value.startByte, this.lastEnd,
+                            {left: value, right: right});
+                    }
+                    properties.push(this.node("PatternProperty", from, this.lastEnd,
+                        {key: key, value: bound}));
+                }
+                this.skipLines();
+                if (!this.eat(",")) break;
+            }
+            this.expect("}", null);
+            return this.node("ObjectPattern", start, this.lastEnd, {properties: properties});
+        }
+        return this.identifier(false);
+    }
+
+    parameters() {
+        const params = [];
+        this.expect("(", null);
+        while (!this.eof() && !this.at(")")) {
+            this.skipLines();
+            if (this.at(")")) break;
+            const start = this.current().startByte;
+            const modifiers = this.modifiers();
+            const name = this.bindingPattern();
+            const optional = this.eat("?");
+            const annotation = this.eat(":") ? this.typeExpression() : null;
+            const initial = this.eat("=") ? this.expression(2, true) : null;
+            params.push(this.node("Parameter", start, this.lastEnd,
+                {name: name, optional: optional, annotation: annotation,
+                 defaultValue: initial, modifiers: modifiers}));
+            this.skipLines();
+            if (!this.eat(",")) break;
+        }
+        this.expect(")", null);
+        return params;
+    }
+
+    modifiers() {
+        const list = [];
+        while (MODIFIERS.has(this.text(0))) list.push(this.take().text);
+        return list;
+    }
+
+    functionDeclaration(declaration) {
+        const start = this.current().startByte;
+        let asynchronous = false;
+        let isConcurrent = false;
+        for (let n = 0; n < 2; n++) {
+            if (this.eat("async")) asynchronous = true;
+            else if (this.eat("concurrent")) isConcurrent = true;
+            else break;
+        }
+        this.expect("function", null);
+        const generator = this.eat("*");
+        let id = null;
+        if (this.current().kind === "identifier") id = this.identifier(false);
+        else if (declaration) id = this.identifier(false);
+        const typeParameters = this.typeParameters();
+        const params = this.parameters();
+        const resultType = this.eat(":") ? this.typeExpression() : null;
+        this.skipLines();
+        const body = this.at("{") ? this.block() : null;
+        if (body === null) this.separator();
+        return this.node(declaration ? "FunctionDeclaration" : "FunctionExpression", start,
+            this.lastEnd, {id: id, params: params, body: body, returnType: resultType,
+                typeParameters: typeParameters, async: asynchronous, concurrent: isConcurrent,
+                generator: generator});
+    }
+
+    classDeclaration(declaration) {
+        const start = this.current().startByte;
+        const isAbstract = this.eat("abstract");
+        this.expect("class", null);
+        let id = null;
+        if (this.current().kind === "identifier") id = this.identifier(false);
+        else if (declaration) id = this.identifier(false);
+        const typeParameters = this.typeParameters();
+        const superClass = this.eat("extends") ? this.expression(17, true) : null;
+        const implementsTypes = [];
+        if (this.eat("implements")) {
+            do { implementsTypes.push(this.typeExpression()); } while (this.eat(","));
+        }
+        this.skipLines();
+        this.expect("{", null);
+        const members = [];
+        while (!this.eof() && !this.at("}")) {
+            this.skipLines();
+            if (this.at("}")) break;
+            const checkpoint = this.index;
+            members.push(this.classMember());
+            if (this.index === checkpoint && !this.eof()) this.recoverStatement();
+        }
+        this.expect("}", null);
+        return this.node(declaration ? "ClassDeclaration" : "ClassExpression", start, this.lastEnd,
+            {id: id, abstract: isAbstract, typeParameters: typeParameters,
+             superClass: superClass, implements: implementsTypes, members: members});
+    }
+
+    decorators() {
+        const decorators = [];
+        while (this.at("@")) {
+            const start = this.take().startByte;
+            const expression = this.expression(17, true);
+            decorators.push(this.node("Decorator", start, this.lastEnd, {expression: expression}));
+            this.skipLines();
+        }
+        return decorators;
+    }
+
+    classMember() {
+        const start = this.current().startByte;
+        const decorators = this.decorators();
+        const modifiers = this.modifiers();
+        if (this.at("{") && modifiers.length === 1 && modifiers[0] === "static") {
+            const body = this.block();
+            return this.node("StaticBlock", start, this.lastEnd, {body: body});
+        }
+        let memberKind = "method";
+        if (this.at("get") && this.text(1) !== "(" && this.text(1) !== ":" && this.text(1) !== "=") {
+            memberKind = "get"; this.take();
+        } else if (this.at("set") && this.text(1) !== "(" && this.text(1) !== ":" && this.text(1) !== "=") {
+            memberKind = "set"; this.take();
+        } else if (this.at("computed") && this.text(1) !== "(") {
+            memberKind = "computed"; this.take();
+        }
+        const isAsync = this.eat("async");
+        const generator = this.eat("*");
+        const name = this.propertyName();
+        const optional = this.eat("?");
+        if (this.at("(") || this.at("<")) {
+            const typeParameters = this.typeParameters();
+            const params = this.parameters();
+            const returnType = this.eat(":") ? this.typeExpression() : null;
+            this.skipLines();
+            const body = this.at("{") ? this.block() : null;
+            if (body === null) this.separator();
+            return this.node("MethodDefinition", start, this.lastEnd,
+                {name: name, memberKind: memberKind, modifiers: modifiers,
+                 decorators: decorators, optional: optional, async: isAsync,
+                 generator: generator, typeParameters: typeParameters,
+                 params: params, returnType: returnType, body: body});
+        }
+        const annotation = this.eat(":") ? this.typeExpression() : null;
+        const initializer = this.eat("=") ? this.expression(2, true) : null;
+        this.separator();
+        return this.node("FieldDefinition", start, this.lastEnd,
+            {name: name, decorators: decorators, modifiers: modifiers,
+             optional: optional, annotation: annotation, initializer: initializer});
+    }
+
+    decoratedDeclaration() {
+        const start = this.current().startByte;
+        const annotations = this.decorators();
+        let declaration = null;
+        if (this.at("class") || this.at("abstract")) declaration = this.classDeclaration(true);
+        else if (this.at("function") || this.functionHead()) declaration = this.functionDeclaration(true);
+        else {
+            this.error("Decorators must precede a function or class declaration", null, null, "NAPALM-PARSE-001");
+            declaration = this.statement();
+        }
+        return this.node("DecoratedDeclaration", start, this.lastEnd,
+            {decorators: annotations, declaration: declaration});
+    }
+
+    // Type arguments are kept as syntax trees, not resolved or checked here.
+    // A pending '>' represents the remainder of a >> or >>> operator split
+    // only while parsing nested generic type arguments.
+    consumeTypeClose() {
+        if (this.pendingAngles > 0) { this.take(); return true; }
+        if (this.eat(">")) return true;
+        if (this.at(">>") || this.at(">>>")) {
+            const token = this.take();
+            this.pendingAngles = token.text.length - 1;
+            this.pendingAngleOffset = token.startByte + 1;
+            for (let offset = 1; offset < token.text.length; offset++) {
+                this.positions.set(token.startByte + offset,
+                    {line: token.range.start.line,
+                     character: token.range.start.character + offset});
+            }
+            return true;
+        }
+        return false;
+    }
+
+    atTypeClose() {
+        return this.pendingAngles > 0 || this.at(">") || this.at(">>") || this.at(">>>");
+    }
+
+    typeParameters() {
+        if (!this.eat("<")) return [];
+        const params = [];
+        while (!this.eof() && !this.atTypeClose()) {
+            this.skipLines();
+            const start = this.current().startByte;
+            const name = this.identifier(false);
+            const constraint = this.eat("extends") ? this.typeExpression() : null;
+            const defaultType = this.eat("=") ? this.typeExpression() : null;
+            params.push(this.node("TypeParameter", start, this.lastEnd,
+                {name: name, constraint: constraint, defaultType: defaultType}));
+            this.skipLines();
+            if (!this.eat(",")) break;
+        }
+        if (!this.consumeTypeClose()) this.error("Expected '>' to close type parameters", null, null, "NAPALM-PARSE-001");
+        return params;
+    }
+
+    typeExpression() {
+        if (this.typeDepth >= MAX_PARSE_DEPTH) {
+            const token = this.current();
+            this.error("Maximum type nesting depth exceeded", token.startByte, token.endByte,
+                "NAPALM-PARSE-002");
+            if (!this.eof()) this.take();
+            return this.node("ErrorType", token.startByte, this.lastEnd, {});
+        }
+        this.typeDepth++;
+        const result = this.typeExpressionInner();
+        this.typeDepth--;
+        return result;
+    }
+
+    typeExpressionInner() {
+        const start = this.current().startByte;
+        let left = this.typeIntersection();
+        while (this.eat("|")) {
+            const right = this.typeIntersection();
+            left = this.node("UnionType", start, this.lastEnd,
+                {left: left, right: right});
+        }
+        return left;
+    }
+
+    typeIntersection() {
+        const start = this.current().startByte;
+        let left = this.typePostfix();
+        while (this.eat("&")) {
+            const right = this.typePostfix();
+            left = this.node("IntersectionType", start, this.lastEnd,
+                {left: left, right: right});
+        }
+        return left;
+    }
+
+    typePostfix() {
+        const start = this.current().startByte;
+        let left = this.typePrimary();
+        while (true) {
+            if (this.eat("[")) {
+                if (!this.expect("]", null)) break;
+                left = this.node("ArrayType", start, this.lastEnd, {element: left});
+                continue;
+            }
+            if (this.eat("?")) {
+                left = this.node("OptionalType", start, this.lastEnd, {base: left});
+                continue;
+            }
+            break;
+        }
+        return left;
+    }
+
+    typePrimary() {
+        if (this.typePrimaryDepth >= MAX_PARSE_DEPTH) {
+            const token = this.current();
+            this.error("Maximum nested type depth exceeded", token.startByte, token.endByte,
+                "NAPALM-PARSE-002");
+            if (!this.eof()) this.take();
+            return this.node("ErrorType", token.startByte, this.lastEnd, {});
+        }
+        this.typePrimaryDepth++;
+        const result = this.typePrimaryInner();
+        this.typePrimaryDepth--;
+        return result;
+    }
+
+    typePrimaryInner() {
+        this.skipLines();
+        const start = this.current().startByte;
+        if (this.eat("...")) {
+            const base = this.typePrimary();
+            return this.node("RestType", start, this.lastEnd, {base: base});
+        }
+        if (this.eat("{")) {
+            const members = [];
+            while (!this.eof() && !this.at("}")) {
+                this.skipLines();
+                if (this.at("}")) break;
+                const fieldStart = this.current().startByte;
+                const isReadonly = this.eat("readonly");
+                const name = this.propertyName();
+                const optional = this.eat("?");
+                let signature = null;
+                if (this.at("(")) {
+                    const params = this.parameters();
+                    const result = this.eat(":") ? this.typeExpression() : null;
+                    signature = this.node("MethodType", fieldStart, this.lastEnd,
+                        {params: params, returnType: result});
+                } else if (this.eat(":")) signature = this.typeExpression();
+                else this.error("Expected ':' or method signature in object type", null, null, "NAPALM-PARSE-001");
+                members.push(this.node("TypeProperty", fieldStart, this.lastEnd,
+                    {name: name, optional: optional, readonly: isReadonly, annotation: signature}));
+                if (this.eat(";") || this.eat(",")) continue;
+                if (this.current().kind === "newline") this.skipLines();
+                else if (!this.at("}")) { this.error("Expected type member separator", null, null, "NAPALM-PARSE-001"); this.recoverStatement(); }
+            }
+            this.expect("}", null);
+            return this.node("ObjectType", start, this.lastEnd, {members: members});
+        }
+        if (this.eat("[")) {
+            const elements = [];
+            while (!this.eof() && !this.at("]")) {
+                this.skipLines();
+                if (this.at("]")) break;
+                elements.push(this.typeExpression());
+                if (!this.eat(",")) break;
+            }
+            this.expect("]", null);
+            return this.node("TupleType", start, this.lastEnd, {elements: elements});
+        }
+        if (this.at("(")) {
+            const params = this.parameters();
+            if (this.eat("=>")) {
+                const result = this.typeExpression();
+                return this.node("FunctionType", start, this.lastEnd,
+                    {params: params, returnType: result});
+            }
+            if (params.length === 1 && params[0].annotation !== null) {
+                return this.node("ParenthesizedType", start, this.lastEnd,
+                    {inner: params[0].annotation});
+            }
+            return this.node("ParenthesizedType", start, this.lastEnd, {params: params});
+        }
+        if (this.current().kind === "string" || this.current().kind === "number" ||
+            this.current().kind === "boolean" || this.current().kind === "null") {
+            const literal = this.take();
+            return this.node("LiteralType", start, this.lastEnd, {value: literal.text});
+        }
+        if (this.at("typeof") || this.at("keyof") || this.at("readonly")) {
+            const operator = this.take().text;
+            const argument = this.typePrimary();
+            return this.node("TypeOperator", start, this.lastEnd,
+                {operator: operator, argument: argument});
+        }
+        let base = this.identifier(true);
+        while (this.eat(".")) {
+            const property = this.identifier(true);
+            base = this.node("QualifiedTypeName", start, this.lastEnd,
+                {object: base, property: property});
+        }
+        if (this.eat("<")) {
+            const args = [];
+            while (!this.eof() && !this.atTypeClose()) {
+                this.skipLines();
+                args.push(this.typeExpression());
+                this.skipLines();
+                if (!this.eat(",")) break;
+            }
+            if (!this.consumeTypeClose()) this.error("Expected '>' to close generic arguments", null, null, "NAPALM-PARSE-001");
+            base = this.node("GenericType", start, this.lastEnd,
+                {name: base, arguments: args});
+        }
+        return base;
+    }
+
+    interfaceDeclaration() {
+        const start = this.take().startByte;
+        const id = this.identifier(false);
+        const typeParameters = this.typeParameters();
+        const parents = [];
+        if (this.eat("extends")) {
+            do { parents.push(this.typeExpression()); } while (this.eat(","));
+        }
+        this.skipLines();
+        const body = this.typePrimary();
+        if (body.kind !== "ObjectType") {
+            this.error("Expected an interface body", body.startByte, body.endByte, "NAPALM-PARSE-001");
+        }
+        return this.node("InterfaceDeclaration", start, this.lastEnd,
+            {id: id, typeParameters: typeParameters, extends: parents, body: body});
+    }
+
+    typeAlias() {
+        const start = this.take().startByte;
+        const id = this.identifier(false);
+        const typeParameters = this.typeParameters();
+        this.expect("=", null);
+        const annotation = this.typeExpression();
+        this.separator();
+        return this.node("TypeAliasDeclaration", start, this.lastEnd,
+            {id: id, typeParameters: typeParameters, annotation: annotation});
+    }
+
+    enumDeclaration() {
+        const start = this.take().startByte;
+        const id = this.identifier(false);
+        this.skipLines();
+        this.expect("{", null);
+        const members = [];
+        while (!this.eof() && !this.at("}")) {
+            this.skipLines();
+            if (this.at("}")) break;
+            const from = this.current().startByte;
+            const name = this.propertyName();
+            const initializer = this.eat("=") ? this.expression(2, true) : null;
+            members.push(this.node("EnumMember", from, this.lastEnd,
+                {name: name, initializer: initializer}));
+            if (!this.eat(",")) {
+                if (this.current().kind === "newline") this.skipLines();
+                else break;
+            }
+        }
+        this.expect("}", null);
+        return this.node("EnumDeclaration", start, this.lastEnd, {id: id, members: members});
+    }
+
+    importDeclaration() {
+        const start = this.take().startByte;
+        let isTypeOnly = this.eat("type");
+        const specifiers = [];
+        let source = null;
+        if (this.current().kind === "string") {
+            source = this.take().text;
+        } else {
+            if (this.current().kind === "identifier") {
+                const local = this.identifier(false);
+                specifiers.push(this.node("DefaultImport", local.startByte, local.endByte,
+                    {local: local}));
+                this.eat(",");
+            }
+            if (this.eat("{")) {
+                while (!this.eof() && !this.at("}")) {
+                    this.skipLines();
+                    if (this.at("}")) break;
+                    const imported = this.identifier(true);
+                    const local = this.eat("as") ? this.identifier(false) : imported;
+                    specifiers.push(this.node("NamedImport", imported.startByte, this.lastEnd,
+                        {imported: imported, local: local}));
+                    if (!this.eat(",")) break;
+                }
+                this.expect("}", null);
+            }
+            if (!this.expect("from", null)) this.recoverStatement();
+            if (this.current().kind === "string") source = this.take().text;
+            else this.error("Expected a module specifier string", null, null, "NAPALM-PARSE-001");
+        }
+        this.separator();
+        return this.node("ImportDeclaration", start, this.lastEnd,
+            {source: source, specifiers: specifiers, typeOnly: isTypeOnly});
+    }
+
+    exportDeclaration() {
+        const start = this.take().startByte;
+        const isTypeOnly = this.eat("type");
+        if (this.eat("default")) {
+            let declaration = null;
+            if (this.at("function") || this.functionHead()) declaration = this.functionDeclaration(false);
+            else if (this.at("class") || this.at("abstract")) declaration = this.classDeclaration(false);
+            else {
+                declaration = this.expression(0, true);
+                this.separator();
+            }
+            return this.node("ExportDefaultDeclaration", start, this.lastEnd,
+                {declaration: declaration});
+        }
+        if (this.eat("{")) {
+            const names = [];
+            while (!this.eof() && !this.at("}")) {
+                this.skipLines();
+                if (this.at("}")) break;
+                const local = this.identifier(true);
+                const exported = this.eat("as") ? this.identifier(true) : local;
+                names.push(this.node("ExportSpecifier", local.startByte, this.lastEnd,
+                    {local: local, exported: exported}));
+                if (!this.eat(",")) break;
+            }
+            this.expect("}", null);
+            let source = null;
+            if (this.eat("from")) {
+                if (this.current().kind === "string") source = this.take().text;
+                else this.error("Expected a module specifier string", null, null, "NAPALM-PARSE-001");
+            }
+            this.separator();
+            return this.node("ExportNamedDeclaration", start, this.lastEnd,
+                {specifiers: names, source: source, typeOnly: isTypeOnly});
+        }
+        let declaration = null;
+        if (isTypeOnly && this.current().kind === "identifier") {
+            // 'export type Name = ...' consumed the type keyword above.
+            const id = this.identifier(false);
+            const typeParameters = this.typeParameters();
+            this.expect("=", null);
+            const annotation = this.typeExpression();
+            this.separator();
+            declaration = this.node("TypeAliasDeclaration", id.startByte, this.lastEnd,
+                {id: id, typeParameters: typeParameters, annotation: annotation});
+        } else {
+            declaration = this.statement();
+        }
+        return this.node("ExportDeclaration", start, this.lastEnd,
+            {declaration: declaration, typeOnly: isTypeOnly});
+    }
+
+    declareStatement() {
+        const start = this.take().startByte;
+        const declaration = this.statement();
+        return this.node("DeclareStatement", start, this.lastEnd,
+            {declaration: declaration});
+    }
+
+    condition() {
+        this.expect("(", null);
+        this.skipLines();
+        const value = this.expression(0, true);
+        this.skipLines();
+        this.expect(")", null);
+        return value;
+    }
+
+    ifStatement() {
+        const start = this.take().startByte;
+        const test = this.condition();
+        this.skipLines();
+        const consequent = this.statement();
+        this.skipLines();
+        const alternate = this.eat("else") ? this.statement() : null;
+        return this.node("IfStatement", start, this.lastEnd,
+            {test: test, consequent: consequent, alternate: alternate});
+    }
+
+    whileStatement() {
+        const start = this.take().startByte;
+        const test = this.condition();
+        this.skipLines();
+        const body = this.statement();
+        return this.node("WhileStatement", start, this.lastEnd, {test: test, body: body});
+    }
+
+    doWhileStatement() {
+        const start = this.take().startByte;
+        const body = this.statement();
+        this.skipLines();
+        this.expect("while", null);
+        const test = this.condition();
+        this.separator();
+        return this.node("DoWhileStatement", start, this.lastEnd,
+            {body: body, test: test});
+    }
+
+    commaExpression(allowIn) {
+        const start = this.current().startByte;
+        const expressions = [this.expression(2, allowIn)];
+        while (this.eat(",")) {
+            this.skipLines();
+            expressions.push(this.expression(2, allowIn));
+        }
+        return expressions.length === 1 ? expressions[0] :
+            this.node("SequenceExpression", start, this.lastEnd, {expressions: expressions});
+    }
+
+    forStatement() {
+        const start = this.take().startByte;
+        const asynchronous = this.eat("await");
+        this.expect("(", null);
+        this.skipLines();
+        let init = null;
+        if (!this.at(";")) {
+            if (this.at("const") || this.at("let") || this.at("var")) {
+                init = this.variableDeclaration(false);
+            } else init = this.commaExpression(false);
+        }
+        if (this.at("of") || this.at("in")) {
+            const relation = this.take().text;
+            const right = this.expression(0, true);
+            this.expect(")", null);
+            this.skipLines();
+            const body = this.statement();
+            return this.node(relation === "of" ? "ForOfStatement" : "ForInStatement",
+                start, this.lastEnd,
+                {left: init, right: right, body: body, await: asynchronous});
+        }
+        this.expect(";", null);
+        const test = this.at(";") ? null : this.commaExpression(true);
+        this.expect(";", null);
+        const update = this.at(")") ? null : this.commaExpression(true);
+        this.expect(")", null);
+        this.skipLines();
+        const body = this.statement();
+        return this.node("ForStatement", start, this.lastEnd,
+            {init: init, test: test, update: update, body: body});
+    }
+
+    switchStatement() {
+        const start = this.take().startByte;
+        const discriminant = this.condition();
+        this.skipLines();
+        this.expect("{", null);
+        const cases = [];
+        while (!this.eof() && !this.at("}")) {
+            this.skipLines();
+            if (this.at("}")) break;
+            const caseStart = this.current().startByte;
+            let test = null;
+            if (this.eat("case")) test = this.expression(0, true);
+            else if (!this.eat("default")) {
+                this.error("Expected 'case' or 'default'", null, null, "NAPALM-PARSE-001");
+                this.recoverStatement();
+                continue;
+            }
+            this.expect(":", null);
+            const consequent = [];
+            while (!this.eof() && !this.at("case") && !this.at("default") && !this.at("}")) {
+                this.skipLines();
+                if (this.at("case") || this.at("default") || this.at("}")) break;
+                const checkpoint = this.index;
+                consequent.push(this.statement());
+                if (this.index === checkpoint) this.recoverStatement();
+            }
+            cases.push(this.node("SwitchCase", caseStart, this.lastEnd,
+                {test: test, consequent: consequent}));
+        }
+        this.expect("}", null);
+        return this.node("SwitchStatement", start, this.lastEnd,
+            {discriminant: discriminant, cases: cases});
+    }
+
+    tryStatement() {
+        const start = this.take().startByte;
+        this.skipLines();
+        const block = this.block();
+        this.skipLines();
+        let handler = null;
+        let finalizer = null;
+        if (this.eat("catch")) {
+            const handlerStart = this.lastEnd;
+            let param = null;
+            if (this.eat("(")) { param = this.bindingPattern(); this.expect(")", null); }
+            this.skipLines();
+            const body = this.block();
+            handler = this.node("CatchClause", handlerStart, this.lastEnd,
+                {param: param, body: body});
+        }
+        this.skipLines();
+        if (this.eat("finally")) { this.skipLines(); finalizer = this.block(); }
+        if (handler === null && finalizer === null) this.error("Expected 'catch' or 'finally'", null, null, "NAPALM-PARSE-001");
+        return this.node("TryStatement", start, this.lastEnd,
+            {block: block, handler: handler, finalizer: finalizer});
+    }
+
+    flowStatement() {
+        const keyword = this.take();
+        let argument = null;
+        if (keyword.text === "break" || keyword.text === "continue") {
+            if (this.current().kind === "identifier") argument = this.identifier(false);
+        } else if (!this.eof() && !this.at(";") && !this.at("}") &&
+                   this.current().kind !== "newline") {
+            argument = this.expression(0, true);
+        } else if (keyword.text === "throw") this.error("'throw' requires an expression on the same line", null, null, "NAPALM-PARSE-001");
+        this.separator();
+        return this.node(keyword.text === "return" ? "ReturnStatement" :
+            keyword.text === "throw" ? "ThrowStatement" :
+            keyword.text === "break" ? "BreakStatement" :
+            keyword.text === "continue" ? "ContinueStatement" :
+            keyword.text === "defer" ? "DeferStatement" : "ErrDeferStatement",
+            keyword.startByte, this.lastEnd, {argument: argument});
+    }
+
+    propertyName() {
+        const token = this.current();
+        if (this.eat("[")) {
+            const expression = this.expression(0, true);
+            this.expect("]", null);
+            return this.node("ComputedPropertyName", token.startByte, this.lastEnd,
+                {expression: expression});
+        }
+        if (token.kind === "string" || token.kind === "number") {
+            this.take();
+            return this.node("LiteralPropertyName", token.startByte, this.lastEnd,
+                {name: token.text});
+        }
+        return this.identifier(true);
+    }
+
+    argumentsList() {
+        const args = [];
+        this.expect("(", null);
+        this.skipLines();
+        while (!this.eof() && !this.at(")")) {
+            const start = this.current().startByte;
+            let value = null;
+            if (this.eat("...")) {
+                const argument = this.expression(2, true);
+                value = this.node("SpreadElement", start, this.lastEnd, {argument: argument});
+            } else value = this.expression(2, true);
+            args.push(value);
+            this.skipLines();
+            if (!this.eat(",")) break;
+            this.skipLines();
+        }
+        this.expect(")", null);
+        return args;
+    }
+
+    arrowAhead() {
+        if (!this.at("(")) return false;
+        let depth = 0;
+        let endIndex = -1;
+        for (let i = this.index; i < this.tokens.length; i++) {
+            const text = this.tokens[i].text;
+            if (text === "(") depth++;
+            if (text === ")") {
+                depth--;
+                if (depth === 0) { endIndex = i; break; }
+            }
+            if (this.tokens[i].kind === "eof") return false;
+        }
+        if (endIndex < 0) return false;
+        let index = endIndex + 1;
+        while (index < this.tokens.length && this.tokens[index].kind === "newline") index++;
+        if (index < this.tokens.length && this.tokens[index].text === "=>") return true;
+        if (index >= this.tokens.length || this.tokens[index].text !== ":") return false;
+        // A typed arrow may place a return annotation between ')' and '=>'.
+        // Limit lookahead so an unrelated following statement cannot match.
+        for (let count = 0; count < 48 && index < this.tokens.length; count++) {
+            if (this.tokens[index].text === "=>") return true;
+            if (this.tokens[index].text === "{" || this.tokens[index].text === ";" ||
+                this.tokens[index].kind === "eof") return false;
+            index++;
+        }
+        return false;
+    }
+
+    arrowBody(start, params, isAsync, returnType) {
+        this.expect("=>", null);
+        this.skipLines();
+        const body = this.at("{") ? this.block() : this.expression(2, true);
+        return this.node("ArrowFunctionExpression", start, this.lastEnd,
+            {params: params, body: body, async: isAsync, returnType: returnType});
+    }
+
+    arrayLiteral() {
+        const start = this.take().startByte;
+        const elements = [];
+        while (!this.eof() && !this.at("]")) {
+            this.skipLines();
+            if (this.at("]")) break;
+            if (this.eat(",")) { elements.push(null); continue; }
+            if (this.at("...")) {
+                const from = this.take().startByte;
+                const argument = this.expression(2, true);
+                elements.push(this.node("SpreadElement", from, this.lastEnd,
+                    {argument: argument}));
+            } else elements.push(this.expression(2, true));
+            this.skipLines();
+            if (!this.eat(",")) break;
+        }
+        if (elements.length === 1 && this.at("for")) {
+            const clauses = [];
+            while (this.eat("for")) {
+                const from = this.lastEnd;
+                const name = this.identifier(false);
+                this.expect("in", null);
+                const iterable = this.expression(2, true);
+                const filters = [];
+                while (this.eat("if")) filters.push(this.expression(2, true));
+                clauses.push(this.node("ComprehensionClause", from, this.lastEnd,
+                    {name: name, iterable: iterable, filters: filters}));
+            }
+            this.expect("]", null);
+            return this.node("ListComprehension", start, this.lastEnd,
+                {element: elements[0], clauses: clauses});
+        }
+        this.expect("]", null);
+        return this.node("ArrayExpression", start, this.lastEnd, {elements: elements});
+    }
+
+    objectLiteral() {
+        const start = this.take().startByte;
+        const properties = [];
+        while (!this.eof() && !this.at("}")) {
+            this.skipLines();
+            if (this.at("}")) break;
+            const from = this.current().startByte;
+            if (this.eat("...")) {
+                const argument = this.expression(2, true);
+                properties.push(this.node("SpreadElement", from, this.lastEnd,
+                    {argument: argument}));
+            } else {
+                const key = this.propertyName();
+                if (this.eat(":")) {
+                    const value = this.expression(2, true);
+                    properties.push(this.node("ObjectProperty", from, this.lastEnd,
+                        {key: key, value: value, shorthand: false}));
+                } else if (this.at("(")) {
+                    const params = this.parameters();
+                    const returnType = this.eat(":") ? this.typeExpression() : null;
+                    this.skipLines();
+                    const body = this.block();
+                    properties.push(this.node("ObjectMethod", from, this.lastEnd,
+                        {key: key, params: params, returnType: returnType, body: body}));
+                } else {
+                    let value = this.node("Identifier", key.startByte, key.endByte,
+                        {name: key.name});
+                    if (this.eat("=")) {
+                        const right = this.expression(2, true);
+                        value = this.node("AssignmentPattern", value.startByte, this.lastEnd,
+                            {left: value, right: right});
+                    }
+                    properties.push(this.node("ObjectProperty", from, this.lastEnd,
+                        {key: key, value: value, shorthand: true}));
+                }
+            }
+            this.skipLines();
+            if (!this.eat(",")) break;
+        }
+        this.expect("}", null);
+        return this.node("ObjectExpression", start, this.lastEnd, {properties: properties});
+    }
+
+    templateLiteral() {
+        const start = this.take().startByte;
+        const quasis = [];
+        const expressions = [];
+        let ended = false;
+        while (!this.eof()) {
+            const token = this.current();
+            if (token.kind === "template.end") {
+                this.take(); ended = true; break;
+            }
+            if (token.kind === "template.text") {
+                this.take();
+                quasis.push(this.node("TemplateText", token.startByte, token.endByte,
+                    {raw: token.text}));
+                continue;
+            }
+            if (token.kind === "template.expression.start") {
+                this.take();
+                this.skipLines();
+                const expression = this.expression(0, true);
+                expressions.push(expression);
+                this.skipLines();
+                if (this.current().kind === "template.expression.end") this.take();
+                else {
+                    this.error("Unterminated template interpolation", null, null, "NAPALM-PARSE-001");
+                    break;
+                }
+                continue;
+            }
+            this.error("Unexpected token in template literal", null, null, "NAPALM-PARSE-001");
+            this.take();
+        }
+        if (!ended) this.error("Unterminated template literal", start, this.lastEnd, "NAPALM-PARSE-001");
+        return this.node("TemplateLiteral", start, this.lastEnd,
+            {quasis: quasis, expressions: expressions});
+    }
+
+    prefix() {
+        const token = this.current();
+        const op = token.text;
+        const start = token.startByte;
+        if (this.eof()) {
+            this.error("Expected expression before end of file", null, null, "NAPALM-PARSE-001");
+            return this.node("ErrorExpression", start, start, {});
+        }
+        if (op === "async" && this.text(1) === "(") {
+            this.take();
+            if (this.arrowAhead()) {
+                const params = this.parameters();
+                const returnType = this.eat(":") ? this.typeExpression() : null;
+                return this.arrowBody(start, params, true, returnType);
+            }
+        }
+        if (op === "async" && this.peek(1).kind === "identifier" && this.text(2) === "=>") {
+            this.take();
+            const id = this.identifier(false);
+            return this.arrowBody(start, [this.node("Parameter", id.startByte, id.endByte,
+                {name: id, annotation: null, defaultValue: null})], true, null);
+        }
+        if (op === "function" || this.functionHead()) return this.functionDeclaration(false);
+        if (op === "class") return this.classDeclaration(false);
+        if (PREFIX.has(op)) {
+            this.take();
+            const argument = this.expression(16, true);
+            return this.node(op === "await" ? "AwaitExpression" :
+                op === "yield" ? "YieldExpression" : "UnaryExpression", start, this.lastEnd,
+                {operator: op, argument: argument});
+        }
+        if (op === "|") {
+            this.take();
+            const params = [];
+            while (!this.eof() && !this.at("|")) {
+                this.skipLines();
+                if (this.at("|")) break;
+                const paramStart = this.current().startByte;
+                const name = this.bindingPattern();
+                const annotation = this.eat(":") ? this.typeExpression() : null;
+                params.push(this.node("Parameter", paramStart, this.lastEnd,
+                    {name: name, annotation: annotation, defaultValue: null}));
+                if (!this.eat(",")) break;
+            }
+            this.expect("|", null);
+            this.skipLines();
+            const body = this.at("{") ? this.block() : this.expression(2, true);
+            return this.node("LambdaExpression", start, this.lastEnd,
+                {params: params, body: body});
+        }
+        if (op === "new") {
+            this.take();
+            let callee = this.prefix();
+            while (this.at(".") || this.at("[")) callee = this.member(callee);
+            const args = this.at("(") ? this.argumentsList() : [];
+            return this.node("NewExpression", start, this.lastEnd,
+                {callee: callee, arguments: args});
+        }
+        if (op === "(") {
+            if (this.arrowAhead()) {
+                const params = this.parameters();
+                const returnType = this.eat(":") ? this.typeExpression() : null;
+                return this.arrowBody(start, params, false, returnType);
+            }
+            this.take();
+            this.skipLines();
+            const expressions = [];
+            if (!this.at(")")) {
+                expressions.push(this.expression(2, true));
+                while (this.eat(",")) {
+                    this.skipLines();
+                    expressions.push(this.expression(2, true));
+                }
+            }
+            this.skipLines();
+            this.expect(")", null);
+            const inner = expressions.length === 1 ? expressions[0] :
+                this.node("SequenceExpression", start, this.lastEnd, {expressions: expressions});
+            return this.node("ParenthesizedExpression", start, this.lastEnd, {expression: inner});
+        }
+        if (op === "[") return this.arrayLiteral();
+        if (op === "{") return this.objectLiteral();
+        if (token.kind === "template.start") return this.templateLiteral();
+        if (token.kind === "string" || token.kind === "number" ||
+            token.kind === "boolean" || token.kind === "null") {
+            this.take();
+            return this.node(token.kind === "number" ? "NumericLiteral" :
+                token.kind === "boolean" ? "BooleanLiteral" :
+                token.kind === "null" ? "NullLiteral" : "StringLiteral",
+                start, this.lastEnd, {raw: op});
+        }
+        if (op === "this" || op === "super") {
+            this.take();
+            return this.node(op === "this" ? "ThisExpression" : "SuperExpression",
+                start, this.lastEnd, {});
+        }
+        if (token.kind === "identifier" || CONTEXTUAL_IDENTIFIERS.has(op) || op === "import") {
+            const id = this.identifier(op === "import");
+            if (this.at("=>")) {
+                return this.arrowBody(start, [this.node("Parameter", id.startByte, id.endByte,
+                    {name: id, annotation: null, defaultValue: null})], false, null);
+            }
+            return id;
+        }
+        this.error("Expected expression", null, null, "NAPALM-PARSE-001");
+        if (!this.at("}") && !this.at(")") && !this.at("]") &&
+            token.kind !== "template.expression.end" && token.kind !== "newline") this.take();
+        return this.node("ErrorExpression", start, this.lastEnd, {raw: op});
+    }
+
+    member(object) {
+        const start = object.startByte;
+        const symbol = this.take().text;
+        if (symbol === "[") {
+            const property = this.expression(0, true);
+            this.expect("]", null);
+            return this.node("MemberExpression", start, this.lastEnd,
+                {object: object, property: property, computed: true, optional: false});
+        }
+        if (symbol === "?." && this.at("[")) {
+            this.take();
+            const property = this.expression(0, true);
+            this.expect("]", null);
+            return this.node("MemberExpression", start, this.lastEnd,
+                {object: object, property: property, computed: true, optional: true});
+        }
+        if (symbol === "?." && this.at("(")) {
+            const args = this.argumentsList();
+            return this.node("CallExpression", start, this.lastEnd,
+                {callee: object, arguments: args, optional: true});
+        }
+        const property = this.identifier(true);
+        return this.node("MemberExpression", start, this.lastEnd,
+            {object: object, property: property, computed: false, optional: symbol === "?."});
+    }
+
+    // Generic call lookahead disambiguates foo<A, B>(x) from a < b comparison.
+    typeCallAhead() {
+        if (!this.at("<")) return false;
+        let nesting = 0;
+        for (let i = this.index; i < this.tokens.length && i < this.index + 120; i++) {
+            const token = this.tokens[i];
+            if (token.kind === "newline" || token.kind === "eof") return false;
+            if (token.text === "<") nesting++;
+            else if (token.text === ">" || token.text === ">>" || token.text === ">>>") {
+                nesting -= token.text.length;
+                if (nesting === 0) {
+                    let next = i + 1;
+                    while (next < this.tokens.length && this.tokens[next].kind === "newline") next++;
+                    return next < this.tokens.length && this.tokens[next].text === "(";
+                }
+                if (nesting < 0) return false;
+            }
+        }
+        return false;
+    }
+
+    expression(minimum, allowIn) {
+        if (this.depth >= MAX_PARSE_DEPTH) {
+            const at = this.current().startByte;
+            this.error("Maximum syntax nesting depth exceeded", at, at, "NAPALM-PARSE-002");
+            return this.node("ErrorExpression", at, at, {});
+        }
+        this.depth++;
+        let left = this.prefix();
+        while (!this.eof()) {
+            if (this.current().kind === "newline") {
+                let next = 1;
+                while (this.peek(next).kind === "newline") next++;
+                const nextText = this.text(next);
+                if (nextText === "." || nextText === "?." || nextText === "|>" ||
+                    (bindingPower(nextText) >= minimum && bindingPower(nextText) >= 0)) {
+                    this.skipLines();
+                } else break;
+            }
+            const symbol = this.text(0);
+            const start = left.startByte;
+            if (symbol === "." || symbol === "?." || symbol === "[") {
+                if (18 < minimum) break;
+                left = this.member(left);
+                continue;
+            }
+            if (symbol === "(" && 18 >= minimum) {
+                const args = this.argumentsList();
+                left = this.node("CallExpression", start, this.lastEnd,
+                    {callee: left, arguments: args, optional: false});
+                continue;
+            }
+            if (symbol === "<" && 18 >= minimum && this.typeCallAhead()) {
+                this.take();
+                const typeArguments = [];
+                while (!this.eof() && !this.atTypeClose()) {
+                    typeArguments.push(this.typeExpression());
+                    if (!this.eat(",")) break;
+                }
+                this.consumeTypeClose();
+                const args = this.argumentsList();
+                left = this.node("CallExpression", start, this.lastEnd,
+                    {callee: left, arguments: args, typeArguments: typeArguments, optional: false});
+                continue;
+            }
+            if ((symbol === "++" || symbol === "--") && 17 >= minimum) {
+                const operator = this.take().text;
+                left = this.node("UpdateExpression", start, this.lastEnd,
+                    {operator: operator, argument: left, prefix: false});
+                continue;
+            }
+            if (symbol === "?" && minimum <= 3) {
+                this.take();
+                this.skipLines();
+                const consequent = this.expression(2, allowIn);
+                this.expect(":", null);
+                this.skipLines();
+                const alternate = this.expression(2, allowIn);
+                left = this.node("ConditionalExpression", start, this.lastEnd,
+                    {test: left, consequent: consequent, alternate: alternate});
+                continue;
+            }
+            if (!allowIn && (symbol === "of" || symbol === "in")) break;
+            const power = bindingPower(symbol);
+            if (power < minimum || power < 0) break;
+            const operator = this.take().text;
+            this.skipLines();
+            const right = this.expression(
+                ASSIGNMENTS.has(operator) || operator === "**" ? power : power + 1,
+                allowIn);
+            left = this.node(ASSIGNMENTS.has(operator) ? "AssignmentExpression" :
+                operator === "|>" ? "PipelineExpression" :
+                operator === "&&" || operator === "||" || operator === "??" ?
+                    "LogicalExpression" : "BinaryExpression", start, this.lastEnd,
+                {operator: operator, left: left, right: right});
+        }
+        this.depth--;
+        return left;
+    }
+}
+
+// Syntax only: no name resolution, type checking, or Rust frontend integration.
+// Reuse the lexer output when it was already produced for document diagnostics.
+export function parse(source) {
+    return parseLexed(source, null);
+}
+
+export function parseLexed(source, lexical) {
+    if (typeof source !== "String") throw "Parser expects a String";
+    return new Parser(source, lexical).run();
+}

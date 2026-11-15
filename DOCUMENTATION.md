@@ -966,17 +966,55 @@ System.print(pair.call(4, 5)); // [4, 5]
 
 An ordinary closure call fills missing parameters with `null` and ignores
 excess arguments, up to the global limit of **16 arguments**. This does not
-implement optional or rest parameters:
+implement rest parameters:
 
 - A `b?: string` parameter retains the `string` annotation. Omitting it passes
   `null` and may cause a fatal type error.
 - An unannotated parameter can receive that `null`.
 - Methods and constructors are looked up by **name and arity**; do not assume
-  they use the same rules as a closure.
+  they use the same rules as a closure. Only trailing parameters with default
+  values (below) can be omitted from a method or constructor call.
 - `launch` requires exactly the declared arity.
-- There is no `function f(...args)` or `function f(x = 1)`.
-- If default values are needed, use a check in the body or a destructured
-  parameter with defaults inside the pattern.
+- There is no `function f(...args)`.
+
+### Default Parameter Values
+
+A parameter can declare a default value with `= value`. This works in functions,
+arrow functions, generators, methods, static methods and constructors, including
+constructor parameter properties and destructured parameters:
+
+```napalm
+function greet(name: string = "world", punct = "!") {
+    return "hi " + name + punct;
+}
+greet();             // hi world!
+greet("Ana");        // hi Ana!
+
+function range(start: number, end: number = start + 10) { return [start, end]; }
+range(5);            // [5, 15]: a default can read earlier parameters
+
+class Lexer {
+    constructor(public source: string = "", public pos: number = 0) {}
+    peek(distance = 0) { return this.pos + distance; }
+}
+new Lexer().peek();  // 0
+
+interface Size { w: number; h: number; }
+function area({ w, h }: Size = { w: 1, h: 1 }) { return w * h; }
+```
+
+- The default is evaluated on **every call** that needs it, left to right, after
+  the parameters before it. It is not a shared value computed once.
+- Because an omitted argument arrives as `null`, an **explicit `null` also
+  selects the default**. This is unlike JavaScript, where only `undefined`
+  does.
+- A declared type applies to the final value: `x: number = 0` is checked as
+  `number` after the default is substituted. Callers may still omit `x` or
+  pass `null`. A default with the wrong type fails at runtime when it is used.
+- A method or constructor with trailing defaults also answers every shorter
+  arity. The shorter arity forwards to the class's own implementation. A
+  shorter arity that the class declares explicitly takes precedence.
+- `x?: T = value` is rejected: a parameter with a default is already optional.
 
 For a function that explicitly accepts absence:
 

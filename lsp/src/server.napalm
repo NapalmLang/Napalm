@@ -1,14 +1,16 @@
 // JSON-RPC 2.0 / LSP 3.17 lifecycle and text-document synchronization.
 import {sendFrame, logError} from "./transport";
-import {tokenize} from "./lexer";
-import {parseLexed} from "./parser";
+import {buildModuleIndex, recordForUri, documentDiagnostics, moduleDefinitionAt, moduleReferencesAt} from "./module_index";
 import {createDocumentStore, openDocument, changeDocument, closeDocument, getDocument} from "./documents";
 
 export function createServerState() {
     return {
         initialized: false,
         shutdown: false,
-        documents: createDocumentStore()
+        documents: createDocumentStore(),
+        analyses: new Map(),
+        workspaceRoots: [],
+        moduleIndex: null
     };
 }
 
@@ -24,44 +26,47 @@ export function reportParseError() {
     respondError(null, -32700, "Parse error");
 }
 
-// Diagnostics are computed from unsaved editor text. Lexical and syntactic
-// failures are independent: malformed tokens must not hide later parser errors.
-function publishSyntaxDiagnostics(uri, version, source) {
-    const lexed = tokenize(source);
-    const parsed = parseLexed(source, lexed);
-    const diagnostics = [];
-    for (const diagnostic of lexed.diagnostics) {
-        diagnostics.push({
-            range: diagnostic.range,
-            severity: diagnostic.severity,
-            code: diagnostic.code,
-            source: "napalm-lexer",
-            message: diagnostic.message
+// Rebuild the reachable source graph on changes. Unsaved editor buffers are
+// authoritative; dependent open documents receive fresh diagnostics as well.
+function refreshModules(state) {
+    const index = buildModuleIndex(state["documents"], state["workspaceRoots"]);
+    state["moduleIndex"] = index;
+    for (const uri of state["documents"].keys()) {
+        const record = recordForUri(index, uri);
+        if (record === null) continue;
+        const document = getDocument(state["documents"], uri);
+        state["analyses"].set(uri, {version: document["version"], result: record.semantic});
+        sendFrame({
+            jsonrpc: "2.0",
+            method: "textDocument/publishDiagnostics",
+            params: {uri: uri, version: document["version"], diagnostics: documentDiagnostics(index, uri)}
         });
     }
-    for (const diagnostic of parsed.diagnostics) {
-        // A bad token can also trigger a parser error at the same location;
-        // keep the more specific lexical error instead of reporting twice.
-        let duplicated = false;
-        for (const earlier of lexed.diagnostics) {
-            if (earlier.startByte === diagnostic.startByte) {
-                duplicated = true;
-                break;
-            }
+}
+
+function addRoot(state, uri) {
+    if (typeof uri !== "String" || !uri.startsWith("file:")) return;
+    try {
+        const path = Path.normalize(Uri.toFilePath(uri));
+        for (const existing of state["workspaceRoots"]) {
+            if (existing === path) return;
         }
-        if (!duplicated) diagnostics.push({
-            range: diagnostic.range,
-            severity: diagnostic.severity,
-            code: diagnostic.code,
-            source: "napalm-parser",
-            message: diagnostic.message
-        });
+        state["workspaceRoots"].push(path);
+    } catch (error) { }
+}
+
+function initializeWorkspace(state, params) {
+    if (!isObjectValue(params)) return;
+    const folders = params["workspaceFolders"];
+    if (folders !== null) {
+        for (const folder of folders) {
+            if (isObjectValue(folder)) addRoot(state, folder["uri"]);
+        }
     }
-    sendFrame({
-        jsonrpc: "2.0",
-        method: "textDocument/publishDiagnostics",
-        params: {uri: uri, version: version, diagnostics: diagnostics}
-    });
+    if (state["workspaceRoots"].length === 0) addRoot(state, params["rootUri"]);
+    if (state["workspaceRoots"].length === 0 && typeof params["rootPath"] === "String") {
+        state["workspaceRoots"].push(Path.normalize(params["rootPath"]));
+    }
 }
 
 function clearLexicalDiagnostics(uri) {
@@ -70,6 +75,12 @@ function clearLexicalDiagnostics(uri) {
         method: "textDocument/publishDiagnostics",
         params: {uri: uri, diagnostics: []}
     });
+}
+
+function isObjectValue(value) {
+    if (value === null) return false;
+    const kind = typeof value;
+    return kind === "Object" || kind === "Map";
 }
 
 function validateRequestId(id) {
@@ -108,11 +119,15 @@ export function handleMessage(state, request) {
             respondError(id, -32600, "Server already initialized");
             return false;
         }
+        initializeWorkspace(state, request["params"]);
         state["initialized"] = true;
         respond(id, {
             capabilities: {
                 positionEncoding: "utf-16",
-                textDocumentSync: {openClose: true, change: 2}
+                textDocumentSync: {openClose: true, change: 2},
+                definitionProvider: true,
+                referencesProvider: true,
+                documentSymbolProvider: true
             },
             serverInfo: {name: "napalm-lsp", version: "0.1.0"}
         });
@@ -138,6 +153,51 @@ export function handleMessage(state, request) {
     if (method === "initialized") return false;
     if (method === "$/cancelRequest" || method === "$/setTrace") return false;
 
+    if (method === "textDocument/definition" ||
+        method === "textDocument/references" ||
+        method === "textDocument/documentSymbol") {
+        if (!hasId) return false;
+        const params = request["params"];
+        const document = !isObjectValue(params) ? null : params["textDocument"];
+        const uri = !isObjectValue(document) ? null : document["uri"];
+        if (typeof uri !== "String" || getDocument(state["documents"], uri) === null) {
+            respondError(id, -32602, "Document is not open");
+            return false;
+        }
+        const cached = state["analyses"].get(uri);
+        if (cached === null) {
+            respondError(id, -32603, "Document analysis is unavailable");
+            return false;
+        }
+        const semantic = cached["result"];
+        if (method === "textDocument/documentSymbol") {
+            respond(id, semantic["documentSymbols"]);
+            return false;
+        }
+        const position = params["position"];
+        if (!isObjectValue(position) || typeof position["line"] !== "Number" ||
+            typeof position["character"] !== "Number" ||
+            !position["line"].isInteger || !position["character"].isInteger ||
+            position["line"] < 0 || position["character"] < 0) {
+            respondError(id, -32602, "Invalid document position");
+            return false;
+        }
+        if (method === "textDocument/definition") {
+            respond(id, moduleDefinitionAt(state["moduleIndex"], uri, position));
+            return false;
+        }
+        const context = params["context"];
+        const includeDeclaration = isObjectValue(context) && context["includeDeclaration"] === true;
+        respond(id, moduleReferencesAt(state["moduleIndex"], uri, position, includeDeclaration));
+        return false;
+    }
+
+    if (method === "workspace/didChangeWatchedFiles") {
+        refreshModules(state);
+        if (hasId) respond(id, null);
+        return false;
+    }
+
     if (method === "textDocument/didOpen" ||
         method === "textDocument/didChange" ||
         method === "textDocument/didClose") {
@@ -157,11 +217,10 @@ export function handleMessage(state, request) {
             }
             const uri = params["textDocument"]["uri"];
             if (method === "textDocument/didClose") {
+                state["analyses"].delete(uri);
                 clearLexicalDiagnostics(uri);
-            } else {
-                const document = getDocument(state["documents"], uri);
-                publishSyntaxDiagnostics(uri, document["version"], document["text"]);
             }
+            refreshModules(state);
             if (hasId) respond(id, null);
         } catch (error) {
             if (hasId) respondError(id, -32602, "Invalid document notification params");

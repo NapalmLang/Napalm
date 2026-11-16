@@ -1,0 +1,580 @@
+// Lexical symbol resolution for the self-hosted Napalm language server.
+// This module intentionally does not call the Rust frontend or perform type checking.
+// Names have separate value and type domains; all positions are LSP UTF-16 ranges.
+
+const MAX_SEMANTIC_DIAGNOSTICS = 150;
+const MAX_SEMANTIC_SYMBOLS = 100_000;
+const MAX_SEMANTIC_DEPTH = 192;
+
+function stringSet(words) {
+    const values = new Set();
+    for (const word of words.split(" ")) if (word.length > 0) values.add(word);
+    return values;
+}
+
+// These are the engine-provided globals and predefined surface types, not imported symbols.
+// Only expression identifiers from this set bypass undefined-name diagnostics.
+const GLOBAL_VALUES = stringSet(
+    "Object Class Bool Boolean Null Num Number String Array List Map Range Fn Function Fiber " +
+    "System Date Random Promise Timer FFI fetch Set Proxy memoize once memoizeExpiring " +
+    "delay debounce throttle http get getJSON postJSON setTimeout print Event Emitter " +
+    "Channel Receiver ConcurrentMap ConcurrentSet Generator Bytes ByteBuffer JSON Fs Path " +
+    "Uri FileInfo File Process InputStream OutputStream FileWatcher"
+);
+const GLOBAL_TYPES = stringSet(
+    "any unknown never null boolean bool number num string object void true false " +
+    "Object Class Boolean Number String Array ReadonlyArray List Map ReadonlyMap Set ReadonlySet " +
+    "Record Function Fn Promise Fiber Generator Date Bytes ByteBuffer File FileInfo " +
+    "InputStream OutputStream FileWatcher Event Emitter Channel Receiver ConcurrentMap " +
+    "ConcurrentSet Range Proxy"
+);
+
+function get(node, field) {
+    if (node === null) return null;
+    if (node[field] === null) return null;
+    return node[field];
+}
+
+function scope(parent, category) {
+    return {parent: parent, category: category, values: new Map(), types: new Map(),
+        classScope: category === "class" ? null : (parent === null ? null : parent.classScope)};
+}
+
+function symbolKind(kind) {
+    if (kind === "class") return 5;
+    if (kind === "method") return 6;
+    if (kind === "property") return 7;
+    if (kind === "field") return 8;
+    if (kind === "constructor") return 9;
+    if (kind === "enum") return 10;
+    if (kind === "interface") return 11;
+    if (kind === "function") return 12;
+    if (kind === "variable" || kind === "parameter" || kind === "import") return 13;
+    if (kind === "constant") return 14;
+    if (kind === "enumMember") return 22;
+    if (kind === "type") return 23;
+    return 13;
+}
+
+function namedNode(node) {
+    if (node === null) return null;
+    return node.kind === "Identifier" && node.name.length > 0 ? node : null;
+}
+
+function documentEntry(name, kind, node, selection, children) {
+    return {name: name, kind: symbolKind(kind), range: node.range,
+        selectionRange: selection.range, children: children};
+}
+
+function declarationOutline(node) {
+    if (node === null) return [];
+    const kind = node.kind;
+    if (kind === "ExportDeclaration" || kind === "DeclareStatement" ||
+        kind === "DecoratedDeclaration" || kind === "ExportDefaultDeclaration") {
+        return declarationOutline(get(node, "declaration"));
+    }
+    if (kind === "VariableDeclaration") {
+        const entries = [];
+        for (const item of node.declarations) {
+            const id = namedNode(item.id);
+            if (id !== null) entries.push(documentEntry(id.name,
+                node.declarationKind === "const" ? "constant" : "variable", item, id, []));
+        }
+        return entries;
+    }
+    const id = namedNode(get(node, "id"));
+    if (id === null) return [];
+    let category = null;
+    if (kind === "FunctionDeclaration") category = "function";
+    else if (kind === "ClassDeclaration") category = "class";
+    else if (kind === "InterfaceDeclaration") category = "interface";
+    else if (kind === "TypeAliasDeclaration") category = "type";
+    else if (kind === "EnumDeclaration") category = "enum";
+    if (category === null) return [];
+    const children = [];
+    if (category === "class") {
+        for (const member of node.members) {
+            const name = namedNode(member.name);
+            if (name === null) continue;
+            const memberCategory = member.kind === "FieldDefinition" ? "field" :
+                member.name.name === "constructor" ? "constructor" : "method";
+            children.push(documentEntry(name.name, memberCategory, member, name, []));
+        }
+    } else if (category === "enum") {
+        for (const member of node.members) {
+            const name = namedNode(member.name);
+            if (name !== null) children.push(documentEntry(name.name, "enumMember", member, name, []));
+        }
+    }
+    return [documentEntry(id.name, category, node, id, children)];
+}
+
+function outline(ast) {
+    const result = [];
+    if (ast === null) return result;
+    for (const node of ast.body) {
+        for (const entry of declarationOutline(node)) result.push(entry);
+    }
+    return result;
+}
+
+class SemanticAnalyzer {
+    constructor() {
+        this.diagnostics = [];
+        this.symbols = [];
+        this.occurrences = [];
+        this.depth = 0;
+    }
+
+    diagnostic(node, code, message) {
+        if (node === null || this.diagnostics.length >= MAX_SEMANTIC_DIAGNOSTICS) return;
+        this.diagnostics.push({code: code, message: message, severity: 1,
+            startByte: node.startByte, endByte: node.endByte, range: node.range});
+    }
+
+    bind(targetScope, id, category, domain) {
+        const name = namedNode(id);
+        if (name === null || this.symbols.length >= MAX_SEMANTIC_SYMBOLS) return null;
+        const table = domain === "type" ? targetScope.types : targetScope.values;
+        const existing = table.get(name.name);
+        if (existing !== null) {
+            this.diagnostic(name, "NAPALM-SEM-002", "Duplicate declaration of '" + name.name + "'");
+            return existing;
+        }
+        const record = {id: this.symbols.length, name: name.name, kind: category,
+            declaration: name, domain: domain};
+        this.symbols.push(record);
+        table.set(name.name, record);
+        this.occurrences.push({startByte: name.startByte, endByte: name.endByte,
+            range: name.range, symbol: record, declaration: true});
+        return record;
+    }
+
+    bindBoth(targetScope, id, category) {
+        const record = this.bind(targetScope, id, category, "value");
+        const name = namedNode(id);
+        if (record !== null && name !== null) {
+            if (targetScope.types.has(name.name)) {
+                this.diagnostic(name, "NAPALM-SEM-002", "Duplicate type declaration of '" + name.name + "'");
+            } else targetScope.types.set(name.name, record);
+        }
+    }
+
+    lookup(targetScope, name, domain) {
+        let current = targetScope;
+        while (current !== null) {
+            const table = domain === "type" ? current.types : current.values;
+            const found = table.get(name);
+            if (found !== null) return found;
+            current = current.parent;
+        }
+        return null;
+    }
+
+    reference(id, targetScope, domain, strict) {
+        const node = namedNode(id);
+        if (node === null) return;
+        const found = this.lookup(targetScope, node.name, domain);
+        if (found !== null) {
+            this.occurrences.push({startByte: node.startByte, endByte: node.endByte,
+                range: node.range, symbol: found, declaration: false});
+        } else if (strict && domain === "value" && !GLOBAL_VALUES.has(node.name)) {
+            this.diagnostic(node, "NAPALM-SEM-001", "Undefined variable '" + node.name + "'");
+        }
+    }
+
+    declarePattern(node, targetScope, category) {
+        if (node === null) return;
+        const kind = node.kind;
+        if (kind === "Identifier") { this.bind(targetScope, node, category, "value"); return; }
+        if (kind === "AssignmentPattern") { this.declarePattern(node.left, targetScope, category); return; }
+        if (kind === "RestPattern") { this.declarePattern(node.argument, targetScope, category); return; }
+        if (kind === "ArrayPattern") {
+            for (const part of node.elements) this.declarePattern(part, targetScope, category);
+        } else if (kind === "ObjectPattern") {
+            for (const item of node.properties) {
+                if (item.kind === "PatternProperty") this.declarePattern(item.value, targetScope, category);
+                else this.declarePattern(item, targetScope, category);
+            }
+        }
+    }
+
+    patternUses(node, targetScope) {
+        if (node === null) return;
+        if (node.kind === "AssignmentPattern") {
+            this.patternUses(node.left, targetScope);
+            this.visit(node.right, targetScope);
+        } else if (node.kind === "RestPattern") {
+            this.patternUses(node.argument, targetScope);
+        } else if (node.kind === "ArrayPattern") {
+            for (const part of node.elements) this.patternUses(part, targetScope);
+        } else if (node.kind === "ObjectPattern") {
+            for (const item of node.properties) {
+                if (item.kind === "PatternProperty") {
+                    this.propertyNameUses(item.key, targetScope);
+                    this.patternUses(item.value, targetScope);
+                } else this.patternUses(item, targetScope);
+            }
+        }
+    }
+
+    predeclare(node, targetScope) {
+        if (node === null) return;
+        const kind = node.kind;
+        if (kind === "ExportDeclaration" || kind === "DeclareStatement" ||
+            kind === "DecoratedDeclaration" || kind === "ExportDefaultDeclaration") {
+            this.predeclare(get(node, "declaration"), targetScope);
+        } else if (kind === "VariableDeclaration") {
+            const category = node.declarationKind === "const" ? "constant" : "variable";
+            for (const item of node.declarations) this.declarePattern(item.id, targetScope, category);
+        } else if (kind === "FunctionDeclaration") this.bind(targetScope, node.id, "function", "value");
+        else if (kind === "ClassDeclaration") this.bindBoth(targetScope, node.id, "class");
+        else if (kind === "EnumDeclaration") this.bindBoth(targetScope, node.id, "enum");
+        else if (kind === "TypeAliasDeclaration") this.bind(targetScope, node.id, "type", "type");
+        else if (kind === "InterfaceDeclaration") this.bind(targetScope, node.id, "interface", "type");
+        else if (kind === "ImportDeclaration") {
+            for (const specifier of node.specifiers) {
+                if (node.typeOnly) this.bind(targetScope, specifier.local, "import", "type");
+                else this.bindBoth(targetScope, specifier.local, "import");
+            }
+        }
+    }
+
+    statements(body, parent, newScope) {
+        const targetScope = newScope ? scope(parent, "block") : parent;
+        for (const statement of body) this.predeclare(statement, targetScope);
+        for (const statement of body) this.visit(statement, targetScope);
+    }
+
+    typeParameters(params, targetScope) {
+        for (const param of params) this.bind(targetScope, param.name, "type", "type");
+        for (const param of params) {
+            this.visitType(get(param, "constraint"), targetScope);
+            this.visitType(get(param, "defaultType"), targetScope);
+        }
+    }
+
+    parameters(params, targetScope) {
+        for (const param of params) {
+            this.declarePattern(param.name, targetScope, "parameter");
+            this.patternUses(param.name, targetScope);
+            this.visitType(get(param, "annotation"), targetScope);
+            this.visit(get(param, "defaultValue"), targetScope);
+        }
+    }
+
+    functionBody(node, parent) {
+        const fn = scope(parent, "function");
+        if (node.kind === "FunctionExpression") this.bind(fn, get(node, "id"), "function", "value");
+        if (get(node, "typeParameters") !== null) this.typeParameters(node.typeParameters, fn);
+        this.parameters(node.params, fn);
+        this.visitType(get(node, "returnType"), fn);
+        this.visit(get(node, "body"), fn);
+    }
+
+    classBody(node, parent) {
+        const cls = scope(parent, "class");
+        cls.classScope = cls;
+        if (node.kind === "ClassExpression") this.bindBoth(cls, get(node, "id"), "class");
+        this.typeParameters(node.typeParameters, cls);
+        this.visit(get(node, "superClass"), cls);
+        for (const type of node["implements"]) this.visitType(type, cls);
+        // All members are known before their bodies, so this.method can navigate forward.
+        // A getter and setter may legally share a property name.
+        const accessorSides = new Map();
+        for (const member of node.members) {
+            if (member.kind !== "MethodDefinition" && member.kind !== "FieldDefinition") continue;
+            if (member.name.kind !== "Identifier") continue;
+            const name = member.name.name;
+            const side = get(member, "memberKind");
+            if (side === "get" || side === "set") {
+                const previous = accessorSides.get(name);
+                if (previous !== null) {
+                    if (previous === side || previous === "both") {
+                        this.diagnostic(member.name, "NAPALM-SEM-002", "Duplicate accessor '" + name + "'");
+                    } else accessorSides.set(name, "both");
+                    continue;
+                }
+                accessorSides.set(name, side);
+                this.bind(cls, member.name, "property", "value");
+            } else this.bind(cls, member.name,
+                member.kind === "FieldDefinition" ? "field" : "method", "value");
+        }
+        for (const member of node.members) {
+            if (member.kind === "StaticBlock") this.visit(member.body, cls);
+            else if (member.kind === "MethodDefinition" || member.kind === "FieldDefinition") {
+                for (const decorator of member.decorators) this.visit(decorator, cls);
+                this.propertyNameUses(member.name, cls);
+                if (member.kind === "FieldDefinition") {
+                    this.visitType(get(member, "annotation"), cls);
+                    this.visit(get(member, "initializer"), cls);
+                } else this.functionBody(member, cls);
+            }
+        }
+    }
+
+    propertyNameUses(name, targetScope) {
+        if (name !== null && name.kind === "ComputedPropertyName") this.visit(name.expression, targetScope);
+    }
+
+    visitType(node, targetScope) {
+        if (node === null) return;
+        const kind = node.kind;
+        if (kind === "Identifier") {
+            // Unknown types are deferred until cross-module type resolution exists.
+            if (!GLOBAL_TYPES.has(node.name)) this.reference(node, targetScope, "type", false);
+        } else if (kind === "GenericType") {
+            this.visitType(node.name, targetScope);
+            for (const arg of node.arguments) this.visitType(arg, targetScope);
+        } else if (kind === "QualifiedTypeName") this.visitType(node.object, targetScope);
+        else if (kind === "UnionType" || kind === "IntersectionType") {
+            this.visitType(node.left, targetScope);
+            this.visitType(node.right, targetScope);
+        } else if (kind === "ArrayType") this.visitType(node.element, targetScope);
+        else if (kind === "OptionalType" || kind === "RestType") this.visitType(node.base, targetScope);
+        else if (kind === "TypeOperator") this.visitType(node.argument, targetScope);
+        else if (kind === "ParenthesizedType") {
+            this.visitType(get(node, "inner"), targetScope);
+            if (get(node, "params") !== null) for (const param of node.params) this.visitType(param, targetScope);
+        } else if (kind === "TupleType") for (const item of node.elements) this.visitType(item, targetScope);
+        else if (kind === "ObjectType") {
+            for (const member of node.members) {
+                this.propertyNameUses(member.name, targetScope);
+                this.visitType(member.annotation, targetScope);
+            }
+        } else if (kind === "MethodType" || kind === "FunctionType") {
+            const child = scope(targetScope, "function");
+            this.parameters(node.params, child);
+            this.visitType(get(node, "returnType"), child);
+        }
+    }
+
+    visit(node, targetScope) {
+        if (node === null) return;
+        if (this.depth >= MAX_SEMANTIC_DEPTH) {
+            this.diagnostic(node, "NAPALM-SEM-003", "Maximum semantic nesting depth exceeded");
+            return;
+        }
+        this.depth++;
+        this.visitInner(node, targetScope);
+        this.depth--;
+    }
+
+    visitInner(node, targetScope) {
+        const kind = node.kind;
+        if (kind === "Identifier") { this.reference(node, targetScope, "value", true); return; }
+        if (kind === "Module") { this.statements(node.body, targetScope, false); return; }
+        if (kind === "BlockStatement") { this.statements(node.body, targetScope, true); return; }
+        if (kind === "VariableDeclaration") {
+            for (const item of node.declarations) {
+                this.patternUses(item.id, targetScope);
+                this.visitType(get(item, "annotation"), targetScope);
+                this.visit(get(item, "init"), targetScope);
+            }
+            return;
+        }
+        if (kind === "FunctionDeclaration" || kind === "FunctionExpression" ||
+            kind === "ArrowFunctionExpression" || kind === "LambdaExpression") {
+            this.functionBody(node, targetScope); return;
+        }
+        if (kind === "ClassDeclaration" || kind === "ClassExpression") {
+            this.classBody(node, targetScope); return;
+        }
+        if (kind === "InterfaceDeclaration" || kind === "TypeAliasDeclaration") {
+            const child = scope(targetScope, "type");
+            this.typeParameters(node.typeParameters, child);
+            if (kind === "InterfaceDeclaration") {
+                for (const parent of node["extends"]) this.visitType(parent, child);
+                this.visitType(node.body, child);
+            } else this.visitType(node.annotation, child);
+            return;
+        }
+        if (kind === "EnumDeclaration") {
+            // Enum member initializers may use previously declared member names.
+            const members = scope(targetScope, "enum");
+            for (const member of node.members) this.bind(members, member.name, "enumMember", "value");
+            for (const member of node.members) this.visit(get(member, "initializer"), members);
+            return;
+        }
+        if (kind === "ImportDeclaration") return;
+        if (kind === "ExportDeclaration" || kind === "ExportDefaultDeclaration" ||
+            kind === "DeclareStatement" || kind === "DecoratedDeclaration") {
+            if (get(node, "decorators") !== null) for (const item of node.decorators) this.visit(item, targetScope);
+            this.visit(get(node, "declaration"), targetScope);
+            return;
+        }
+        if (kind === "ExportNamedDeclaration") {
+            if (get(node, "source") === null) for (const item of node.specifiers) {
+                this.reference(item.local, targetScope, node.typeOnly ? "type" : "value", true);
+            }
+            return;
+        }
+        if (kind === "ExpressionStatement" || kind === "ReturnStatement" ||
+            kind === "ThrowStatement" || kind === "DeferStatement" ||
+            kind === "ErrDeferStatement" || kind === "SpreadElement" ||
+            kind === "AwaitExpression" || kind === "YieldExpression" ||
+            kind === "UnaryExpression" || kind === "UpdateExpression" ||
+            kind === "Decorator" || kind === "ParenthesizedExpression") {
+            this.visit(get(node, "expression"), targetScope);
+            this.visit(get(node, "argument"), targetScope);
+            return;
+        }
+        if (kind === "MemberExpression") {
+            this.visit(node.object, targetScope);
+            if (node.computed) this.visit(node.property, targetScope);
+            else if (node.object.kind === "ThisExpression" && targetScope.classScope !== null) {
+                this.reference(node.property, targetScope.classScope, "value", false);
+            }
+            return;
+        }
+        if (kind === "CallExpression" || kind === "NewExpression") {
+            this.visit(node.callee, targetScope);
+            for (const item of node.arguments) this.visit(item, targetScope);
+            if (get(node, "typeArguments") !== null) for (const type of node.typeArguments) this.visitType(type, targetScope);
+            return;
+        }
+        if (kind === "AssignmentPattern") {
+            this.visit(node.left, targetScope);
+            this.visit(node.right, targetScope);
+            return;
+        }
+        if (kind === "AssignmentExpression" || kind === "PipelineExpression" ||
+            kind === "BinaryExpression" || kind === "LogicalExpression") {
+            this.visit(node.left, targetScope); this.visit(node.right, targetScope); return;
+        }
+        if (kind === "ConditionalExpression") {
+            this.visit(node.test, targetScope);
+            this.visit(node.consequent, targetScope);
+            this.visit(node.alternate, targetScope);
+            return;
+        }
+        if (kind === "SequenceExpression" || kind === "ArrayExpression") {
+            const items = kind === "SequenceExpression" ? node.expressions : node.elements;
+            for (const item of items) this.visit(item, targetScope);
+            return;
+        }
+        if (kind === "ObjectExpression") {
+            for (const property of node.properties) this.visit(property, targetScope);
+            return;
+        }
+        if (kind === "ObjectProperty") {
+            this.propertyNameUses(node.key, targetScope);
+            this.visit(node.value, targetScope);
+            return;
+        }
+        if (kind === "ObjectMethod") {
+            this.propertyNameUses(node.key, targetScope);
+            this.functionBody(node, targetScope);
+            return;
+        }
+        if (kind === "TemplateLiteral") {
+            for (const item of node.expressions) this.visit(item, targetScope);
+            return;
+        }
+        if (kind === "ListComprehension") {
+            const child = scope(targetScope, "block");
+            for (const clause of node.clauses) {
+                this.visit(clause.iterable, child);
+                this.bind(child, clause.name, "variable", "value");
+                for (const filter of clause.filters) this.visit(filter, child);
+            }
+            this.visit(node.element, child);
+            return;
+        }
+        if (kind === "IfStatement") {
+            this.visit(node.test, targetScope);
+            this.visit(node.consequent, targetScope);
+            this.visit(node.alternate, targetScope);
+            return;
+        }
+        if (kind === "WhileStatement" || kind === "DoWhileStatement") {
+            this.visit(node.test, targetScope); this.visit(node.body, targetScope); return;
+        }
+        if (kind === "ForStatement" || kind === "ForInStatement" || kind === "ForOfStatement") {
+            const child = scope(targetScope, "block");
+            if (kind === "ForStatement") {
+                this.predeclare(get(node, "init"), child);
+                this.visit(get(node, "init"), child);
+                this.visit(get(node, "test"), child);
+                this.visit(get(node, "update"), child);
+            } else {
+                this.predeclare(get(node, "left"), child);
+                this.visit(get(node, "right"), child);
+                this.visit(get(node, "left"), child);
+            }
+            this.visit(node.body, child);
+            return;
+        }
+        if (kind === "SwitchStatement") {
+            this.visit(node.discriminant, targetScope);
+            const child = scope(targetScope, "block");
+            for (const item of node.cases) {
+                this.visit(get(item, "test"), child);
+                for (const stmt of item.consequent) this.predeclare(stmt, child);
+            }
+            for (const item of node.cases) for (const stmt of item.consequent) this.visit(stmt, child);
+            return;
+        }
+        if (kind === "TryStatement") {
+            this.visit(node.block, targetScope);
+            this.visit(get(node, "handler"), targetScope);
+            this.visit(get(node, "finalizer"), targetScope);
+            return;
+        }
+        if (kind === "CatchClause") {
+            const child = scope(targetScope, "block");
+            this.declarePattern(get(node, "param"), child, "parameter");
+            this.visit(node.body, child);
+            return;
+        }
+        if (kind === "LabeledStatement") { this.visit(node.body, targetScope); return; }
+        // Error nodes, raw literals, labels, and other terminals intentionally
+        // produce no name-resolution diagnostics.
+    }
+
+    run(ast) {
+        const global = scope(null, "module");
+        this.visit(ast, global);
+        return {diagnostics: this.diagnostics, symbols: this.symbols,
+            occurrences: this.occurrences, documentSymbols: outline(ast)};
+    }
+}
+
+export function analyze(ast) {
+    return new SemanticAnalyzer().run(ast);
+}
+
+// Returns the declaration for a reference or the declaration under the cursor.
+// Selection is half-open, except that an editor cursor at the final character
+// is naturally covered by the corresponding UTF-16 code-unit position.
+export function symbolAt(result, position) {
+    if (position === null) return null;
+    for (const item of result.occurrences) {
+        const start = item.range.start;
+        const end = item.range.end;
+        const afterStart = position.line > start.line ||
+            (position.line === start.line && position.character >= start.character);
+        const beforeEnd = position.line < end.line ||
+            (position.line === end.line && position.character < end.character);
+        if (afterStart && beforeEnd) return item.symbol;
+    }
+    return null;
+}
+
+export function definitionAt(result, uri, position) {
+    const found = symbolAt(result, position);
+    if (found === null) return null;
+    return {uri: uri, range: found.declaration.range};
+}
+
+export function referencesAt(result, uri, position, includeDeclaration) {
+    const found = symbolAt(result, position);
+    if (found === null) return [];
+    const locations = [];
+    for (const item of result.occurrences) {
+        if (item.symbol.id === found.id && (includeDeclaration || !item.declaration)) {
+            locations.push({uri: uri, range: item.range});
+        }
+    }
+    return locations;
+}

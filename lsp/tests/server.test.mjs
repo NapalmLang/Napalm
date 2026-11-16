@@ -137,3 +137,105 @@ test('Lexer publishes UTF-16 diagnostics for unsaved documents and clears them',
   assert.deepEqual(diagnostics[1].params.diagnostics, []);
   assert.deepEqual(diagnostics[2].params.diagnostics, []);
 });
+
+test('Parser diagnostics recover after a valid incremental edit', onlyIfPresent, async () => {
+  const uri = 'file:///project/syntax.napalm';
+  const messages = [
+    {jsonrpc: '2.0', id: 1, method: 'initialize', params: {capabilities: {}}},
+    {jsonrpc: '2.0', method: 'textDocument/didOpen', params: {
+      textDocument: {uri, languageId: 'napalm', version: 1, text: 'const answer = ;\nconst valid = 42;'},
+    }},
+    {jsonrpc: '2.0', method: 'textDocument/didChange', params: {
+      textDocument: {uri, version: 2}, contentChanges: [{text: 'const answer = 7;\nconst valid = 42;'}],
+    }},
+    {jsonrpc: '2.0', id: 2, method: 'shutdown'},
+    {jsonrpc: '2.0', method: 'exit'},
+  ];
+  const {responses} = await runServer(messages.map(encodeFrame));
+  const updates = responses.filter((response) => response.method === 'textDocument/publishDiagnostics');
+  assert.equal(updates.length, 2);
+  assert.equal(updates[0].params.version, 1);
+  assert.ok(updates[0].params.diagnostics.some((item) => String(item.code).startsWith('NAPALM-PARSE-')));
+  assert.equal(updates[1].params.version, 2);
+  assert.deepEqual(updates[1].params.diagnostics, []);
+});
+
+
+test('Semantic navigation, document symbols, references and fresh diagnostics', onlyIfPresent, async () => {
+  const uri = 'file:///project/semantic.napalm';
+  const messages = [
+    {jsonrpc: '2.0', id: 1, method: 'initialize', params: {capabilities: {}}},
+    {jsonrpc: '2.0', method: 'textDocument/didOpen', params: {
+      textDocument: {uri, languageId: 'napalm', version: 1,
+        text: 'const value = 1;\nconst doubled = value + value;\n'},
+    }},
+    {jsonrpc: '2.0', id: 2, method: 'textDocument/definition', params: {
+      textDocument: {uri}, position: {line: 1, character: 17},
+    }},
+    {jsonrpc: '2.0', id: 3, method: 'textDocument/references', params: {
+      textDocument: {uri}, position: {line: 0, character: 7},
+      context: {includeDeclaration: true},
+    }},
+    {jsonrpc: '2.0', id: 4, method: 'textDocument/documentSymbol', params: {textDocument: {uri}}},
+    {jsonrpc: '2.0', method: 'textDocument/didChange', params: {
+      textDocument: {uri, version: 2},
+      contentChanges: [{text: 'const value = 1;\nconst doubled = missing;\n'}],
+    }},
+    {jsonrpc: '2.0', method: 'textDocument/didClose', params: {textDocument: {uri}}},
+    {jsonrpc: '2.0', id: 5, method: 'shutdown'},
+    {jsonrpc: '2.0', method: 'exit'},
+  ];
+  const {responses} = await runServer(messages.map(encodeFrame));
+  const requests = responses.filter(item => Object.hasOwn(item, 'id'));
+  const [init, definition, references, symbols, shutdown] = requests;
+  assert.equal(init.result.capabilities.definitionProvider, true);
+  assert.equal(init.result.capabilities.referencesProvider, true);
+  assert.equal(init.result.capabilities.documentSymbolProvider, true);
+  assert.deepEqual(definition.result, {uri, range: {
+    start: {line: 0, character: 6}, end: {line: 0, character: 11},
+  }});
+  assert.equal(references.result.length, 3);
+  assert.deepEqual(Array.from(symbols.result, item => item.name), ['value', 'doubled']);
+  assert.equal(shutdown.result, null);
+  const publications = responses.filter(item => item.method === 'textDocument/publishDiagnostics');
+  assert.equal(publications.length, 3);
+  assert.deepEqual(publications[0].params.diagnostics, []);
+  assert.ok(publications[1].params.diagnostics.some(item => item.code === 'NAPALM-SEM-001'));
+  assert.deepEqual(publications[2].params.diagnostics, []);
+});
+
+test('Cross-module definition, references, and re-analysis after unsaved edit', onlyIfPresent, async () => {
+  const {readFileSync} = await import('node:fs');
+  const {pathToFileURL} = await import('node:url');
+  const root = resolve(projectRoot, 'lsp/tests/fixtures/intermodule');
+  const entry = pathToFileURL(resolve(root, 'entry.napalm')).href;
+  const base = pathToFileURL(resolve(root, 'base.napalm')).href;
+  const entryText = readFileSync(resolve(root, 'entry.napalm'), 'utf8');
+  const baseText = readFileSync(resolve(root, 'base.napalm'), 'utf8');
+  const messages = [
+    {jsonrpc: '2.0', id: 1, method: 'initialize', params: {rootUri: pathToFileURL(root).href, capabilities: {}}},
+    {jsonrpc: '2.0', method: 'textDocument/didOpen', params: {textDocument: {
+      uri: entry, languageId: 'napalm', version: 1, text: entryText}}},
+    {jsonrpc: '2.0', id: 2, method: 'textDocument/definition', params: {
+      textDocument: {uri: entry}, position: {line: 2, character: 17}}},
+    {jsonrpc: '2.0', id: 3, method: 'textDocument/references', params: {
+      textDocument: {uri: entry}, position: {line: 2, character: 26},
+      context: {includeDeclaration: true}}},
+    {jsonrpc: '2.0', method: 'textDocument/didOpen', params: {textDocument: {
+      uri: base, languageId: 'napalm', version: 1, text: baseText}}},
+    {jsonrpc: '2.0', method: 'textDocument/didChange', params: {
+      textDocument: {uri: base, version: 2}, contentChanges: [{text: 'export const count = 7;\n'}]}},
+    {jsonrpc: '2.0', id: 4, method: 'textDocument/definition', params: {
+      textDocument: {uri: entry}, position: {line: 2, character: 17}}},
+    {jsonrpc: '2.0', id: 5, method: 'shutdown'},
+    {jsonrpc: '2.0', method: 'exit'},
+  ];
+  const {responses} = await runServer(messages.map(encodeFrame));
+  const request = (id) => responses.find((item) => item.id === id);
+  assert.equal(request(2).result.uri, base);
+  assert.ok(request(3).result.some((item) => item.uri === base));
+  assert.equal(request(4).result, null);
+  const publications = responses.filter((item) => item.method === 'textDocument/publishDiagnostics' &&
+    item.params.uri === entry);
+  assert.ok(publications.at(-1).params.diagnostics.some((item) => item.code === 'NAPALM-MOD-002'));
+});

@@ -12,9 +12,12 @@ Napalm is the continuation of WrenJIT with a TypeScript-inspired syntax and a dy
 
 For the complete, current language reference and runnable examples, see [DOCUMENTATION.md](DOCUMENTATION.md).
 
-The embedded database frontend (`[[[ ... ]]]`, targeting SurrealMX) is documented
-in [MX.md](docs/MX.md). Parsing and lowering to MX IR are implemented; execution
-is still pending.
+The embedded database eDSL (`[[[ ... ]]]`) is documented in [MX.md](docs/MX.md).
+Its frontend lowers to MX IR, and the [SQLite backend](docs/MX_SQLITE.md) compiles
+logical or optimized IR to parameterized SQL. The VM runs queries through explicit
+`Database.open(path)` connections and `db.execute(query)`. Schema SQL and persistent
+`db.getVersion()` / `SET VERSION` support migrations; see the runnable
+[database example](scripts/database.napalm).
 
 Variable types are optional: the compiler checks known incompatible assignments. Object interfaces also install persistent runtime contracts, enforced through every alias and in the JIT. See [object interfaces](docs/INTERFACES.md). Napalm does **not** promise compatibility with the full TypeScript/JavaScript language, Node.js, or browser APIs.
 

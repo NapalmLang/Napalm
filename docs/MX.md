@@ -1,14 +1,18 @@
-# Embedded database language: initial frontend
+# Embedded database language
 
 Napalm reserves contiguous `[[[ ... ]]]` for its database eDSL. The initial
 implementation parses these blocks into a separate MX AST and lowers that AST
 to verified, typed `napalm_mx_ir` logical plans against an existing catalog.
-The existing MX optimizer can then select physical operations for SurrealMX.
+The existing MX optimizer can then select physical operations. The
+[SQLite backend](MX_SQLITE.md) accepts both logical and optimized IR and emits
+parameterized SQL, retaining the current IR and optimization pipeline.
 
-**Execution is not implemented yet.** The host compiler reports `MX-B001` when
-asked to execute/build a program containing an MX expression. There is no
-database connection, automatic host-variable capture, or VM instruction yet.
-The examples below describe accepted frontend syntax, not runnable programs.
+The VM executes blocks through explicit SQLite connections. A block constructs a
+`DatabaseQuery` and captures its `$parameters` from lexical Napalm variables.
+`db.execute(query)` resolves the schema, lowers to MX IR, runs the existing
+optimizer and executes parameterized SQL. See the [runtime API](MX_SQLITE.md#vm-api)
+and [runnable example](../scripts/database.napalm). The syntax examples below
+assume a `users` table and host variables `minimumAge` and `id`.
 
 ```napalm
 const query = [[[
@@ -54,8 +58,11 @@ visible there. LIMIT/OFFSET are literal unsigned 64-bit integers.
 INSERT checks duplicate fields, row widths, required fields and assignment
 types. Missing nullable fields become NULL. UPDATE expressions read the input
 row and check duplicate assignments, types and nullability. An omitted WHERE
-targets all rows. No implicit schema creation, conversions, defaults, qualified
-names, joins, aggregates, DDL, RETURNING, or transaction syntax is implemented.
+targets all rows. No implicit schema creation, conversions, INSERT default-value
+expansion, qualified names, joins, aggregates, RETURNING, or transaction syntax
+is implemented. Schema statements (`CREATE TABLE`, `CREATE INDEX`, `UPDATE TABLE` /
+`ALTER TABLE`, `DROP TABLE` / `DROP INDEX`) and `SET VERSION` are described in
+[schema SQL and migrations](MX_SQLITE.md#schema-sql-and-migrations).
 
 ## Compiler API
 
@@ -65,16 +72,19 @@ one token and delegates its contents to `napalm_mx_front::parse(body, offset)`.
 Spans are absolute UTF-8 byte offsets into the original Napalm source.
 
 `napalm_mx_lowerer::lower(&block, &mut program, &parameters)` appends one query
-per statement and returns its `QueryId`s. The caller supplies an MX `Program`
+per data statement and returns its `QueryId`s; schema statements use the separate
+`napalm_mx_schema::compile` lowerer and are rejected by this relational entry point.
+The caller supplies an MX `Program`
 whose catalog names refer to its string pool, and typed `Parameter` contracts
 (`name`, `ty`, `nullable`). Only referenced parameters are emitted, in first-use
 order, with a single `ParamId` per name in each query. `$name` is a binding slot,
-not string substitution or a Napalm expression. The executor will bind values.
+not string substitution or a Napalm expression. The SQLite compiler returns
+positional bindings; the VM adapter supplies captured host values.
 
 Lowering uses query-local columns, emits snapshot reads or read/write queries,
 and calls `verify_query` before appending each result. A failed block rolls back
 all newly appended queries and strings. The statements are separate query
-plans; the block does **not** yet promise one atomic multi-statement transaction.
+plans; the VM executes the entire block in one atomic transaction.
 
 The resulting program can be passed to
 `napalm_mx_ir_optimizing::optimization_passes().optimize_program(&mut program)`.

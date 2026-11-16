@@ -37,6 +37,7 @@ pub fn lower(
         let mut ids = Vec::new();
         for statement in &block.statements {
             let table_name = match &statement.value {
+                Statement::Schema(_) => return Err(error(statement.span, "schema statements use the SQLite schema lowerer")),
                 Statement::Select { table, .. }
                 | Statement::Insert { table, .. }
                 | Statement::Update { table, .. }
@@ -286,6 +287,7 @@ impl Lowerer<'_> {
                     table: self.table.id,
                 }))
             }
+            Statement::Schema(_) => Err(error(span, "schema statements use the SQLite schema lowerer")),
         }
     }
     fn require(&self, id: ExprId, expected: ScalarType, span: Span) -> Result<()> {

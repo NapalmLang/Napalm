@@ -1258,7 +1258,11 @@ impl<'ast> Analyzer<'ast> {
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
         match &expr.kind {
-            ExprKind::Mx(_) => {}
+            ExprKind::Mx(block) => {
+                for name in crate::napalm_mx_front::parameters(block) {
+                    self.note_binding_use(&Ident::new(name.value.as_str().into(), name.span), false);
+                }
+            }
             ExprKind::Null | ExprKind::Bool(_) | ExprKind::Number(_) | ExprKind::String(_) => {}
             ExprKind::InterpolatedString(parts) => {
                 for part in parts {
@@ -4653,9 +4657,30 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn lower_expr(&mut self, expr: &Expr) -> ValueId {
         self.set_source(expr.span);
         match &expr.kind {
-            ExprKind::Mx(_) => {
-                self.error("MX-B001", "MX blocks require the database execution backend; use napalm_mx_lowerer::lower to compile their AST to MX IR", expr.span);
-                self.builder.const_null()
+            ExprKind::Mx(block) => {
+                // The schema belongs to the runtime connection. Persist the
+                // validated template as an ordinary WIR constant (also in .burning)
+                // and capture lexical values now, not when execute is called.
+                let Some(body) = self.context.source.get(block.span.as_range()) else {
+                    self.error("MX-B001", "MX template span is outside its source", expr.span);
+                    return self.builder.const_null();
+                };
+                let payload = self.builder.const_string(body);
+                let captures = crate::napalm_mx_front::parameters(block).into_iter().map(|n|
+                    Expr::new(ExprKind::Name(Ident::new(n.value.as_str().into(), n.span)), n.span)
+                ).collect::<Vec<_>>();
+                // $parameters name lexical bindings, including inside methods;
+                // they must not turn into implicit getters on `this`.
+                let implicit_this = self.context.implicit_this;
+                self.context.implicit_this = false;
+                let values = self.lower_list(&captures);
+                self.context.implicit_this = implicit_this;
+                let receiver = self.builder.emit1(Inst::LoadModuleVar {
+                    module: self.context.module,
+                    slot: self.context.module_layout.get(BuiltinId::DatabaseQuery.binding_name()).expect("DatabaseQuery builtin is reserved"),
+                }, Type::Top);
+                let method = self.builder.intern_method("__capture", MethodKind::Method, 2);
+                self.builder.invoke_typed(receiver, method, vec![payload, values], Type::Builtin(BuiltinId::DatabaseQuery, None))
             }
             ExprKind::Null => self.builder.const_null(),
             ExprKind::Bool(value) => self.builder.const_bool(*value),

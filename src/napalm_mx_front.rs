@@ -31,6 +31,7 @@ pub struct Projection {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Statement {
+    Schema(SchemaStatement),
     Select {
         table: Name,
         projection: Option<Vec<Projection>>,
@@ -53,6 +54,119 @@ pub enum Statement {
         table: Name,
         predicate: Option<Expr>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Column {
+    pub name: Name,
+    pub ty: Name,
+    pub nullable: bool,
+    pub primary: bool,
+    pub default: Option<Expr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableChange {
+    Add(Column),
+    Drop(Name),
+    RenameColumn(Name, Name),
+    Rename(Name),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SchemaStatement {
+    CreateTable {
+        table: Name,
+        columns: Vec<Column>,
+        primary: Vec<Name>,
+        if_not_exists: bool,
+    },
+    CreateIndex {
+        name: Name,
+        table: Name,
+        columns: Vec<(Name, bool)>,
+        unique: bool,
+        if_not_exists: bool,
+    },
+    UpdateTable {
+        table: Name,
+        change: TableChange,
+    },
+    Drop {
+        name: Name,
+        index: bool,
+        if_exists: bool,
+    },
+    SetVersion(u64),
+}
+
+/// Lexical captures, once per name in source order. The same ordering is used
+/// by the host analyzer/lowerer and the native query constructor.
+pub fn parameters(block: &Block) -> Vec<&Name> {
+    fn visit<'a>(expr: &'a Expr, out: &mut Vec<&'a Name>) {
+        match &expr.value {
+            ExprKind::Param(name) => {
+                if !out.iter().any(|n| n.value == name.value) {
+                    out.push(name);
+                }
+            }
+            ExprKind::Unary(_, value) | ExprKind::IsNull(value, _) => visit(value, out),
+            ExprKind::Binary(_, left, right) => {
+                visit(left, out);
+                visit(right, out);
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for statement in &block.statements {
+        match &statement.value {
+            Statement::Schema(_) => {}
+            Statement::Select {
+                projection,
+                predicate,
+                order,
+                ..
+            } => {
+                if let Some(projection) = projection {
+                    for p in projection {
+                        visit(&p.expr, &mut out);
+                    }
+                }
+                if let Some(expr) = predicate {
+                    visit(expr, &mut out);
+                }
+                for (expr, _) in order {
+                    visit(expr, &mut out);
+                }
+            }
+            Statement::Insert { rows, .. } => {
+                for row in rows {
+                    for expr in row {
+                        visit(expr, &mut out);
+                    }
+                }
+            }
+            Statement::Update {
+                assignments,
+                predicate,
+                ..
+            } => {
+                for (_, expr) in assignments {
+                    visit(expr, &mut out);
+                }
+                if let Some(expr) = predicate {
+                    visit(expr, &mut out);
+                }
+            }
+            Statement::Delete { predicate, .. } => {
+                if let Some(expr) = predicate {
+                    visit(expr, &mut out);
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Logos, Clone, Copy, Debug, PartialEq)]
@@ -268,7 +382,33 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
     fn statement(&mut self) -> Result<Statement> {
-        if self.eat("select") {
+        if self.eat("create") {
+            return self.create().map(Statement::Schema);
+        } else if self.eat("alter") {
+            self.expect("table")?;
+            return self.update_table().map(Statement::Schema);
+        } else if self.eat("drop") {
+            let index = self.eat("index");
+            if !index {
+                self.expect("table")?;
+            }
+            let if_exists = if self.eat("if") {
+                self.expect("exists")?;
+                true
+            } else {
+                false
+            };
+            return Ok(Statement::Schema(SchemaStatement::Drop {
+                name: self.name()?,
+                index,
+                if_exists,
+            }));
+        } else if self.eat("set") {
+            self.expect("version")?;
+            return Ok(Statement::Schema(SchemaStatement::SetVersion(
+                self.integer()?,
+            )));
+        } else if self.eat("select") {
             let projection = if self.eat("*") {
                 None
             } else {
@@ -331,6 +471,9 @@ impl<'a> Parser<'a> {
                 rows,
             })
         } else if self.eat("update") {
+            if self.eat("table") {
+                return self.update_table().map(Statement::Schema);
+            }
             let table = self.name()?;
             self.expect("set")?;
             let assignments = self.list(|p| {
@@ -351,8 +494,151 @@ impl<'a> Parser<'a> {
                 predicate: self.predicate()?,
             })
         } else {
-            self.err("expected SELECT, INSERT, UPDATE or DELETE")
+            self.err("expected SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP or SET VERSION")
         }
+    }
+
+    fn if_not_exists(&mut self) -> Result<bool> {
+        if !self.eat("if") {
+            return Ok(false);
+        }
+        self.expect("not")?;
+        self.expect("exists")?;
+        Ok(true)
+    }
+
+    fn column(&mut self) -> Result<Column> {
+        let name = self.name()?;
+        let ty = self.name()?;
+        let mut column = Column {
+            name,
+            ty,
+            nullable: true,
+            primary: false,
+            default: None,
+        };
+        let mut null_seen = false;
+        loop {
+            if self.eat("primary") {
+                if column.primary {
+                    return self.err("duplicate PRIMARY KEY");
+                }
+                self.expect("key")?;
+                column.primary = true;
+            } else if self.eat("not") {
+                self.expect("null")?;
+                if null_seen {
+                    return self.err("duplicate nullability constraint");
+                }
+                null_seen = true;
+                column.nullable = false;
+            } else if self.eat("null") {
+                if null_seen {
+                    return self.err("duplicate nullability constraint");
+                }
+                null_seen = true;
+                column.nullable = true;
+            } else if self.eat("default") {
+                if column.default.is_some() {
+                    return self.err("duplicate DEFAULT");
+                }
+                let expr = self.expr(0)?;
+                let literal = matches!(
+                    expr.value,
+                    ExprKind::Null | ExprKind::Bool(_) | ExprKind::Number(_) | ExprKind::String(_)
+                ) || matches!(&expr.value, ExprKind::Unary(UnaryOp::Neg, e) if matches!(e.value, ExprKind::Number(_)));
+                if !literal {
+                    return self.err("DEFAULT requires a scalar literal");
+                }
+                column.default = Some(expr);
+            } else {
+                break;
+            }
+        }
+        if column.primary && null_seen && column.nullable {
+            return self.err("primary key cannot be NULL");
+        }
+        Ok(column)
+    }
+
+    fn create(&mut self) -> Result<SchemaStatement> {
+        if self.eat("table") {
+            let if_not_exists = self.if_not_exists()?;
+            let table = self.name()?;
+            self.expect("(")?;
+            let mut columns = vec![];
+            let mut primary = vec![];
+            loop {
+                if self.eat("primary") {
+                    if !primary.is_empty() {
+                        return self.err("duplicate PRIMARY KEY");
+                    }
+                    self.expect("key")?;
+                    self.expect("(")?;
+                    primary = self.list(Self::name)?;
+                    self.expect(")")?;
+                } else {
+                    columns.push(self.column()?);
+                }
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(")")?;
+            Ok(SchemaStatement::CreateTable {
+                table,
+                columns,
+                primary,
+                if_not_exists,
+            })
+        } else {
+            let unique = self.eat("unique");
+            self.expect("index")?;
+            let if_not_exists = self.if_not_exists()?;
+            let name = self.name()?;
+            self.expect("on")?;
+            let table = self.name()?;
+            self.expect("(")?;
+            let columns = self.list(|p| {
+                let name = p.name()?;
+                let desc = p.eat("desc");
+                if !desc {
+                    p.eat("asc");
+                }
+                Ok((name, desc))
+            })?;
+            self.expect(")")?;
+            Ok(SchemaStatement::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                if_not_exists,
+            })
+        }
+    }
+
+    fn update_table(&mut self) -> Result<SchemaStatement> {
+        let table = self.name()?;
+        let change = if self.eat("add") {
+            self.eat("column");
+            TableChange::Add(self.column()?)
+        } else if self.eat("drop") {
+            self.eat("column");
+            TableChange::Drop(self.name()?)
+        } else if self.eat("rename") {
+            if self.eat("to") {
+                TableChange::Rename(self.name()?)
+            } else {
+                self.eat("column");
+                let old = self.name()?;
+                self.expect("to")?;
+                TableChange::RenameColumn(old, self.name()?)
+            }
+        } else {
+            return self.err("expected ADD COLUMN, DROP COLUMN or RENAME");
+        };
+        Ok(SchemaStatement::UpdateTable { table, change })
     }
     fn expr(&mut self, min: u8) -> Result<Expr> {
         if self.depth >= 128 {

@@ -54,6 +54,8 @@ pub mod napalm_front;
 pub mod napalm_front_main;
 pub mod napalm_mx_front;
 pub mod napalm_mx_lowerer;
+pub mod napalm_mx_sqlite;
+pub mod napalm_mx_schema;
 pub mod napalm_mx_ir;
 pub mod napalm_mx_ir_optimizer;
 pub mod napalm_mx_ir_optimizing;

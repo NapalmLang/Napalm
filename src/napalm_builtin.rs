@@ -16,6 +16,7 @@ use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate,
     NaiveDateTime, Offset, TimeZone, Timelike, Utc,
 };
+use crate::napalm_interpreter::MxNative;
 
 #[derive(Clone, Copy, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -351,6 +352,8 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::InputStream,
         BuiltinClass::OutputStream,
         BuiltinClass::Package,
+        BuiltinClass::Database,
+        BuiltinClass::DatabaseQuery,
         BuiltinClass::List,
         BuiltinClass::Map,
         BuiltinClass::Set,
@@ -517,8 +520,20 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     string_right_add.ret(result);
     manifest.string_right_add = Some(string_right_add.finish());
 
-    // JSON is a global static utility. Parsing reuses simd-json's tape conversion
-    // and stringification reuses the existing fetch JSON serializer.
+    // Connections own SQLite resources; query construction captures scalar values.
+    manifest.register_native(program, static_(BuiltinId::Database), "open", MethodKind::Method, 1, NativeBuiltin::Database(MxNative::Open));
+    manifest.register_native(program, static_(BuiltinId::DatabaseQuery), "__capture", MethodKind::Method, 2, NativeBuiltin::Database(MxNative::Capture));
+    for (name, arity, native) in [
+        ("getVersion", 0, MxNative::GetVersion),
+        ("setVersion", 1, MxNative::SetVersion),
+        ("execute", 1, MxNative::Execute),
+        ("close", 0, MxNative::Close),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::Database), name, MethodKind::Method, arity, NativeBuiltin::Database(native));
+    }
+    manifest.register_native(program, instance(BuiltinClass::Database), "closed", MethodKind::Getter, 0, NativeBuiltin::Database(MxNative::Closed));
+
+    // JSON reuses the fetch stack's codecs.
     manifest.register_native(
         program,
         static_(BuiltinId::JSON),

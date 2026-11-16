@@ -196,10 +196,22 @@ fn mx_host_ast_can_be_lowered_directly() {
 }
 
 #[test]
-fn mx_host_execution_reports_pending_backend() {
+fn mx_host_compiles_query_templates_without_a_database_schema() {
     let source = "const q = [[[SELECT * FROM users]]];";
     let parsed = crate::napalm_front_main::parse("test", source);
     let output = crate::napalm_lowerer::lower_new_program("test", source, "test", &parsed.module);
-    assert!(output.has_errors());
-    assert!(output.diagnostics.iter().any(|d| d.code == "MX-B001"));
+    assert!(!output.has_errors(), "{:?}", output.diagnostics);
+}
+
+#[test]
+fn mx_undefined_captures_are_host_diagnostics_including_methods() {
+    for source in [
+        "const q = [[[ SELECT * FROM users WHERE id = $missing ]]];",
+        "class Queries { query() { return [[[ SELECT * FROM users WHERE id = $missing ]]]; } }",
+    ] {
+        let parsed = crate::napalm_front_main::parse("test", source);
+        assert!(!parsed.has_errors());
+        let output = crate::napalm_lowerer::lower_new_program("test", source, "test", &parsed.module);
+        assert!(output.diagnostics.iter().any(|d| d.code == "NAPALM-L018" && d.message.contains("missing")), "{:?}", output.diagnostics);
+    }
 }

@@ -94,6 +94,9 @@ use self::collection_ops::*;
 mod path_vm;
 #[path = "napalm_bytes_vm.rs"]
 mod bytes_vm;
+#[path = "napalm_mx_vm.rs"]
+mod mx_vm;
+
 #[path = "napalm_fs_vm.rs"]
 mod fs_vm;
 #[path = "napalm_json_vm.rs"]
@@ -3226,6 +3229,8 @@ enum HeapObject {
     InputStream(process_vm::NativeInputStream),
     OutputStream(process_vm::NativeOutputStream),
     Package(Box<package_vm::NapalmPackage>),
+    Database(Arc<mx_vm::NapalmDatabase>),
+    DatabaseQuery(Arc<mx_vm::NapalmQuery>),
     List(Vec<Value>),
     Map(NapalmMap),
     Set { map: Value },
@@ -4228,6 +4233,8 @@ gc_descriptor!(GC_FILE, "Napalm.File", GcTraceLayout::Leaf);
 gc_descriptor!(GC_INPUT_STREAM, "Napalm.InputStream", GcTraceLayout::Leaf);
 gc_descriptor!(GC_OUTPUT_STREAM, "Napalm.OutputStream", GcTraceLayout::Leaf);
 gc_descriptor!(GC_PACKAGE, "Napalm.Package", GcTraceLayout::Leaf);
+gc_descriptor!(GC_DATABASE, "Napalm.Database", GcTraceLayout::Leaf);
+gc_descriptor!(GC_DATABASE_QUERY, "Napalm.DatabaseQuery", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANGE, "Napalm.Range", GcTraceLayout::Leaf);
 gc_descriptor!(GC_DATE, "Napalm.Date", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANDOM, "Napalm.Random", GcTraceLayout::Leaf);
@@ -4268,6 +4275,8 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::InputStream(_) => &GC_INPUT_STREAM,
         HeapObject::OutputStream(_) => &GC_OUTPUT_STREAM,
         HeapObject::Package(_) => &GC_PACKAGE,
+        HeapObject::Database(_) => &GC_DATABASE,
+        HeapObject::DatabaseQuery(_) => &GC_DATABASE_QUERY,
         HeapObject::List(_) => &GC_LIST,
         HeapObject::Map(_) => &GC_MAP,
         HeapObject::Proxy { .. } => &GC_PROXY,
@@ -4326,6 +4335,8 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::File(file) => std::mem::size_of::<fs_vm::NapalmFile>() + file.external_bytes(),
         HeapObject::InputStream(_) | HeapObject::OutputStream(_) => 0,
         HeapObject::Package(package) => std::mem::size_of::<package_vm::NapalmPackage>() + package.external_bytes(),
+        HeapObject::Database(db) => db.external_bytes(),
+        HeapObject::DatabaseQuery(query) => query.external_bytes(),
         HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
         HeapObject::Map(map) => map.external_bytes(),
         HeapObject::Cell(_) => std::mem::size_of::<RegisterWord>(),
@@ -4613,6 +4624,8 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         | HeapObject::InputStream(_)
         | HeapObject::OutputStream(_)
         | HeapObject::Package(_)
+        | HeapObject::Database(_)
+        | HeapObject::DatabaseQuery(_)
         | HeapObject::Random { .. }
         | HeapObject::Range { .. }
         | HeapObject::Date { .. }
@@ -6332,6 +6345,8 @@ impl HostContext<'_> {
             Some(HeapObject::InputStream(_)) => out.write_str("<InputStream:stdin>"),
             Some(HeapObject::OutputStream(stream)) => write!(out, "<OutputStream:{}>", stream.label()),
             Some(HeapObject::Package(package)) => write!(out, "<Package name={:?}>", package.name),
+            Some(HeapObject::Database(db)) => write!(out, "<Database path={:?}>", db.path),
+            Some(HeapObject::DatabaseQuery(_)) => write!(out, "<DatabaseQuery>"),
             Some(HeapObject::Proxy { .. }) => out.write_str("<proxy>"),
             Some(HeapObject::List(values)) => {
                 if !seen.insert(handle) { out.push_str("[...]"); return; }
@@ -7791,6 +7806,7 @@ pub enum NativeBuiltin {
     DecoratorRun,
     DecoratorStore,
     DecoratorStoreList,
+    Database(MxNative),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7798,6 +7814,11 @@ pub enum NativeBuiltin {
 pub enum JsonNative {
     Parse,
     Stringify,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MxNative {
+    Open, Capture, CreateTable, CreateIndex, Execute, Close, Closed, GetVersion, SetVersion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7923,9 +7944,11 @@ pub enum BuiltinClass {
     OutputStream,
     /// `.orange` package builder returned by `Package.package(name)`.
     Package,
+    Database,
+    DatabaseQuery,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 35;
+const BUILTIN_CLASS_COUNT: usize = 37;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -7957,6 +7980,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::OutputStream as u64),
         HeapObject::Package(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Package as u64),
+        HeapObject::Database(_) => ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Database as u64),
+        HeapObject::DatabaseQuery(_) => ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::DatabaseQuery as u64),
         HeapObject::List(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::List as u64),
         HeapObject::Set { .. } =>
@@ -13034,6 +13059,7 @@ impl<'p> Interpreter<'p> {
             | Some(HeapObject::FileInfo(_)) | Some(HeapObject::File(_))
             | Some(HeapObject::InputStream(_)) | Some(HeapObject::OutputStream(_))
             | Some(HeapObject::Package(_))
+            | Some(HeapObject::Database(_)) | Some(HeapObject::DatabaseQuery(_))
             | Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
             | Some(HeapObject::Date { .. })
             | Some(HeapObject::Set { .. })
@@ -16236,6 +16262,7 @@ impl Interpreter<'_> {
             NativeBuiltin::InputStream(native) => self.execute_input_stream_native(op, native, receiver, args),
             NativeBuiltin::OutputStream(native) => self.execute_output_stream_native(op, native, receiver, args),
             NativeBuiltin::Package(native) => self.execute_package_native(op, native, receiver, args),
+            NativeBuiltin::Database(native) => self.execute_mx_native(op, native, receiver, args),
             NativeBuiltin::ProxyNew => {
                 let target = arg(0);
                 let handler = arg(1);
@@ -17477,6 +17504,8 @@ impl Interpreter<'_> {
                     (BuiltinId::InputStream, Some(HeapObject::InputStream(_))) => true,
                     (BuiltinId::OutputStream, Some(HeapObject::OutputStream(_))) => true,
                     (BuiltinId::Package, Some(HeapObject::Package(_))) => true,
+                    (BuiltinId::Database, Some(HeapObject::Database(_))) => true,
+                    (BuiltinId::DatabaseQuery, Some(HeapObject::DatabaseQuery(_))) => true,
                     _ => false,
                 }
             }
@@ -17712,6 +17741,8 @@ impl Interpreter<'_> {
             Some(HeapObject::InputStream(_)) => "InputStream".to_owned(),
             Some(HeapObject::OutputStream(_)) => "OutputStream".to_owned(),
             Some(HeapObject::Package(_)) => "Package".to_owned(),
+            Some(HeapObject::Database(_)) => "Database".to_owned(),
+            Some(HeapObject::DatabaseQuery(_)) => "DatabaseQuery".to_owned(),
             Some(HeapObject::List(_)) => {
                 let element = contracts.iter().find_map(|contract| match contract {
                     Type::List(Some(element)) => Some(&**element),
@@ -20091,7 +20122,7 @@ fn builtin_instance_type(builtin: BuiltinId) -> Option<Type> {
         | BuiltinId::File
         | BuiltinId::InputStream
         | BuiltinId::OutputStream
-        | BuiltinId::Package => Type::Builtin(builtin, None),
+        | BuiltinId::Package | BuiltinId::Database | BuiltinId::DatabaseQuery => Type::Builtin(builtin, None),
         _ => return None,
     })
 }
@@ -20819,6 +20850,8 @@ impl Interpreter<'_> {
             Some(HeapObject::InputStream(_)) => "<InputStream:stdin>".into(),
             Some(HeapObject::OutputStream(stream)) => format!("<OutputStream:{}>", stream.label()),
             Some(HeapObject::Package(package)) => format!("<Package name={:?}>", package.name),
+            Some(HeapObject::Database(db)) => format!("<Database path={:?}>", db.path),
+            Some(HeapObject::DatabaseQuery(_)) => "<DatabaseQuery>".into(),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),
             Some(HeapObject::Proxy { .. }) => "<proxy>".into(),
@@ -24029,6 +24062,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_tests.rs");
     include!("tests/napalm_fs_tests.rs");
     include!("tests/napalm_package_tests.rs");
+    include!("tests/napalm_mx_vm_tests.rs");
     include!("tests/napalm_http_tests.rs");
     include!("tests/napalm_function_jit_tests.rs");
     include!("tests/napalm_shared_literal_tests.rs");

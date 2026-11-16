@@ -12,7 +12,7 @@ The standalone Rust compiler accepts tables matching an MX catalog in `main`.
 ## VM API
 
 ```napalm
-const db = Database.open(":memory:"); // Or a persistent file path.
+const db = Database.open(DatabaseMode.Memory); // Or Database.open(DatabaseMode.File, path).
 db.execute([[[
     CREATE TABLE users (id Number PRIMARY KEY, name String NOT NULL, active Bool NOT NULL);
     CREATE INDEX users_name ON users (name);
@@ -25,8 +25,9 @@ System.print(rows[0].name);
 db.close();
 ```
 
-- `Database.open(path)` opens or creates a database; `":memory:"` is private to
-  that connection. SQLite is bundled. Foreign keys are enabled.
+- `Database.open(mode)` / `Database.open(mode, path)` opens a database. `mode` is
+  a member of the native `DatabaseMode` enum (see below); strings are rejected.
+  SQLite is bundled. Foreign keys are enabled.
 - Schema creation and changes use SQL inside `[[[ ... ]]]`, through `db.execute`.
   The previous `createTable` and `createIndex` methods are no longer exposed.
 - `db.getVersion()` reads the persistent application schema version (initially 0).
@@ -39,6 +40,25 @@ db.close();
   duplicate names are errors (use `AS`). Earlier SELECT results are discarded.
 - `db.close()` releases the connection and is idempotent; `db.closed` reports
   its state. Unreachable connections are also released by GC.
+
+### Open modes
+
+| `DatabaseMode` | Path argument | Behavior |
+| --- | --- | --- |
+| `Memory` | none | Private in-memory database, discarded on close. |
+| `Temporary` | none | Private temporary database: kept in memory and spilled to a temporary file when it grows, deleted on close. |
+| `SharedMemory` | name | In-memory database shared by every connection in the process that uses the same name. Freed when its last connection closes. |
+| `File` | file path | Read/write; the file is created if missing. |
+| `ReadWrite` | file path | Read/write; fails if the file does not exist. |
+| `ReadOnly` | file path | Read-only; fails if the file does not exist. Writes, `SET VERSION` and `setVersion` fail. |
+
+Members evaluate to their discriminants (`Memory` is 0, ..., `ReadOnly` is 5),
+like a Napalm `enum` without initializers; new members are only appended.
+Paths are literal: `file:` URIs are not interpreted, and a file named `:memory:`
+is just `Database.open(DatabaseMode.File, ":memory:")`. `SharedMemory` uses
+SQLite's `memdb` VFS, so connections keep normal locking and the 5 s busy
+timeout applies between them. `ReadOnly` does not create `__napalm_metadata`; a
+database without it reports version 0.
 
 `$name` captures the current scalar value when the block is constructed, including
 inside closures. Re-executing the same query uses those same captured values;

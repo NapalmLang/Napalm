@@ -6345,7 +6345,7 @@ impl HostContext<'_> {
             Some(HeapObject::InputStream(_)) => out.write_str("<InputStream:stdin>"),
             Some(HeapObject::OutputStream(stream)) => write!(out, "<OutputStream:{}>", stream.label()),
             Some(HeapObject::Package(package)) => write!(out, "<Package name={:?}>", package.name),
-            Some(HeapObject::Database(db)) => write!(out, "<Database path={:?}>", db.path),
+            Some(HeapObject::Database(db)) => write!(out, "{db}"),
             Some(HeapObject::DatabaseQuery(_)) => write!(out, "<DatabaseQuery>"),
             Some(HeapObject::Proxy { .. }) => out.write_str("<proxy>"),
             Some(HeapObject::List(values)) => {
@@ -7819,6 +7819,51 @@ pub enum JsonNative {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MxNative {
     Open, Capture, CreateTable, CreateIndex, Execute, Close, Closed, GetVersion, SetVersion,
+    /// `DatabaseMode.<member>` getter.
+    Mode(DatabaseMode),
+}
+
+/// Members of the native `DatabaseMode` enum. Scripts see each member as its
+/// discriminant (like an ordinary Napalm `enum` without initializers), so the
+/// order is part of the script-visible API: only append new members.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DatabaseMode {
+    /// Private in-memory database (SQLite `:memory:`). No path.
+    Memory,
+    /// Private on-disk temporary database, deleted on close. No path.
+    Temporary,
+    /// Named in-memory database shared by every connection in this process
+    /// that opens the same name; freed when its last connection closes.
+    SharedMemory,
+    /// Read/write file, created if missing.
+    File,
+    /// Read/write existing file; fails if it does not exist.
+    ReadWrite,
+    /// Read-only existing file.
+    ReadOnly,
+}
+
+impl DatabaseMode {
+    pub const ALL: [Self; 6] = [
+        Self::Memory, Self::Temporary, Self::SharedMemory, Self::File, Self::ReadWrite, Self::ReadOnly,
+    ];
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Memory => "Memory",
+            Self::Temporary => "Temporary",
+            Self::SharedMemory => "SharedMemory",
+            Self::File => "File",
+            Self::ReadWrite => "ReadWrite",
+            Self::ReadOnly => "ReadOnly",
+        }
+    }
+    pub fn from_value(value: f64) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| *mode as u8 as f64 == value)
+    }
+    /// Whether the mode names a file / shared database, and so needs a path.
+    pub const fn takes_path(self) -> bool {
+        !matches!(self, Self::Memory | Self::Temporary)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20850,7 +20895,7 @@ impl Interpreter<'_> {
             Some(HeapObject::InputStream(_)) => "<InputStream:stdin>".into(),
             Some(HeapObject::OutputStream(stream)) => format!("<OutputStream:{}>", stream.label()),
             Some(HeapObject::Package(package)) => format!("<Package name={:?}>", package.name),
-            Some(HeapObject::Database(db)) => format!("<Database path={:?}>", db.path),
+            Some(HeapObject::Database(db)) => db.to_string(),
             Some(HeapObject::DatabaseQuery(_)) => "<DatabaseQuery>".into(),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
             Some(HeapObject::Map(map)) => format!("<map:{}>", map.len()),

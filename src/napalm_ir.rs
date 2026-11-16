@@ -583,10 +583,12 @@ pub enum BuiltinId {
     Package = 51,
     Database = 52,
     DatabaseQuery = 53,
+    /// Native enum of `Database.open` storage/access modes.
+    DatabaseMode = 54,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 55] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
@@ -602,7 +604,7 @@ impl BuiltinId {
         Self::FileInfo, Self::File,
         Self::Process, Self::InputStream, Self::OutputStream,
         Self::Package,
-        Self::Database, Self::DatabaseQuery,
+        Self::Database, Self::DatabaseQuery, Self::DatabaseMode,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -653,6 +655,7 @@ impl BuiltinId {
             Self::Package => "Package",
             Self::Database => "Database",
             Self::DatabaseQuery => "DatabaseQuery",
+            Self::DatabaseMode => "DatabaseMode",
         }
     }
     /// Module-layout key reserving this builtin. Native decorators use a hidden

@@ -16,7 +16,7 @@ use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate,
     NaiveDateTime, Offset, TimeZone, Timelike, Utc,
 };
-use crate::napalm_interpreter::MxNative;
+use crate::napalm_interpreter::{DatabaseMode, MxNative};
 
 #[derive(Clone, Copy, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -521,7 +521,14 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.string_right_add = Some(string_right_add.finish());
 
     // Connections own SQLite resources; query construction captures scalar values.
-    manifest.register_native(program, static_(BuiltinId::Database), "open", MethodKind::Method, 1, NativeBuiltin::Database(MxNative::Open));
+    // `Database.open(mode)` for Memory/Temporary, `Database.open(mode, path)`
+    // for the modes that name a file or shared database.
+    for arity in [1, 2] {
+        manifest.register_native(program, static_(BuiltinId::Database), "open", MethodKind::Method, arity, NativeBuiltin::Database(MxNative::Open));
+    }
+    for mode in DatabaseMode::ALL {
+        manifest.register_native(program, static_(BuiltinId::DatabaseMode), mode.name(), MethodKind::Getter, 0, NativeBuiltin::Database(MxNative::Mode(mode)));
+    }
     manifest.register_native(program, static_(BuiltinId::DatabaseQuery), "__capture", MethodKind::Method, 2, NativeBuiltin::Database(MxNative::Capture));
     for (name, arity, native) in [
         ("getVersion", 0, MxNative::GetVersion),

@@ -1,4 +1,4 @@
-const db = Database.open(":memory:");
+const db = Database.open(DatabaseMode.Memory);
 if (db.getVersion() < 1) {
     db.execute([[[
         CREATE TABLE users (id Number PRIMARY KEY, name String NOT NULL);

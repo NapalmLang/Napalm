@@ -53,8 +53,19 @@ struct DatabaseState {
 }
 #[derive(Debug)]
 pub(super) struct NapalmDatabase {
+    pub(super) mode: DatabaseMode,
+    /// File path or shared-memory name; empty for Memory/Temporary.
     pub(super) path: String,
     state: parking_lot::Mutex<DatabaseState>,
+}
+impl std::fmt::Display for NapalmDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.mode.takes_path() {
+            write!(f, "<Database mode={} path={:?}>", self.mode.name(), self.path)
+        } else {
+            write!(f, "<Database mode={}>", self.mode.name())
+        }
+    }
 }
 impl NapalmDatabase {
     pub(super) fn external_bytes(&self) -> usize {
@@ -82,6 +93,20 @@ fn schema_type(declared: &str) -> Result<mx::ScalarType, RuntimeError> {
 }
 
 fn get_version(connection: &Connection) -> Result<i64, RuntimeError> {
+    // A read-only connection cannot create the metadata table, so a database
+    // that Napalm never wrote reports the initial version.
+    if connection.is_readonly(rusqlite::MAIN_DB).map_err(failure)? {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [schema::METADATA],
+                |r| r.get(0),
+            )
+            .map_err(failure)?;
+        if !exists {
+            return Ok(0);
+        }
+    }
     let version: i64 = connection
         .query_row(
             "SELECT version FROM __napalm_metadata WHERE id = 1",
@@ -93,6 +118,37 @@ fn get_version(connection: &Connection) -> Result<i64, RuntimeError> {
         return Err(failure("invalid database version"));
     }
     Ok(version)
+}
+
+/// Opens the SQLite connection for `mode`. Paths are always literal (no
+/// `file:` URI interpretation), so a file named `:memory:` needs `./:memory:`.
+fn open_connection(mode: DatabaseMode, path: &str) -> Result<Connection, RuntimeError> {
+    use rusqlite::OpenFlags as F;
+    let base = F::SQLITE_OPEN_NO_MUTEX;
+    let read_write = base | F::SQLITE_OPEN_READ_WRITE;
+    let opened = match mode {
+        DatabaseMode::Memory => Connection::open_in_memory_with_flags(read_write | F::SQLITE_OPEN_CREATE),
+        // SQLite's empty filename: a private temporary file deleted on close.
+        DatabaseMode::Temporary => Connection::open_with_flags("", read_write | F::SQLITE_OPEN_CREATE),
+        // memdb names starting with '/' are shared by all connections of the
+        // process. Unlike shared-cache `:memory:`, it keeps normal file locking,
+        // so busy_timeout applies between connections.
+        DatabaseMode::SharedMemory => Connection::open_with_flags_and_vfs(
+            format!("/{path}"),
+            read_write | F::SQLITE_OPEN_CREATE,
+            "memdb",
+        ),
+        DatabaseMode::File => Connection::open_with_flags(path, read_write | F::SQLITE_OPEN_CREATE),
+        DatabaseMode::ReadWrite => Connection::open_with_flags(path, read_write),
+        DatabaseMode::ReadOnly => Connection::open_with_flags(path, base | F::SQLITE_OPEN_READ_ONLY),
+    };
+    opened.map_err(|error| {
+        if mode.takes_path() {
+            failure(format!("cannot open {path:?} as {}: {error}", mode.name()))
+        } else {
+            failure(format!("cannot open {} database: {error}", mode.name()))
+        }
+    })
 }
 
 fn initialize_metadata(connection: &mut Connection) -> Result<(), RuntimeError> {
@@ -503,12 +559,31 @@ impl Interpreter<'_> {
                 .unwrap_or(Value::NULL)
         };
         match native {
+            MxNative::Mode(mode) => Ok(Value::from_num(mode as u8 as f64)),
             MxNative::Open => {
-                let path = self.mx_text(arg(0))?;
-                if path.is_empty() || path.contains('\0') {
+                let mode = arg(0).as_num().and_then(DatabaseMode::from_value).ok_or_else(|| {
+                    failure("Database.open expects a DatabaseMode member, e.g. Database.open(DatabaseMode.Memory)")
+                })?;
+                let path = match (mode.takes_path(), args.len() > 1) {
+                    (true, true) => self.mx_text(arg(1))?,
+                    (false, false) => String::new(),
+                    (true, false) => {
+                        return Err(failure(format!(
+                            "DatabaseMode.{} requires a path: Database.open(DatabaseMode.{0}, path)",
+                            mode.name()
+                        )));
+                    }
+                    (false, true) => {
+                        return Err(failure(format!(
+                            "DatabaseMode.{} does not take a path",
+                            mode.name()
+                        )));
+                    }
+                };
+                if mode.takes_path() && (path.is_empty() || path.contains('\0')) {
                     return Err(failure("database path must not be empty or contain NUL"));
                 }
-                let mut connection = Connection::open(&path).map_err(failure)?;
+                let mut connection = open_connection(mode, &path)?;
                 // Quoted identifiers must never fall back to string literals
                 // (notably for an unknown CREATE INDEX column).
                 for option in [
@@ -524,10 +599,16 @@ impl Interpreter<'_> {
                 connection
                     .busy_timeout(std::time::Duration::from_secs(5))
                     .map_err(failure)?;
-                initialize_metadata(&mut connection)?;
+                if mode == DatabaseMode::ReadOnly {
+                    // Validates existing metadata without writing.
+                    get_version(&connection)?;
+                } else {
+                    initialize_metadata(&mut connection)?;
+                }
                 Ok(self
                     .heap
                     .alloc(HeapObject::Database(Arc::new(NapalmDatabase {
+                        mode,
                         path,
                         state: parking_lot::Mutex::new(DatabaseState {
                             connection: Some(connection),
@@ -741,7 +822,8 @@ mod tests {
             )
             .unwrap();
         let db = NapalmDatabase {
-            path: ":memory:".into(),
+            mode: DatabaseMode::Memory,
+            path: String::new(),
             state: parking_lot::Mutex::new(DatabaseState {
                 connection: Some(connection),
                 cached: None,
@@ -773,7 +855,8 @@ mod tests {
         napalm_mx_sqlite::install_functions(&connection).unwrap();
         connection.execute_batch("CREATE TABLE items (id REAL NOT NULL PRIMARY KEY, value BOOLEAN NOT NULL); INSERT INTO items VALUES (1, 7)").unwrap();
         let db = NapalmDatabase {
-            path: ":memory:".into(),
+            mode: DatabaseMode::Memory,
+            path: String::new(),
             state: parking_lot::Mutex::new(DatabaseState {
                 connection: Some(connection),
                 cached: None,

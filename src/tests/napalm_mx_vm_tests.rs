@@ -3,7 +3,7 @@ fn napalm_mx_vm_crud_types_and_snapshot_captures() {
     run_napalm(
         r#"
         function expect(ok) { if (!ok) throw "database assertion failed"; }
-        const db: Database = Database.open(":memory:");
+        const db: Database = Database.open(DatabaseMode.Memory);
         expect(typeof db === "Database" && db instanceof Database && !db.closed);
         db.execute([[[ CREATE TABLE users (id Number NOT NULL, name String NOT NULL, active Bool NOT NULL, data Bytes NOT NULL, note String, PRIMARY KEY (id)) ]]]);
         let name = "O'Reilly; DROP TABLE users; --";
@@ -34,7 +34,7 @@ fn napalm_mx_vm_crud_types_and_snapshot_captures() {
 fn napalm_mx_vm_closures_cache_gc_and_indexes() {
     run_napalm_checked(
         r#"
-        const db = Database.open(":memory:");
+        const db = Database.open(DatabaseMode.Memory);
         db.execute([[[ CREATE TABLE items (id Number NOT NULL, value Number NOT NULL, PRIMARY KEY (id)) ]]]);
         function makeQuery(id) { return () => [[[ SELECT value AS answer FROM items WHERE id = $id ]]]; }
         const captured = makeQuery(42);
@@ -65,7 +65,7 @@ fn napalm_mx_vm_atomic_blocks_and_errors() {
     run_napalm(
         r#"
         let errors = 0;
-        const db = Database.open(":memory:");
+        const db = Database.open(DatabaseMode.Memory);
         db.execute([[[ CREATE TABLE items (id Number NOT NULL, name String, PRIMARY KEY (id)) ]]]);
         try { db.execute([[[ INSERT INTO items (id, name) VALUES (1, 'first'); INSERT INTO items (id, name) VALUES (1, 'duplicate') ]]]); }
         catch (e) { errors++; }
@@ -92,11 +92,11 @@ fn napalm_mx_vm_file_reopen() {
         &directory.source(
             r#"
         const path = Path.join(__ROOT__, "data.sqlite");
-        const db = Database.open(path);
+        const db = Database.open(DatabaseMode.File, path);
         db.execute([[[ CREATE TABLE items (id Number NOT NULL, name String NOT NULL, PRIMARY KEY (id)) ]]]);
         db.execute([[[ INSERT INTO items (id, name) VALUES (1, 'persistent') ]]]);
         db.close();
-        const reopened = Database.open(path);
+        const reopened = Database.open(DatabaseMode.File, path);
         const name = reopened.execute([[[ SELECT name FROM items ]]])[0].name;
         reopened.close();
         Fs.removeFile(path);
@@ -108,10 +108,91 @@ fn napalm_mx_vm_file_reopen() {
 }
 
 #[test]
+fn napalm_mx_vm_open_modes() {
+    let directory = FsTestDirectory::new();
+    run_napalm(
+        &directory.source(
+            r#"
+        function expect(ok, message) { if (!ok) throw "open mode assertion failed: " + message; }
+        function fails(f) { try { f(); return false; } catch (e) { return true; } }
+        expect(DatabaseMode.Memory === 0 && DatabaseMode.Temporary === 1 && DatabaseMode.SharedMemory === 2, "values");
+        expect(DatabaseMode.File === 3 && DatabaseMode.ReadWrite === 4 && DatabaseMode.ReadOnly === 5, "values");
+
+        const memory = Database.open(DatabaseMode.Memory);
+        expect(memory.toString() === "<Database mode=Memory>", "display");
+        memory.close();
+
+        const temporary = Database.open(DatabaseMode.Temporary);
+        temporary.execute([[[ CREATE TABLE t (id Number PRIMARY KEY); INSERT INTO t (id) VALUES (1) ]]]);
+        expect(temporary.execute([[[ SELECT id FROM t ]]])[0].id === 1, "temporary");
+        temporary.close();
+
+        // Shared in-memory databases are visible to every connection with the same name.
+        const a = Database.open(DatabaseMode.SharedMemory, "shared");
+        const b = Database.open(DatabaseMode.SharedMemory, "shared");
+        const other = Database.open(DatabaseMode.SharedMemory, "other");
+        a.execute([[[ CREATE TABLE s (id Number PRIMARY KEY); INSERT INTO s (id) VALUES (7); SET VERSION 3 ]]]);
+        expect(b.execute([[[ SELECT id FROM s ]]])[0].id === 7 && b.getVersion() === 3, "shared");
+        expect(other.getVersion() === 0 && fails(() => other.execute([[[ SELECT id FROM s ]]])), "isolated names");
+        a.close(); b.close(); other.close();
+        const fresh = Database.open(DatabaseMode.SharedMemory, "shared");
+        expect(fresh.getVersion() === 0, "shared memory is freed with its last connection");
+        fresh.close();
+
+        const path = Path.join(__ROOT__, "modes.sqlite");
+        expect(fails(() => Database.open(DatabaseMode.ReadWrite, path)), "ReadWrite needs an existing file");
+        expect(fails(() => Database.open(DatabaseMode.ReadOnly, path)), "ReadOnly needs an existing file");
+        const file = Database.open(DatabaseMode.File, path);
+        file.execute([[[ CREATE TABLE f (id Number PRIMARY KEY); INSERT INTO f (id) VALUES (1); SET VERSION 2 ]]]);
+        file.close();
+        const rw = Database.open(DatabaseMode.ReadWrite, path);
+        rw.execute([[[ INSERT INTO f (id) VALUES (2) ]]]);
+        rw.close();
+        const ro = Database.open(DatabaseMode.ReadOnly, path);
+        expect(ro.execute([[[ SELECT id FROM f ]]]).length === 2 && ro.getVersion() === 2, "read-only reads");
+        expect(fails(() => ro.execute([[[ INSERT INTO f (id) VALUES (3) ]]])), "read-only rejects writes");
+        expect(fails(() => ro.setVersion(5)) && ro.getVersion() === 2, "read-only rejects version writes");
+        ro.close();
+        Fs.removeFile(path);
+
+        expect(fails(() => Database.open(":memory:")), "strings are not modes");
+        expect(fails(() => Database.open(99)), "unknown mode");
+        expect(fails(() => Database.open(DatabaseMode.File)), "missing path");
+        expect(fails(() => Database.open(DatabaseMode.Memory, "x")), "unexpected path");
+        expect(fails(() => Database.open(DatabaseMode.File, "")), "empty path");
+        const result = "ok";
+    "#,
+        ),
+        "ok",
+    );
+}
+
+#[test]
+fn napalm_mx_vm_read_only_without_napalm_metadata() {
+    let directory = FsTestDirectory::new();
+    let path = directory.0.join("external.sqlite");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL); INSERT INTO items VALUES (1, 'external')")
+        .unwrap();
+    drop(connection);
+    run_napalm(
+        &directory.source(
+            r#"
+        const db = Database.open(DatabaseMode.ReadOnly, Path.join(__ROOT__, "external.sqlite"));
+        const result = [db.getVersion(), db.execute([[[ SELECT name FROM items ]]])[0].name];
+        db.close();
+    "#,
+        ),
+        "[0, external]",
+    );
+}
+
+#[test]
 fn napalm_mx_vm_burning_roundtrip() {
     let (program, entry, builtins) = compile_typescript_module(
         r#"
-        const db = Database.open(":memory:");
+        const db = Database.open(DatabaseMode.Memory);
         db.execute([[[ CREATE TABLE items (id Number NOT NULL, name String NOT NULL, PRIMARY KEY (id)) ]]]);
         const name = "burning";
         const rows = db.execute([[[ INSERT INTO items (id, name) VALUES (1, $name); SELECT name FROM items ]]]);
@@ -139,7 +220,7 @@ fn napalm_mx_vm_burning_roundtrip() {
 fn napalm_mx_vm_template_nesting_and_method_captures() {
     let expression = (0..50).fold("$id".to_owned(), |e, _| format!("({e} + 1)"));
     let source = r#"
-        const db = Database.open(":memory:");
+        const db = Database.open(DatabaseMode.Memory);
         db.execute([[[ CREATE TABLE items (id Number NOT NULL, PRIMARY KEY (id)) ]]]);
         db.execute([[[ INSERT INTO items (id) VALUES (1) ]]]);
         const id = 2;
@@ -158,7 +239,7 @@ fn napalm_mx_vm_schema_migrations_and_version_are_atomic() {
     run_napalm(
         r#"
         function expect(ok) { if (!ok) throw "migration assertion failed"; }
-        const db = Database.open(":memory:");
+        const db = Database.open(DatabaseMode.Memory);
         expect(db.getVersion() === 0);
         db.execute([[[
             CREATE TABLE users (id Number PRIMARY KEY, name String NOT NULL);
@@ -214,7 +295,7 @@ fn napalm_mx_vm_schema_migrations_and_version_are_atomic() {
 fn napalm_mx_vm_schema_errors_leave_no_partial_schema_or_metadata() {
     run_napalm(
         r#"
-        const db = Database.open(":memory:");
+        const db = Database.open(DatabaseMode.Memory);
         let errors = 0;
         try { db.execute([[[ CREATE TABLE items (id Number PRIMARY KEY); SET VERSION 1; INSERT INTO items (id) VALUES (1), (1); ]]]); } catch (e) { errors++; }
         // CREATE succeeds again because the earlier block was rolled back.
@@ -247,14 +328,14 @@ fn napalm_mx_vm_version_persists_across_connections() {
     run_napalm(&directory.source(r#"
         function expect(ok) { if (!ok) throw "version assertion failed"; }
         const path = Path.join(__ROOT__, "version.sqlite");
-        const first = Database.open(path);
-        const second = Database.open(path);
+        const first = Database.open(DatabaseMode.File, path);
+        const second = Database.open(DatabaseMode.File, path);
         expect(first.getVersion() === 0 && second.getVersion() === 0);
         first.execute([[[ CREATE TABLE pair (a Number, b String, PRIMARY KEY (a, b)); SET VERSION 2; ]]]);
         expect(second.getVersion() === 2);
         second.setVersion(7);
         first.close(); second.close();
-        const reopened = Database.open(path);
+        const reopened = Database.open(DatabaseMode.File, path);
         expect(reopened.getVersion() === 7);
         reopened.execute([[[ INSERT INTO pair (a, b) VALUES (1, 'x') ]]]);
         reopened.close();

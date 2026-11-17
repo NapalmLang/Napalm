@@ -16,14 +16,14 @@ FFI bridge, embedded TypeScript parser, or AST conversion from Rust.
 ## AST API
 
 ```napalm
-import {parse} from "./src/parser";
+import {parse, parseLexed} from "./src/parser";
 
 const result = parse("const answer = 42;");
 const first = result.ast.body[0];
 System.print(first.kind); // VariableDeclaration
 ```
 
-`parse(text, lexical?)` optionally accepts the result from `tokenize(text)`;
+`parse(text)` tokenizes internally. `parseLexed(text, lexical)` accepts the result from `tokenize(text)`;
 this avoids lexing the same unsaved document twice. Return shape:
 
 ```text

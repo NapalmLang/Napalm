@@ -1,6 +1,7 @@
 // JSON-RPC 2.0 / LSP 3.17 lifecycle and text-document synchronization.
 import {sendFrame, logError} from "./transport";
 import {buildModuleIndex, recordForUri, documentDiagnostics, moduleDefinitionAt, moduleReferencesAt} from "./module_index";
+import {completionAt, hoverAt} from "./intelligence";
 import {createDocumentStore, openDocument, changeDocument, closeDocument, getDocument} from "./documents";
 
 export function createServerState() {
@@ -127,7 +128,9 @@ export function handleMessage(state, request) {
                 textDocumentSync: {openClose: true, change: 2},
                 definitionProvider: true,
                 referencesProvider: true,
-                documentSymbolProvider: true
+                documentSymbolProvider: true,
+                hoverProvider: true,
+                completionProvider: {resolveProvider: false, triggerCharacters: [".", "?"]}
             },
             serverInfo: {name: "napalm-lsp", version: "0.1.0"}
         });
@@ -155,7 +158,9 @@ export function handleMessage(state, request) {
 
     if (method === "textDocument/definition" ||
         method === "textDocument/references" ||
-        method === "textDocument/documentSymbol") {
+        method === "textDocument/documentSymbol" ||
+        method === "textDocument/hover" ||
+        method === "textDocument/completion") {
         if (!hasId) return false;
         const params = request["params"];
         const document = !isObjectValue(params) ? null : params["textDocument"];
@@ -170,7 +175,9 @@ export function handleMessage(state, request) {
             return false;
         }
         const semantic = cached["result"];
-        if (method === "textDocument/documentSymbol") {
+        if (method === "textDocument/documentSymbol" ||
+        method === "textDocument/hover" ||
+        method === "textDocument/completion") {
             respond(id, semantic["documentSymbols"]);
             return false;
         }
@@ -180,6 +187,14 @@ export function handleMessage(state, request) {
             !position["line"].isInteger || !position["character"].isInteger ||
             position["line"] < 0 || position["character"] < 0) {
             respondError(id, -32602, "Invalid document position");
+            return false;
+        }
+        if (method === "textDocument/hover") {
+            respond(id, hoverAt(state["moduleIndex"], uri, position));
+            return false;
+        }
+        if (method === "textDocument/completion") {
+            respond(id, completionAt(state["moduleIndex"], uri, position));
             return false;
         }
         if (method === "textDocument/definition") {

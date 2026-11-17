@@ -123,7 +123,37 @@ class SemanticAnalyzer {
         this.diagnostics = [];
         this.symbols = [];
         this.occurrences = [];
+        this.scopes = [];
+        this.symbolBySpan = new Map();
         this.depth = 0;
+    }
+
+    rememberScope(targetScope, node) {
+        if (node !== null) {
+            targetScope.ownerNode = node;
+            this.scopes.push({scope: targetScope,
+            startByte: node.startByte, endByte: node.endByte});
+        }
+    }
+
+    ownerOf(id, node) {
+        if (id === null || id.kind !== "Identifier") return;
+        const found = this.symbolBySpan.get(id.startByte + ":" + id.endByte);
+        if (found !== null && found.owner === null) found.owner = node;
+    }
+
+    patternOwner(pattern, node) {
+        if (pattern === null) return;
+        if (pattern.kind === "Identifier") this.ownerOf(pattern, node);
+        else if (pattern.kind === "AssignmentPattern") this.patternOwner(pattern.left, node);
+        else if (pattern.kind === "RestPattern") this.patternOwner(pattern.argument, node);
+        else if (pattern.kind === "ArrayPattern") {
+            for (const part of pattern.elements) this.patternOwner(part, node);
+        } else if (pattern.kind === "ObjectPattern") {
+            for (const part of pattern.properties) {
+                this.patternOwner(part.kind === "PatternProperty" ? part.value : part, node);
+            }
+        }
     }
 
     diagnostic(node, code, message) {
@@ -142,8 +172,9 @@ class SemanticAnalyzer {
             return existing;
         }
         const record = {id: this.symbols.length, name: name.name, kind: category,
-            declaration: name, domain: domain};
+            declaration: name, domain: domain, owner: null};
         this.symbols.push(record);
+        this.symbolBySpan.set(name.startByte + ":" + name.endByte, record);
         table.set(name.name, record);
         this.occurrences.push({startByte: name.startByte, endByte: name.endByte,
             range: name.range, symbol: record, declaration: true});
@@ -226,16 +257,35 @@ class SemanticAnalyzer {
             this.predeclare(get(node, "declaration"), targetScope);
         } else if (kind === "VariableDeclaration") {
             const category = node.declarationKind === "const" ? "constant" : "variable";
-            for (const item of node.declarations) this.declarePattern(item.id, targetScope, category);
-        } else if (kind === "FunctionDeclaration") this.bind(targetScope, node.id, "function", "value");
-        else if (kind === "ClassDeclaration") this.bindBoth(targetScope, node.id, "class");
-        else if (kind === "EnumDeclaration") this.bindBoth(targetScope, node.id, "enum");
-        else if (kind === "TypeAliasDeclaration") this.bind(targetScope, node.id, "type", "type");
-        else if (kind === "InterfaceDeclaration") this.bind(targetScope, node.id, "interface", "type");
+            for (const item of node.declarations) {
+                this.declarePattern(item.id, targetScope, category);
+                this.patternOwner(item.id, item);
+            }
+        } else if (kind === "FunctionDeclaration") {
+            this.bind(targetScope, node.id, "function", "value");
+            this.ownerOf(node.id, node);
+        }
+        else if (kind === "ClassDeclaration") {
+            this.bindBoth(targetScope, node.id, "class");
+            this.ownerOf(node.id, node);
+        }
+        else if (kind === "EnumDeclaration") {
+            this.bindBoth(targetScope, node.id, "enum");
+            this.ownerOf(node.id, node);
+        }
+        else if (kind === "TypeAliasDeclaration") {
+            this.bind(targetScope, node.id, "type", "type");
+            this.ownerOf(node.id, node);
+        }
+        else if (kind === "InterfaceDeclaration") {
+            this.bind(targetScope, node.id, "interface", "type");
+            this.ownerOf(node.id, node);
+        }
         else if (kind === "ImportDeclaration") {
             for (const specifier of node.specifiers) {
                 if (node.typeOnly) this.bind(targetScope, specifier.local, "import", "type");
                 else this.bindBoth(targetScope, specifier.local, "import");
+                this.ownerOf(specifier.local, specifier);
             }
         }
     }
@@ -257,6 +307,7 @@ class SemanticAnalyzer {
     parameters(params, targetScope) {
         for (const param of params) {
             this.declarePattern(param.name, targetScope, "parameter");
+            this.patternOwner(param.name, param);
             this.patternUses(param.name, targetScope);
             this.visitType(get(param, "annotation"), targetScope);
             this.visit(get(param, "defaultValue"), targetScope);
@@ -265,7 +316,11 @@ class SemanticAnalyzer {
 
     functionBody(node, parent) {
         const fn = scope(parent, "function");
-        if (node.kind === "FunctionExpression") this.bind(fn, get(node, "id"), "function", "value");
+        this.rememberScope(fn, node);
+        if (node.kind === "FunctionExpression") {
+            this.bind(fn, get(node, "id"), "function", "value");
+            this.ownerOf(get(node, "id"), node);
+        }
         if (get(node, "typeParameters") !== null) this.typeParameters(node.typeParameters, fn);
         this.parameters(node.params, fn);
         this.visitType(get(node, "returnType"), fn);
@@ -274,6 +329,7 @@ class SemanticAnalyzer {
 
     classBody(node, parent) {
         const cls = scope(parent, "class");
+        this.rememberScope(cls, node);
         cls.classScope = cls;
         if (node.kind === "ClassExpression") this.bindBoth(cls, get(node, "id"), "class");
         this.typeParameters(node.typeParameters, cls);
@@ -297,8 +353,12 @@ class SemanticAnalyzer {
                 }
                 accessorSides.set(name, side);
                 this.bind(cls, member.name, "property", "value");
-            } else this.bind(cls, member.name,
-                member.kind === "FieldDefinition" ? "field" : "method", "value");
+                this.ownerOf(member.name, member);
+            } else {
+                this.bind(cls, member.name,
+                    member.kind === "FieldDefinition" ? "field" : "method", "value");
+                this.ownerOf(member.name, member);
+            }
         }
         for (const member of node.members) {
             if (member.kind === "StaticBlock") this.visit(member.body, cls);
@@ -364,7 +424,12 @@ class SemanticAnalyzer {
         const kind = node.kind;
         if (kind === "Identifier") { this.reference(node, targetScope, "value", true); return; }
         if (kind === "Module") { this.statements(node.body, targetScope, false); return; }
-        if (kind === "BlockStatement") { this.statements(node.body, targetScope, true); return; }
+        if (kind === "BlockStatement") {
+            const child = scope(targetScope, "block");
+            this.rememberScope(child, node);
+            this.statements(node.body, child, false);
+            return;
+        }
         if (kind === "VariableDeclaration") {
             for (const item of node.declarations) {
                 this.patternUses(item.id, targetScope);
@@ -392,7 +457,10 @@ class SemanticAnalyzer {
         if (kind === "EnumDeclaration") {
             // Enum member initializers may use previously declared member names.
             const members = scope(targetScope, "enum");
-            for (const member of node.members) this.bind(members, member.name, "enumMember", "value");
+            for (const member of node.members) {
+                this.bind(members, member.name, "enumMember", "value");
+                this.ownerOf(member.name, member);
+            }
             for (const member of node.members) this.visit(get(member, "initializer"), members);
             return;
         }
@@ -492,6 +560,7 @@ class SemanticAnalyzer {
         }
         if (kind === "ForStatement" || kind === "ForInStatement" || kind === "ForOfStatement") {
             const child = scope(targetScope, "block");
+            this.rememberScope(child, node);
             if (kind === "ForStatement") {
                 this.predeclare(get(node, "init"), child);
                 this.visit(get(node, "init"), child);
@@ -523,7 +592,9 @@ class SemanticAnalyzer {
         }
         if (kind === "CatchClause") {
             const child = scope(targetScope, "block");
+            this.rememberScope(child, node);
             this.declarePattern(get(node, "param"), child, "parameter");
+            this.patternOwner(get(node, "param"), node);
             this.visit(node.body, child);
             return;
         }
@@ -534,9 +605,10 @@ class SemanticAnalyzer {
 
     run(ast) {
         const global = scope(null, "module");
+        this.rememberScope(global, ast);
         this.visit(ast, global);
         return {diagnostics: this.diagnostics, symbols: this.symbols,
-            occurrences: this.occurrences, documentSymbols: outline(ast)};
+            occurrences: this.occurrences, scopes: this.scopes, documentSymbols: outline(ast)};
     }
 }
 

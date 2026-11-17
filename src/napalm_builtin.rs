@@ -17,6 +17,7 @@ use chrono::{
     NaiveDateTime, Offset, TimeZone, Timelike, Utc,
 };
 use crate::napalm_interpreter::{DatabaseMode, MxNative};
+use crate::napalm_interpreter::RegexNative;
 
 #[derive(Clone, Copy, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -352,6 +353,10 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::InputStream,
         BuiltinClass::OutputStream,
         BuiltinClass::Package,
+        BuiltinClass::Regex,
+        BuiltinClass::RegexBuilder,
+        BuiltinClass::RegexMatch,
+        BuiltinClass::RegexCaptures,
         BuiltinClass::Database,
         BuiltinClass::DatabaseQuery,
         BuiltinClass::List,
@@ -696,6 +701,67 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         manifest.register_native(program, instance(BuiltinClass::Package), name,
             MethodKind::Method, arity, NativeBuiltin::Package(native));
     }
+
+    // regexr's public API, with both Rust spelling and Napalm camelCase aliases.
+    for (builtin, name, native) in [
+        (BuiltinId::Regex, "new", RegexNative::New),
+        (BuiltinId::Regex, "escape", RegexNative::Escape),
+        (BuiltinId::Regex, "builder", RegexNative::BuilderNew),
+        (BuiltinId::RegexBuilder, "new", RegexNative::BuilderNew),
+    ] {
+        manifest.register_native(program, static_(builtin), name, MethodKind::Method, 1, NativeBuiltin::Regex(native));
+    }
+    for (class, methods) in [
+        (BuiltinClass::Regex, &[
+            ("as_str", "asStr", 0, RegexNative::AsStr),
+            ("engine_name", "engineName", 0, RegexNative::EngineName),
+            ("capture_names", "captureNames", 0, RegexNative::CaptureNames),
+            ("is_match", "isMatch", 1, RegexNative::IsMatch),
+            ("try_is_match", "tryIsMatch", 1, RegexNative::TryIsMatch),
+            ("find", "find", 1, RegexNative::Find),
+            ("try_find", "tryFind", 1, RegexNative::TryFind),
+            ("find_iter", "findIter", 1, RegexNative::FindIter),
+            ("captures", "captures", 1, RegexNative::Captures),
+            ("try_captures", "tryCaptures", 1, RegexNative::TryCaptures),
+            ("captures_iter", "capturesIter", 1, RegexNative::CapturesIter),
+            ("replace", "replace", 2, RegexNative::Replace),
+            ("replace_all", "replaceAll", 2, RegexNative::ReplaceAll),
+        ][..]),
+        (BuiltinClass::RegexBuilder, &[
+            ("jit", "jit", 1, RegexNative::Jit),
+            ("optimize_prefixes", "optimizePrefixes", 1, RegexNative::OptimizePrefixes),
+            ("backtrack_limit", "backtrackLimit", 1, RegexNative::BacktrackLimit),
+            ("size_limit", "sizeLimit", 1, RegexNative::SizeLimit),
+            ("nest_limit", "nestLimit", 1, RegexNative::NestLimit),
+            ("build", "build", 0, RegexNative::Build),
+        ][..]),
+        (BuiltinClass::RegexMatch, &[
+            ("start", "start", 0, RegexNative::Start),
+            ("end", "end", 0, RegexNative::End),
+            ("as_str", "asStr", 0, RegexNative::AsStr),
+            ("as_bytes", "asBytes", 0, RegexNative::AsBytes),
+            ("range", "range", 0, RegexNative::Range),
+            ("len", "len", 0, RegexNative::Len),
+            ("is_empty", "isEmpty", 0, RegexNative::IsEmpty),
+        ][..]),
+        (BuiltinClass::RegexCaptures, &[
+            ("len", "len", 0, RegexNative::Len),
+            ("is_empty", "isEmpty", 0, RegexNative::IsEmpty),
+            ("get", "get", 1, RegexNative::Get),
+            ("name", "name", 1, RegexNative::Name),
+        ][..]),
+    ] {
+        for &(rust, camel, arity, native) in methods {
+            manifest.register_native(program, instance(class), rust, MethodKind::Method, arity, NativeBuiltin::Regex(native));
+            if camel != rust {
+                manifest.register_native(program, instance(class), camel, MethodKind::Method, arity, NativeBuiltin::Regex(native));
+            }
+        }
+    }
+    for class in [BuiltinClass::RegexMatch, BuiltinClass::RegexCaptures] {
+        manifest.register_native(program, instance(class), "length", MethodKind::Getter, 0, NativeBuiltin::Regex(RegexNative::Len));
+    }
+    manifest.register_native(program, instance(BuiltinClass::RegexCaptures), "[]", MethodKind::SubscriptGetter, 1, NativeBuiltin::Regex(RegexNative::Index));
 
     // Native immutable Bytes and mutable ByteBuffer. These are ordinary
     // runtime calls so both JIT tiers use the established GC-safe call ABI.

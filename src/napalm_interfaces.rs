@@ -239,6 +239,10 @@ impl Heap {
             Type::Builtin(BuiltinId::Package, None) => {
                 matches!(self.get(value), Some(HeapObject::Package(_)))
             }
+            Type::Builtin(builtin @ (BuiltinId::Regex | BuiltinId::RegexBuilder
+                | BuiltinId::RegexMatch | BuiltinId::RegexCaptures), None) => {
+                matches!(self.get(value), Some(HeapObject::Regex(object)) if object.builtin() == *builtin)
+            }
             Type::Builtin(BuiltinId::Generator, element) => {
                 if !matches!(self.get(value), Some(HeapObject::FiberObject { generator: true, .. })) {
                     return Err(mismatch(path, expected));

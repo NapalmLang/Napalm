@@ -62,6 +62,7 @@ presented as existing features.
 42. [Path](#42-path)
 43. [Uri](#43-uri)
 44. [Package (.orange)](#44-package)
+45. [Regex](#45-regex)
 
 ### How to Read the Examples
 
@@ -3121,7 +3122,8 @@ System.print('aba'.replace('a', 'x'));    // xba
 System.print('aba'.replaceAll('a', 'x')); // xbx
 ```
 
-`concat`, regular expressions, and regular-expression methods are not provided.
+`concat` and regular-expression methods on String are not provided. Use the
+[Regex built-in](#45-regex) for regular-expression searches and replacements.
 
 ## 25. Numbers and Randomness
 
@@ -4677,3 +4679,203 @@ System.print(files.length); // number of extracted files
 ```
 
 See [scripts/package.napalm](scripts/package.napalm) for a complete example.
+
+## 45. Regex
+
+`Regex` exposes the public string-matching API of
+[regexr 0.6.2](https://docs.rs/regexr/0.6.2/regexr/). The four built-in types are
+`Regex`, `RegexBuilder`, `RegexMatch`, and `RegexCaptures`. No import is needed;
+all four work in type annotations, `instanceof`, and `typeof`.
+
+### 45.1 Construction and Pattern Syntax
+
+```napalm
+const digits: Regex = new Regex("[0-9]+");
+System.print(digits.isMatch("order 123")); // true
+System.print(digits.find("order 123").asStr()); // 123
+System.print(digits.replaceAll("a12b34", "#")); // a#b#
+
+// Regex.new(pattern) is equivalent to new Regex(pattern).
+const words = Regex.new("\\w+");
+for (const match of words.findIter("hello world")) {
+    System.print(match.asStr()); // hello, then world
+}
+```
+
+Patterns are ordinary Napalm strings, so double backslashes when necessary:
+`"\\d+"` passes `\d+` to regexr. Regex literals such as `/pattern/i` are not
+supported. Flags belong inside the pattern: `(?i)hello`, `(?m)^line`,
+`(?s).`, `(?x)a b`, `(?-u)\w`, or scoped forms such as `(?i:hello)`.
+The supported flags are `i` (case-insensitive), `m` (multiline), `s` (dot
+matches newlines), `x` (extended), and `u` (Unicode). Syntax and matching
+semantics come directly from regexr, including character classes, alternation,
+greedy/lazy quantifiers, numbered/named groups, lookahead/lookbehind, Unicode
+properties, and backreferences. For example:
+
+```napalm
+System.print(Regex.new("(?i)hello").isMatch("HELLO")); // true
+System.print(Regex.new("(?<=foo)bar(?=!)").find("foobar!").asStr()); // bar
+System.print(Regex.new("(ab)\\1").isMatch("abab")); // true
+System.print(Regex.new("\\p{L}+").isMatch("café")); // true
+```
+
+Atomic groups, possessive quantifiers, and `\N{NAME}` are rejected by this
+version of regexr. Patterns, inputs, names, and replacements must be valid
+UTF-8 Strings; other values are not coerced. Invalid patterns and arguments
+throw catchable runtime errors.
+
+`Regex.escape(text)` escapes a literal for use as a pattern, including `#`
+and ASCII whitespace for extended mode. Its result is suitable outside a
+character class; do not insert it directly inside a handwritten `[...]`.
+
+```napalm
+const literal = "a.b|c";
+const exact = Regex.new("^" + Regex.escape(literal) + "$");
+System.print(exact.isMatch(literal)); // true
+```
+
+### 45.2 Regex Methods
+
+Every snake_case method has the camelCase alias shown below. Both spellings
+are calls, including `asStr()`, `engineName()`, and `captureNames()`.
+
+| Method | Alias | Result |
+| --- | --- | --- |
+| `Regex.new(pattern)` | `new Regex(pattern)` | Compile a Regex; throw on failure. |
+| `Regex.escape(text)` | — | Escape literal text. |
+| `Regex.builder(pattern)` | `RegexBuilder.new(pattern)` | Create a configurable builder. |
+| `re.as_str()` | `re.asStr()` | Original pattern String. |
+| `re.engine_name()` | `re.engineName()` | Selected engine's diagnostic name; not a stable engine-selection contract. |
+| `re.capture_names()` | `re.captureNames()` | Array of named groups only; order is unspecified. |
+| `re.is_match(text)` | `re.isMatch(text)` | Whether a match exists anywhere in the input. |
+| `re.try_is_match(text)` | `re.tryIsMatch(text)` | Same result, but throws when the configured backtracking budget is exhausted. |
+| `re.find(text)` | — | First `RegexMatch`, or `null`. |
+| `re.try_find(text)` | `re.tryFind(text)` | First match or `null`; throws on budget exhaustion. |
+| `re.find_iter(text)` | `re.findIter(text)` | Array of non-overlapping `RegexMatch` values. |
+| `re.captures(text)` | — | `RegexCaptures` for the first match, or `null`. |
+| `re.try_captures(text)` | `re.tryCaptures(text)` | First captures or `null`; throws on budget exhaustion. |
+| `re.captures_iter(text)` | `re.capturesIter(text)` | Array of non-overlapping `RegexCaptures` values. |
+| `re.replace(text, replacement)` | — | String with the first match replaced. |
+| `re.replace_all(text, replacement)` | `re.replaceAll(text, replacement)` | String with every match replaced. |
+
+The `*_iter` methods materialize Arrays eagerly, preserving regexr's order,
+non-overlap, anchor context, and empty-match progression. Use ordinary
+`for...of`, indexing, and `.length` on the returned Array. They are not lazy
+Rust iterators. Empty matches advance by complete Unicode characters; an
+empty match immediately following a nonempty match at the same endpoint is
+suppressed. For example, `Regex.new("a*").findIter("aa")` contains one match.
+
+Replacements are **literal**. `$0`, `$1`, `${name}`, and `$&` are inserted
+unchanged; there is no replacement callback or capture interpolation. This
+matches regexr. `String.replace` and `String.replaceAll` retain their ordinary
+literal-search behavior and do not accept a Regex.
+
+### 45.3 Match Results and UTF-8 Offsets
+
+`RegexMatch` values are returned by searches and capture accessors; there is
+no public constructor. They retain their text even after the original Regex
+and input variables go out of scope or garbage collection runs.
+
+| Method/property | Result |
+| --- | --- |
+| `match.start()` | Inclusive starting byte offset in the original input. |
+| `match.end()` | Exclusive ending byte offset in the original input. |
+| `match.range()` | Exclusive Napalm Range, `start...end`. |
+| `match.len()` or `match.length` | Matched byte count, `end - start`. |
+| `match.is_empty()` or `match.isEmpty()` | Whether the matched span is empty. |
+| `match.as_str()` or `match.asStr()` | Matched String. |
+| `match.as_bytes()` or `match.asBytes()` | Matched immutable Bytes. |
+
+Offsets and lengths are **UTF-8 bytes**, not String character indexes or UTF-16
+code units. Do not pass them directly to character-based String slicing.
+
+```napalm
+const match = Regex.new("世").find("é世🎉");
+System.print([match.start(), match.end(), match.len()]); // [2, 5, 3]
+System.print(match.asStr()); // 世
+System.print(match.asBytes().toUtf8()); // 世
+```
+
+### 45.4 Capture Results
+
+`RegexCaptures` has no public constructor. Group `0` is the complete match;
+remaining numeric slots correspond to capture groups. Unmatched optional
+groups retain their slots.
+
+| Method/property | Result |
+| --- | --- |
+| `captures.len()` or `captures.length` | Number of slots, including group 0. |
+| `captures.is_empty()` or `captures.isEmpty()` | Whether there are no slots. A successful capture normally includes slot 0. |
+| `captures.get(index)` | `RegexMatch`, or `null` for an absent/nonparticipating group. |
+| `captures.name(name)` | Named `RegexMatch`, or `null`. |
+| `captures[index]` | Matched String; throws if the group is absent or did not participate. |
+| `captures[name]` | Named matched String; throws if absent or nonparticipating. |
+
+Indexes must be nonnegative safe integer Numbers. Indexing follows regexr's
+string-returning `Index` API, with catchable Napalm errors instead of Rust
+panics. An empty participating group returns an empty match/String, not `null`.
+
+```napalm
+const re = Regex.new("(?<word>[a-z]+)(?:-(?<number>[0-9]+))?");
+const captures: RegexCaptures = re.captures("abc-12");
+System.print(captures[0]); // abc-12
+System.print(captures["word"]); // abc
+System.print(captures.name("number").start()); // 4
+System.print(re.captures("abc").name("number")); // null
+```
+
+### 45.5 Builder Options and Execution Errors
+
+Create a builder with `new RegexBuilder(pattern)`, `RegexBuilder.new(pattern)`,
+or `Regex.builder(pattern)`. Setters mutate and return the same builder for
+chaining. `build()` returns an independent Regex; the builder remains reusable
+and later changes do not affect previously compiled values.
+
+| Method | Alias | Default and meaning |
+| --- | --- | --- |
+| `builder.jit(enabled)` | — | `true`; request regexr's native compilation when available. Pass `false` to opt out explicitly. |
+| `builder.optimize_prefixes(enabled)` | `optimizePrefixes(enabled)` | `false`; merge shared prefixes in large literal alternations. |
+| `builder.backtrack_limit(limit)` | `backtrackLimit(limit)` | `100000000` search steps for fallible backreference searches. |
+| `builder.size_limit(limit)` | `sizeLimit(limit)` | `10000` expanded pattern elements. |
+| `builder.nest_limit(limit)` | `nestLimit(limit)` | `250` nesting depth for groups, classes, and flag scopes. |
+| `builder.build()` | — | Compile with the selected options; throw on failure. |
+
+Boolean options require a Bool. Limits require finite nonnegative integers;
+`sizeLimit` and `nestLimit` accept up to `4294967295`, and `backtrackLimit`
+accepts up to `9007199254740991` (Napalm's largest safe integer, rather than
+Rust's full `u64` range). Zero is passed to regexr unchanged.
+
+In **regexr 0.6.2**, the custom backtracking limit is consulted by `tryFind`,
+`tryCaptures`, and `tryIsMatch`. Budget exhaustion throws; a completed search
+with no match returns `null` or `false`. Ordinary searches, iterator methods,
+and replacements use the engine's default budget and treat exhaustion as no
+match (or the end of iteration), so they can yield partial results. Use the
+`try*` operations when distinguishing failure from absence matters.
+
+```napalm
+const re = Regex.builder("(a+)\\1").backtrackLimit(0).build();
+try {
+    re.tryFind("aaaa");
+} catch (error) {
+    System.print(error); // Regex error reporting exhausted backtracking budget
+}
+```
+
+Napalm enables regexr's JIT feature alongside SIMD. `new Regex(pattern)`,
+`Regex.new(pattern)`, and all builder constructors request `.jit(true)` by
+default: native compilation is attempted during construction or `build()`,
+without waiting for the pattern to become hot. This can increase creation
+time. Unlike regexr's own default, no explicit JIT option is needed in Napalm.
+Use `Regex.builder(pattern).jit(false).build()` to opt out for a particular
+Regex. Engine selection and fallback remain regexr's responsibility; a JIT
+request does not guarantee a JIT engine for every pattern/platform. This
+option is independent of Napalm's own tracing JIT and remains enabled when
+Napalm is built with `--no-default-features`.
+
+The binding covers regexr's public `Regex`, `RegexBuilder`, `Match`, `Captures`,
+and `escape` operations. Rust iterator/borrowing/`Result` types become Napalm
+Arrays, owned values, `null`, and exceptions; internal parser/compiler/VM
+modules are not exposed. Native Regex objects cannot currently cross a
+`launch` concurrent boundary; construct them inside the target context.
+
+See [scripts/regex.napalm](scripts/regex.napalm) for a complete example.

@@ -105,6 +105,9 @@ mod json_vm;
 mod process_vm;
 #[path = "napalm_package_vm.rs"]
 mod package_vm;
+#[path = "napalm_regex_vm.rs"]
+mod regex_vm;
+pub use regex_vm::RegexNative;
 use crate::napalm_bytes::{NapalmBytes, NapalmByteBuffer};
 use crate::napalm_tracing_jit::{
     JitAction, SharedJitProfile, SharedJitRepository, SmallMapLiteralTraceInfo, TraceActivation,
@@ -3229,6 +3232,7 @@ enum HeapObject {
     InputStream(process_vm::NativeInputStream),
     OutputStream(process_vm::NativeOutputStream),
     Package(Box<package_vm::NapalmPackage>),
+    Regex(Box<regex_vm::RegexObject>),
     Database(Arc<mx_vm::NapalmDatabase>),
     DatabaseQuery(Arc<mx_vm::NapalmQuery>),
     List(Vec<Value>),
@@ -4233,6 +4237,7 @@ gc_descriptor!(GC_FILE, "Napalm.File", GcTraceLayout::Leaf);
 gc_descriptor!(GC_INPUT_STREAM, "Napalm.InputStream", GcTraceLayout::Leaf);
 gc_descriptor!(GC_OUTPUT_STREAM, "Napalm.OutputStream", GcTraceLayout::Leaf);
 gc_descriptor!(GC_PACKAGE, "Napalm.Package", GcTraceLayout::Leaf);
+gc_descriptor!(GC_REGEX, "Napalm.Regex", GcTraceLayout::Leaf);
 gc_descriptor!(GC_DATABASE, "Napalm.Database", GcTraceLayout::Leaf);
 gc_descriptor!(GC_DATABASE_QUERY, "Napalm.DatabaseQuery", GcTraceLayout::Leaf);
 gc_descriptor!(GC_RANGE, "Napalm.Range", GcTraceLayout::Leaf);
@@ -4275,6 +4280,7 @@ fn descriptor_for(object: &HeapObject) -> &'static GcDescriptor {
         HeapObject::InputStream(_) => &GC_INPUT_STREAM,
         HeapObject::OutputStream(_) => &GC_OUTPUT_STREAM,
         HeapObject::Package(_) => &GC_PACKAGE,
+        HeapObject::Regex(_) => &GC_REGEX,
         HeapObject::Database(_) => &GC_DATABASE,
         HeapObject::DatabaseQuery(_) => &GC_DATABASE_QUERY,
         HeapObject::List(_) => &GC_LIST,
@@ -4335,6 +4341,7 @@ fn external_bytes_for(object: &HeapObject) -> usize {
         HeapObject::File(file) => std::mem::size_of::<fs_vm::NapalmFile>() + file.external_bytes(),
         HeapObject::InputStream(_) | HeapObject::OutputStream(_) => 0,
         HeapObject::Package(package) => std::mem::size_of::<package_vm::NapalmPackage>() + package.external_bytes(),
+        HeapObject::Regex(object) => object.external_bytes(),
         HeapObject::Database(db) => db.external_bytes(),
         HeapObject::DatabaseQuery(query) => query.external_bytes(),
         HeapObject::List(values) => values.capacity() * std::mem::size_of::<Value>(),
@@ -4624,6 +4631,7 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
         | HeapObject::InputStream(_)
         | HeapObject::OutputStream(_)
         | HeapObject::Package(_)
+        | HeapObject::Regex(_)
         | HeapObject::Database(_)
         | HeapObject::DatabaseQuery(_)
         | HeapObject::Random { .. }
@@ -6345,6 +6353,7 @@ impl HostContext<'_> {
             Some(HeapObject::InputStream(_)) => out.write_str("<InputStream:stdin>"),
             Some(HeapObject::OutputStream(stream)) => write!(out, "<OutputStream:{}>", stream.label()),
             Some(HeapObject::Package(package)) => write!(out, "<Package name={:?}>", package.name),
+            Some(HeapObject::Regex(object)) => write!(out, "{object}"),
             Some(HeapObject::Database(db)) => write!(out, "{db}"),
             Some(HeapObject::DatabaseQuery(_)) => write!(out, "<DatabaseQuery>"),
             Some(HeapObject::Proxy { .. }) => out.write_str("<proxy>"),
@@ -7807,6 +7816,7 @@ pub enum NativeBuiltin {
     DecoratorStore,
     DecoratorStoreList,
     Database(MxNative),
+    Regex(RegexNative),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7991,9 +8001,13 @@ pub enum BuiltinClass {
     Package,
     Database,
     DatabaseQuery,
+    Regex,
+    RegexBuilder,
+    RegexMatch,
+    RegexCaptures,
 }
 
-const BUILTIN_CLASS_COUNT: usize = 37;
+const BUILTIN_CLASS_COUNT: usize = 41;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ReceiverClass(u64);
@@ -8025,6 +8039,8 @@ fn heap_object_receiver_class(object: &HeapObject) -> Option<ReceiverClass> {
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::OutputStream as u64),
         HeapObject::Package(_) =>
             ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Package as u64),
+        HeapObject::Regex(object) =>
+            ReceiverClass(CLASS_KIND_BUILTIN | object.class() as u64),
         HeapObject::Database(_) => ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::Database as u64),
         HeapObject::DatabaseQuery(_) => ReceiverClass(CLASS_KIND_BUILTIN | BuiltinClass::DatabaseQuery as u64),
         HeapObject::List(_) =>
@@ -13104,6 +13120,7 @@ impl<'p> Interpreter<'p> {
             | Some(HeapObject::FileInfo(_)) | Some(HeapObject::File(_))
             | Some(HeapObject::InputStream(_)) | Some(HeapObject::OutputStream(_))
             | Some(HeapObject::Package(_))
+            | Some(HeapObject::Regex(_))
             | Some(HeapObject::Database(_)) | Some(HeapObject::DatabaseQuery(_))
             | Some(HeapObject::Range { .. }) | Some(HeapObject::Random { .. })
             | Some(HeapObject::Date { .. })
@@ -16307,6 +16324,7 @@ impl Interpreter<'_> {
             NativeBuiltin::InputStream(native) => self.execute_input_stream_native(op, native, receiver, args),
             NativeBuiltin::OutputStream(native) => self.execute_output_stream_native(op, native, receiver, args),
             NativeBuiltin::Package(native) => self.execute_package_native(op, native, receiver, args),
+            NativeBuiltin::Regex(native) => self.execute_regex_native(op, native, receiver, args),
             NativeBuiltin::Database(native) => self.execute_mx_native(op, native, receiver, args),
             NativeBuiltin::ProxyNew => {
                 let target = arg(0);
@@ -17549,6 +17567,7 @@ impl Interpreter<'_> {
                     (BuiltinId::InputStream, Some(HeapObject::InputStream(_))) => true,
                     (BuiltinId::OutputStream, Some(HeapObject::OutputStream(_))) => true,
                     (BuiltinId::Package, Some(HeapObject::Package(_))) => true,
+                    (builtin, Some(HeapObject::Regex(object))) => *builtin == object.builtin(),
                     (BuiltinId::Database, Some(HeapObject::Database(_))) => true,
                     (BuiltinId::DatabaseQuery, Some(HeapObject::DatabaseQuery(_))) => true,
                     _ => false,
@@ -17786,6 +17805,7 @@ impl Interpreter<'_> {
             Some(HeapObject::InputStream(_)) => "InputStream".to_owned(),
             Some(HeapObject::OutputStream(_)) => "OutputStream".to_owned(),
             Some(HeapObject::Package(_)) => "Package".to_owned(),
+            Some(HeapObject::Regex(object)) => object.builtin().name().to_owned(),
             Some(HeapObject::Database(_)) => "Database".to_owned(),
             Some(HeapObject::DatabaseQuery(_)) => "DatabaseQuery".to_owned(),
             Some(HeapObject::List(_)) => {
@@ -20167,7 +20187,9 @@ fn builtin_instance_type(builtin: BuiltinId) -> Option<Type> {
         | BuiltinId::File
         | BuiltinId::InputStream
         | BuiltinId::OutputStream
-        | BuiltinId::Package | BuiltinId::Database | BuiltinId::DatabaseQuery => Type::Builtin(builtin, None),
+        | BuiltinId::Package | BuiltinId::Database | BuiltinId::DatabaseQuery
+        | BuiltinId::Regex | BuiltinId::RegexBuilder | BuiltinId::RegexMatch
+        | BuiltinId::RegexCaptures => Type::Builtin(builtin, None),
         _ => return None,
     })
 }
@@ -20895,6 +20917,7 @@ impl Interpreter<'_> {
             Some(HeapObject::InputStream(_)) => "<InputStream:stdin>".into(),
             Some(HeapObject::OutputStream(stream)) => format!("<OutputStream:{}>", stream.label()),
             Some(HeapObject::Package(package)) => format!("<Package name={:?}>", package.name),
+            Some(HeapObject::Regex(object)) => object.to_string(),
             Some(HeapObject::Database(db)) => db.to_string(),
             Some(HeapObject::DatabaseQuery(_)) => "<DatabaseQuery>".into(),
             Some(HeapObject::List(values)) => format!("<list:{}>", values.len()),
@@ -24107,6 +24130,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_tests.rs");
     include!("tests/napalm_fs_tests.rs");
     include!("tests/napalm_package_tests.rs");
+    include!("tests/napalm_regex_tests.rs");
     include!("tests/napalm_mx_vm_tests.rs");
     include!("tests/napalm_http_tests.rs");
     include!("tests/napalm_function_jit_tests.rs");

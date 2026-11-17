@@ -35,19 +35,20 @@ tar = "0.4.46" # Archive manipulation library for Rust
 # vfs = "0.13.0" # Virtual file system abstraction for Rust
 zstd = { version = "0.14.4", features = ["zstdmt"] } # .burning compression
 postcard = { version = "1.1.3", features = ["use-std"] } # Binary .burning metadata/bootstrap encoding
+regexr = { version = "0.6.2", features = ["jit"] } # Regular expressions with native compilation enabled
 
 libffi = "5.2.0" # Native C calls
 libloading = "0.9.1" # Dynamic library loading
 http-body-util = "0.1.5"
 crossbeam-deque = "0.8.8" # Work-stealing deque for concurrent task scheduling
 
-bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator
+bumpalo = { version = "3.20.4", features = ["collections"] } # Memory allocator similar to arena allocator
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "system-proxy", "gzip", "brotli", "deflate", "zstd"] } # HTTP client for Rust
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "net", "sync"] } # Asynchronous runtime for Rust
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 simd-json = { version = "0.19.0", default-features = false, features = ["runtime-detection", "swar-number-parsing", "big-int-as-float"] } # Fast JSON parsing using SIMD
-rusqlite = { version = "0.41.1", default-features = false, features = ["bundled", "functions"] } # Embedded SQL backend
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled", "functions"] } # Embedded SQL backend
 
 cranelift = { path = "./crates/wasmtime/cranelift/umbrella", features = ["jit", "module", "native"] } # JIT compiler back-end framework for Rust
 mmtk = { path = "./crates/mmtk/" } # Garbage Collector, my own fork for having Windows support

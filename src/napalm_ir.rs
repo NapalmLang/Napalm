@@ -585,10 +585,14 @@ pub enum BuiltinId {
     DatabaseQuery = 53,
     /// Native enum of `Database.open` storage/access modes.
     DatabaseMode = 54,
+    Regex = 55,
+    RegexBuilder = 56,
+    RegexMatch = 57,
+    RegexCaptures = 58,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 55] = [
+    pub const ALL: [Self; 59] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
@@ -605,6 +609,7 @@ impl BuiltinId {
         Self::Process, Self::InputStream, Self::OutputStream,
         Self::Package,
         Self::Database, Self::DatabaseQuery, Self::DatabaseMode,
+        Self::Regex, Self::RegexBuilder, Self::RegexMatch, Self::RegexCaptures,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -656,6 +661,10 @@ impl BuiltinId {
             Self::Database => "Database",
             Self::DatabaseQuery => "DatabaseQuery",
             Self::DatabaseMode => "DatabaseMode",
+            Self::Regex => "Regex",
+            Self::RegexBuilder => "RegexBuilder",
+            Self::RegexMatch => "RegexMatch",
+            Self::RegexCaptures => "RegexCaptures",
         }
     }
     /// Module-layout key reserving this builtin. Native decorators use a hidden

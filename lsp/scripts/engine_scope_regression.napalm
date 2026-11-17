@@ -1,0 +1,24 @@
+// Regression test: separate methods and functions have independent lexical scopes.
+// This should compile without NAPALM-B001 or NAPALM-B002 diagnostics.
+class ScopeProbe {
+    first() {
+        const value = 1;
+        return value;
+    }
+
+    second() {
+        const value = 2;
+        return value;
+    }
+}
+
+function otherFunction() {
+    const value = 3;
+    return value;
+}
+
+const object = new ScopeProbe();
+if (object.first() !== 1 || object.second() !== 2 || otherFunction() !== 3) {
+    throw "Independent lexical scopes regression";
+}
+System.print("Independent lexical scopes passed");

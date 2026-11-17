@@ -1,7 +1,8 @@
 // JSON-RPC 2.0 / LSP 3.17 lifecycle and text-document synchronization.
 import {sendFrame, logError} from "./transport";
-import {buildModuleIndex, recordForUri, documentDiagnostics, moduleDefinitionAt, moduleReferencesAt} from "./module_index";
-import {completionAt, hoverAt} from "./intelligence";
+import {buildModuleIndex, updateModuleIndex, filePathForUri, recordForUri, documentDiagnostics, moduleDefinitionAt, moduleReferencesAt} from "./module_index";
+import {completionAt, hoverAt, signatureHelpAt} from "./intelligence";
+import {semanticTokensAt, prepareRenameAt, renameAt, SEMANTIC_TOKEN_TYPES, SEMANTIC_TOKEN_MODIFIERS} from "./editor_features";
 import {createDocumentStore, openDocument, changeDocument, closeDocument, getDocument} from "./documents";
 
 export function createServerState() {
@@ -11,7 +12,8 @@ export function createServerState() {
         documents: createDocumentStore(),
         analyses: new Map(),
         workspaceRoots: [],
-        moduleIndex: null
+        moduleIndex: null,
+        indexStats: null
     };
 }
 
@@ -29,9 +31,11 @@ export function reportParseError() {
 
 // Rebuild the reachable source graph on changes. Unsaved editor buffers are
 // authoritative; dependent open documents receive fresh diagnostics as well.
-function refreshModules(state) {
-    const index = buildModuleIndex(state["documents"], state["workspaceRoots"]);
+function refreshModules(state, dirtyPaths) {
+    const index = updateModuleIndex(state["moduleIndex"], state["documents"],
+        state["workspaceRoots"], dirtyPaths);
     state["moduleIndex"] = index;
+    state["indexStats"] = index.stats;
     for (const uri of state["documents"].keys()) {
         const record = recordForUri(index, uri);
         if (record === null) continue;
@@ -84,6 +88,22 @@ function isObjectValue(value) {
     return kind === "Object" || kind === "Map";
 }
 
+function validLspPosition(position) {
+    return isObjectValue(position) &&
+        typeof position["line"] === "Number" && position["line"].isInteger &&
+        typeof position["character"] === "Number" && position["character"].isInteger &&
+        position["line"] >= 0 && position["character"] >= 0;
+}
+
+function validLspRange(range) {
+    if (!isObjectValue(range) || !validLspPosition(range["start"]) ||
+        !validLspPosition(range["end"])) return false;
+    const first = range["start"];
+    const last = range["end"];
+    return first["line"] < last["line"] ||
+        (first["line"] === last["line"] && first["character"] <= last["character"]);
+}
+
 function validateRequestId(id) {
     if (id === null) return true;
     if (typeof id === "String") return true;
@@ -130,7 +150,13 @@ export function handleMessage(state, request) {
                 referencesProvider: true,
                 documentSymbolProvider: true,
                 hoverProvider: true,
-                completionProvider: {resolveProvider: false, triggerCharacters: [".", "?"]}
+                completionProvider: {resolveProvider: false, triggerCharacters: [".", "?"]},
+                signatureHelpProvider: {triggerCharacters: ["(", ","], retriggerCharacters: [","]},
+                renameProvider: {prepareProvider: true},
+                semanticTokensProvider: {
+                    legend: {tokenTypes: SEMANTIC_TOKEN_TYPES, tokenModifiers: SEMANTIC_TOKEN_MODIFIERS},
+                    full: true, range: true
+                }
             },
             serverInfo: {name: "napalm-lsp", version: "0.1.0"}
         });
@@ -160,7 +186,12 @@ export function handleMessage(state, request) {
         method === "textDocument/references" ||
         method === "textDocument/documentSymbol" ||
         method === "textDocument/hover" ||
-        method === "textDocument/completion") {
+        method === "textDocument/completion" ||
+        method === "textDocument/signatureHelp" ||
+        method === "textDocument/prepareRename" ||
+        method === "textDocument/rename" ||
+        method === "textDocument/semanticTokens/full" ||
+        method === "textDocument/semanticTokens/range") {
         if (!hasId) return false;
         const params = request["params"];
         const document = !isObjectValue(params) ? null : params["textDocument"];
@@ -175,17 +206,22 @@ export function handleMessage(state, request) {
             return false;
         }
         const semantic = cached["result"];
-        if (method === "textDocument/documentSymbol" ||
-        method === "textDocument/hover" ||
-        method === "textDocument/completion") {
+        if (method === "textDocument/documentSymbol") {
             respond(id, semantic["documentSymbols"]);
             return false;
         }
+        if (method === "textDocument/semanticTokens/full" ||
+            method === "textDocument/semanticTokens/range") {
+            const range = method === "textDocument/semanticTokens/range" ? params["range"] : null;
+            if (method === "textDocument/semanticTokens/range" && !validLspRange(range)) {
+                respondError(id, -32602, "Invalid semantic token range");
+                return false;
+            }
+            respond(id, semanticTokensAt(state["moduleIndex"], uri, range));
+            return false;
+        }
         const position = params["position"];
-        if (!isObjectValue(position) || typeof position["line"] !== "Number" ||
-            typeof position["character"] !== "Number" ||
-            !position["line"].isInteger || !position["character"].isInteger ||
-            position["line"] < 0 || position["character"] < 0) {
+        if (!validLspPosition(position)) {
             respondError(id, -32602, "Invalid document position");
             return false;
         }
@@ -195,6 +231,21 @@ export function handleMessage(state, request) {
         }
         if (method === "textDocument/completion") {
             respond(id, completionAt(state["moduleIndex"], uri, position));
+            return false;
+        }
+        if (method === "textDocument/signatureHelp") {
+            respond(id, signatureHelpAt(state["moduleIndex"], uri, position));
+            return false;
+        }
+        if (method === "textDocument/prepareRename") {
+            respond(id, prepareRenameAt(state["moduleIndex"], uri, position));
+            return false;
+        }
+        if (method === "textDocument/rename") {
+            const newName = params["newName"];
+            if (typeof newName !== "String") {
+                respondError(id, -32602, "Invalid new symbol name");
+            } else respond(id, renameAt(state["moduleIndex"], uri, position, newName));
             return false;
         }
         if (method === "textDocument/definition") {
@@ -208,7 +259,23 @@ export function handleMessage(state, request) {
     }
 
     if (method === "workspace/didChangeWatchedFiles") {
-        refreshModules(state);
+        const dirtyPaths = [];
+        const params = request["params"];
+        const changes = isObjectValue(params) ? params["changes"] : null;
+        if (changes !== null) {
+            for (const change of changes) {
+                if (!isObjectValue(change)) continue;
+                const path = filePathForUri(change["uri"]);
+                if (path !== null) dirtyPaths.push(path);
+            }
+        }
+        if (dirtyPaths.length === 0 && state["moduleIndex"] !== null) {
+            // An unspecified watcher event may affect any cached disk source.
+            for (const record of state["moduleIndex"].order) {
+                if (!state["documents"].has(record.uri)) dirtyPaths.push(record.path);
+            }
+        }
+        refreshModules(state, dirtyPaths);
         if (hasId) respond(id, null);
         return false;
     }
@@ -235,7 +302,8 @@ export function handleMessage(state, request) {
                 state["analyses"].delete(uri);
                 clearLexicalDiagnostics(uri);
             }
-            refreshModules(state);
+            const dirtyPath = filePathForUri(uri);
+            refreshModules(state, dirtyPath === null ? [] : [dirtyPath]);
             if (hasId) respond(id, null);
         } catch (error) {
             if (hasId) respondError(id, -32602, "Invalid document notification params");

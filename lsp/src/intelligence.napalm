@@ -50,9 +50,25 @@ function combine(a, b) {
     if (a.name === b.name) return a;
     if (a.name === "unknown" || b.name === "unknown") return shape("unknown");
     if (a.name === "any" || b.name === "any") return shape("any");
-    if (a.name === "Null") return shape(b.name + " | Null");
-    if (b.name === "Null") return shape(a.name + " | Null");
-    return shape(a.name + " | " + b.name);
+    const names = [];
+    const seen = new Set();
+    for (const source of [a.name, b.name]) {
+        for (const part of source.split(" | ")) {
+            if (!seen.has(part) && part !== "Null") {
+                names.push(part);
+                seen.add(part);
+            }
+        }
+    }
+    for (const source of [a.name, b.name]) {
+        for (const part of source.split(" | ")) {
+            if (part === "Null" && !seen.has("Null")) {
+                names.push("Null");
+                seen.add("Null");
+            }
+        }
+    }
+    return primitiveMembers(shape(names.join(" | ")));
 }
 
 function method(result, params) {
@@ -185,7 +201,12 @@ function fromAnnotation(node, record, index, active, depth) {
     }
     if (kind === "TupleType") return primitiveMembers(shape("Array"));
     if (kind === "FunctionType" || kind === "MethodType") return functionType(node, record, index, active, depth + 1);
-    if (kind === "LiteralType") return shape("unknown");
+    if (kind === "LiteralType") {
+        if (node.value === "null") return shape("Null");
+        if (node.value === "true" || node.value === "false") return shape("Boolean");
+        if (node.value.startsWith('"') || node.value.startsWith("'")) return primitiveMembers(shape("String"));
+        return shape("Number");
+    }
     return shape("unknown");
 }
 
@@ -403,6 +424,260 @@ function expressionType(node, record, index, active, depth) {
     return shape("unknown");
 }
 
+// Flow analysis is query-local and never changes semantic symbols or cached ASTs.
+// It follows the path to a cursor, joins completed branches, and only narrows
+// stable local identifiers. Unknown side effects intentionally remain unknown.
+const MAX_FLOW_DEPTH = 64;
+const MAX_FLOW_STEPS = 12000;
+
+function flowClone(values) {
+    const result = new Map();
+    for (const key of values.keys()) result.set(key, values.get(key));
+    return result;
+}
+
+function flowSymbol(record, node) {
+    return node !== null && node.kind === "Identifier" ? symbolForNode(record, node) : null;
+}
+
+function flowValue(context, values, symbol) {
+    const current = values.get(symbol.id);
+    return current === null ? symbolType(symbol, context.record, context.index, new Set(), 0) : current;
+}
+
+function flowAssignment(context, values, id, type) {
+    const symbol = flowSymbol(context.record, id);
+    if (symbol !== null && symbol.domain === "value" && symbol.kind !== "constant") {
+        values.set(symbol.id, type);
+    }
+}
+
+function flowTypeForExpression(context, values, expression) {
+    if (expression === null) return shape("unknown");
+    if (expression.kind === "Identifier") {
+        const symbol = flowSymbol(context.record, expression);
+        if (symbol !== null) return flowValue(context, values, symbol);
+    }
+    if (expression.kind === "ParenthesizedExpression") return flowTypeForExpression(context, values, expression.expression);
+    return expressionType(expression, context.record, context.index, new Set(), 0);
+}
+
+function flowParts(type) {
+    return type.name.split(" | ");
+}
+
+function flowNarrowType(type, expected, positive) {
+    const pieces = flowParts(type);
+    const result = [];
+    let matched = false;
+    for (const piece of pieces) {
+        if (piece === expected) matched = true;
+        if ((piece === expected) === positive) result.push(piece);
+    }
+    if (positive && !matched) {
+        if (type.name === "unknown" || type.name === "any") return primitiveMembers(shape(expected));
+        return type;
+    }
+    if (result.length === 0) return shape("never");
+    if (result.length === 1 && result[0] === type.name) return type;
+    return primitiveMembers(shape(result.join(" | ")));
+}
+
+function flowGuardOfComparison(test) {
+    if (test === null || test.kind !== "BinaryExpression") return null;
+    const equal = test.operator === "==" || test.operator === "===";
+    if (!equal && test.operator !== "!=" && test.operator !== "!==") return null;
+    let left = test.left;
+    let right = test.right;
+    if (left.kind === "NullLiteral" || left.kind === "StringLiteral") {
+        left = test.right;
+        right = test.left;
+    }
+    if (left.kind === "Identifier" && right.kind === "NullLiteral") {
+        return {target: left, expected: "Null", positive: equal};
+    }
+    if (left.kind === "UnaryExpression" && left.operator === "typeof" &&
+        left.argument.kind === "Identifier" && right.kind === "StringLiteral") {
+        const literal = right.raw.slice(1, right.raw.length - 1);
+        const target = literal === "string" || literal === "String" ? "String" :
+            literal === "number" || literal === "Number" ? "Number" :
+            literal === "boolean" || literal === "Boolean" ? "Boolean" : null;
+        if (target !== null) return {target: left.argument, expected: target, positive: equal};
+    }
+    return null;
+}
+
+function flowGuard(context, values, test, positive, depth) {
+    if (test === null || depth > MAX_FLOW_DEPTH) return values;
+    if (test.kind === "ParenthesizedExpression") return flowGuard(context, values, test.expression, positive, depth + 1);
+    if (test.kind === "UnaryExpression" && test.operator === "!") {
+        return flowGuard(context, values, test.argument, !positive, depth + 1);
+    }
+    if (test.kind === "LogicalExpression") {
+        if ((test.operator === "&&" && positive) || (test.operator === "||" && !positive)) {
+            flowGuard(context, values, test.left, positive, depth + 1);
+            flowGuard(context, values, test.right, positive, depth + 1);
+        }
+        return values;
+    }
+    const comparison = flowGuardOfComparison(test);
+    if (comparison !== null) {
+        const symbol = flowSymbol(context.record, comparison.target);
+        if (symbol !== null) {
+            const narrowed = flowNarrowType(flowValue(context, values, symbol),
+                comparison.expected, positive === comparison.positive);
+            values.set(symbol.id, narrowed);
+        }
+    } else if (test.kind === "Identifier" && positive) {
+        const symbol = flowSymbol(context.record, test);
+        if (symbol !== null) values.set(symbol.id,
+            flowNarrowType(flowValue(context, values, symbol), "Null", false));
+    }
+    return values;
+}
+
+function flowJoin(context, before, first, second) {
+    const result = flowClone(before);
+    const all = new Set();
+    for (const key of first.keys()) all.add(key);
+    for (const key of second.keys()) all.add(key);
+    for (const key of all) {
+        const symbol = context.record.semantic.symbols[key];
+        if (symbol === null) continue;
+        const base = flowValue(context, before, symbol);
+        const a = first.has(key) ? first.get(key) : base;
+        const b = second.has(key) ? second.get(key) : base;
+        result.set(key, combine(a, b));
+    }
+    return result;
+}
+
+function flowStops(node) {
+    if (node === null) return false;
+    if (node.kind === "ReturnStatement" || node.kind === "ThrowStatement") return true;
+    if (node.kind === "BlockStatement" && node.body.length > 0) {
+        return flowStops(node.body[node.body.length - 1]);
+    }
+    if (node.kind === "IfStatement") return node.alternate !== null &&
+        flowStops(node.consequent) && flowStops(node.alternate);
+    return false;
+}
+
+function flowApplyExpression(context, values, node) {
+    if (node === null) return;
+    if (node.kind === "AssignmentExpression" && node.left.kind === "Identifier") {
+        flowAssignment(context, values, node.left, flowTypeForExpression(context, values, node.right));
+    } else if (node.kind === "UpdateExpression" && node.argument.kind === "Identifier") {
+        flowAssignment(context, values, node.argument, shape("Number"));
+    } else if (node.kind === "SequenceExpression") {
+        for (const item of node.expressions) flowApplyExpression(context, values, item);
+    }
+}
+
+function flowWalk(context, node, position, values, depth) {
+    if (node === null || depth > MAX_FLOW_DEPTH || context.steps >= MAX_FLOW_STEPS ||
+        node.startByte >= position) return values;
+    context.steps++;
+    const kind = node.kind;
+    if (kind === "Module" || kind === "Program" || kind === "BlockStatement") {
+        for (const statement of node.body) {
+            if (statement.startByte >= position) break;
+            values = flowWalk(context, statement, position, values, depth + 1);
+        }
+        return values;
+    }
+    if (kind === "ExportDeclaration" || kind === "ExportDefaultDeclaration" ||
+        kind === "DeclareStatement" || kind === "DecoratedDeclaration") {
+        return flowWalk(context, node.declaration, position, values, depth + 1);
+    }
+    if (kind === "VariableDeclaration") {
+        for (const declaration of node.declarations) {
+            if (declaration.startByte >= position) break;
+            if (declaration.id.kind === "Identifier" && declaration.init !== null &&
+                declaration.annotation === null && declaration.init.endByte <= position) {
+                const symbol = flowSymbol(context.record, declaration.id);
+                if (symbol !== null) values.set(symbol.id,
+                    flowTypeForExpression(context, values, declaration.init));
+            }
+        }
+    } else if (kind === "ExpressionStatement") {
+        if (node.endByte <= position) flowApplyExpression(context, values, node.expression);
+    } else if (kind === "IfStatement") {
+        if (node.test.endByte >= position) return values;
+        const before = flowClone(values);
+        const thenFlow = flowGuard(context, flowClone(before), node.test, true, depth + 1);
+        const elseFlow = flowGuard(context, flowClone(before), node.test, false, depth + 1);
+        if (position <= node.consequent.endByte && position >= node.consequent.startByte) {
+            return flowWalk(context, node.consequent, position, thenFlow, depth + 1);
+        }
+        if (node.alternate !== null && position >= node.alternate.startByte &&
+            position <= node.alternate.endByte) {
+            return flowWalk(context, node.alternate, position, elseFlow, depth + 1);
+        }
+        if (node.endByte <= position) {
+            const a = flowWalk(context, node.consequent, position, thenFlow, depth + 1);
+            const b = node.alternate === null ? elseFlow :
+                flowWalk(context, node.alternate, position, elseFlow, depth + 1);
+            if (flowStops(node.consequent)) return b;
+            if (node.alternate !== null && flowStops(node.alternate)) return a;
+            return flowJoin(context, before, a, b);
+        }
+    } else if (kind === "FunctionDeclaration" || kind === "FunctionExpression" ||
+        kind === "ArrowFunctionExpression" || kind === "LambdaExpression" ||
+        kind === "MethodDefinition" || kind === "ObjectMethod") {
+        const body = node.body;
+        if (body !== null && position >= body.startByte && position <= body.endByte) {
+            return flowWalk(context, body, position, flowClone(values), depth + 1);
+        }
+    } else if (kind === "ClassDeclaration" || kind === "ClassExpression") {
+        for (const member of node.members) {
+            if (position >= member.startByte && position <= member.endByte) {
+                return flowWalk(context, member, position, flowClone(values), depth + 1);
+            }
+        }
+    } else if (kind === "WhileStatement" || kind === "DoWhileStatement" ||
+        kind === "ForStatement" || kind === "ForOfStatement" || kind === "ForInStatement") {
+        if (node.body !== null && position >= node.body.startByte && position <= node.body.endByte) {
+            return flowWalk(context, node.body, position, flowClone(values), depth + 1);
+        }
+        if (node.body !== null && node.endByte <= position) {
+            const applied = flowWalk(context, node.body, position, flowClone(values), depth + 1);
+            return flowJoin(context, values, values, applied);
+        }
+    } else if (kind === "TryStatement") {
+        if (position >= node.block.startByte && position <= node.block.endByte) {
+            return flowWalk(context, node.block, position, flowClone(values), depth + 1);
+        }
+        if (node.handler !== null && position >= node.handler.startByte && position <= node.handler.endByte) {
+            return flowWalk(context, node.handler, position, flowClone(values), depth + 1);
+        }
+        if (node.finalizer !== null && position >= node.finalizer.startByte && position <= node.finalizer.endByte) {
+            return flowWalk(context, node.finalizer, position, flowClone(values), depth + 1);
+        }
+        if (node.endByte <= position) {
+            const attempted = flowWalk(context, node.block, position, flowClone(values), depth + 1);
+            const fallback = node.handler === null ? values :
+                flowWalk(context, node.handler, position, flowClone(values), depth + 1);
+            let joined = flowJoin(context, values, attempted, fallback);
+            if (node.finalizer !== null) joined = flowWalk(context, node.finalizer, position, joined, depth + 1);
+            return joined;
+        }
+    } else if (kind === "CatchClause") {
+        return flowWalk(context, node.body, position, values, depth + 1);
+    }
+    return values;
+}
+
+function flowTypeAt(index, record, symbol, byteOffset) {
+    if (symbol === null) return shape("unknown");
+    const base = symbolType(symbol, record, index, new Set(), 0);
+    if (symbol.kind === "import" || symbol.domain !== "value") return base;
+    const context = {index: index, record: record, steps: 0};
+    const env = flowWalk(context, record.ast, byteOffset, new Map(), 0);
+    const type = env.get(symbol.id);
+    return type === null ? base : type;
+}
+
 function positionByte(record, position) {
     const offset = offsetAt(record.source, position.line, position.character);
     if (offset === null) return null;
@@ -487,7 +762,7 @@ function memberReceiverType(index, record, context, byteOffset, active) {
         return shape("unknown");
     }
     const sym = tokenSymbol(record, context.token);
-    return sym !== null ? symbolType(sym, record, index, active, 0) : builtinType(context.token.text);
+    return sym !== null ? flowTypeAt(index, record, sym, byteOffset) : builtinType(context.token.text);
 }
 
 function completionKind(symbol) {
@@ -562,7 +837,7 @@ export function completionAt(index, uri, position) {
         const used = new Set();
         for (const symbol of scopeSymbols(record, byteOffset, typeContext ? "type" : "value")) {
             if (!symbol.name.startsWith(prefix)) continue;
-            const type = symbolType(symbol, record, index, active, 0);
+            const type = flowTypeAt(index, record, symbol, byteOffset);
             appendCompletion(items, used, symbol.name, completionKind(symbol), descriptor(type), prefix);
         }
         const builtinWords = typeContext ? BUILTIN_TYPES : ENGINE_GLOBALS;
@@ -584,7 +859,7 @@ export function hoverAt(index, uri, position) {
     for (const occurrence of record.semantic.occurrences) {
         if (occurrence.startByte <= byteOffset && byteOffset < occurrence.endByte) {
             const symbol = occurrence.symbol;
-            const type = symbolType(symbol, record, index, new Set(), 0);
+            const type = flowTypeAt(index, record, symbol, byteOffset);
             const text = symbol.kind + " " + symbol.name + ": " + descriptor(type);
             return {contents: {kind: "markdown", value: "```napalm\n" + text + "\n```"},
                 range: occurrence.range};
@@ -615,8 +890,66 @@ export function inferSymbolAt(index, uri, position) {
     if (byteOffset === null) return "unknown";
     for (const occurrence of record.semantic.occurrences) {
         if (occurrence.startByte <= byteOffset && byteOffset < occurrence.endByte) {
-            return descriptor(symbolType(occurrence.symbol, record, index, new Set(), 0));
+            return descriptor(flowTypeAt(index, record, occurrence.symbol, byteOffset));
         }
     }
     return "unknown";
+}
+// Collect the closest call's active argument from lexical tokens. Parentheses
+// inside arrays, objects, or nested calls cannot advance an outer argument.
+export function signatureHelpAt(index, uri, position) {
+    const record = recordForUri(index, uri);
+    if (record === null) return null;
+    const byteOffset = positionByte(record, position);
+    if (byteOffset === null) return null;
+    const tokens = record.lexical.tokens;
+    const stack = [];
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (token.startByte >= byteOffset) break;
+        const value = token.text;
+        if (value === "(" || value === "[" || value === "{") {
+            stack.push({tokenIndex: i, symbol: value, argument: 0});
+        } else if (value === ")" || value === "]" || value === "}") {
+            if (stack.length === 0) return null;
+            const last = stack[stack.length - 1];
+            if ((value === ")" && last.symbol !== "(") ||
+                (value === "]" && last.symbol !== "[") ||
+                (value === "}" && last.symbol !== "{")) return null;
+            stack.pop();
+        } else if (value === "," && stack.length > 0 && stack[stack.length - 1].symbol === "(") {
+            stack[stack.length - 1].argument++;
+        }
+    }
+    if (stack.length === 0 || stack[stack.length - 1].symbol !== "(") return null;
+    const call = stack[stack.length - 1];
+    let before = call.tokenIndex - 1;
+    while (before >= 0 && tokens[before].kind === "newline") before--;
+    if (before < 0) return null;
+    const callee = tokens[before];
+    if (callee.kind !== "identifier") return null;
+    let callable = null;
+    if (before >= 2 && (tokens[before - 1].text === "." || tokens[before - 1].text === "?.")) {
+        const receiverToken = tokens[before - 2];
+        const context = {token: receiverToken, prefix: ""};
+        const receiver = memberReceiverType(index, record, context, byteOffset, new Set());
+        const candidate = receiver.members.get(callee.text);
+        if (candidate !== null) callable = candidate.type;
+    } else {
+        const symbol = tokenSymbol(record, callee);
+        if (symbol !== null) callable = flowTypeAt(index, record, symbol, byteOffset);
+    }
+    if (callable === null || callable.name !== "Function") return null;
+    const parameters = [];
+    const names = [];
+    for (const parameter of callable.parameters) {
+        const label = parameter.name + ": " + parameter.type;
+        parameters.push({label: label});
+        names.push(label);
+    }
+    const label = callee.text + "(" + names.join(", ") + "): " + descriptor(callable.returns);
+    const activeParameter = parameters.length === 0 ? 0 :
+        (call.argument < parameters.length ? call.argument : parameters.length - 1);
+    return {signatures: [{label: label, parameters: parameters}], activeSignature: 0,
+        activeParameter: activeParameter};
 }

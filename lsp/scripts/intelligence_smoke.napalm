@@ -1,0 +1,31 @@
+// Run from the repository root: napalm lsp/scripts/intelligence_smoke.napalm
+import {buildModuleIndex} from "../src/module_index";
+import {completionAt, hoverAt, inferSymbolAt} from "../src/intelligence";
+
+function expect(condition, description) {
+    if (!condition) throw "intelligence smoke: " + description;
+}
+
+function findItem(items, name) {
+    for (const item of items) if (item.label === name) return item;
+    return null;
+}
+
+const source = "const answer = 42;\n" +
+    "function twice(value: number): number { return value + answer; }\n" +
+    "const data = {value: answer, title: \"Napalm\"};\n" +
+    "data.va;\n" +
+    "const result = twice(answer);\n";
+const uri = Uri.fromFilePath(Path.resolve("lsp/scripts/intelligence_virtual.napalm"));
+const documents = new Map();
+documents.set(uri, {uri: uri, text: source, version: 1});
+const index = buildModuleIndex(documents, [Process.cwd()]);
+expect(index !== null, "module index created");
+expect(inferSymbolAt(index, uri, {line: 0, character: 7}) === "Number", "number inference");
+expect(inferSymbolAt(index, uri, {line: 4, character: 6}) === "Number", "function result inference");
+const choices = completionAt(index, uri, {line: 3, character: 7});
+const member = findItem(choices.items, "value");
+expect(member !== null && member.detail === "Number", "object member completion");
+const hover = hoverAt(index, uri, {line: 1, character: 9});
+expect(hover !== null && hover.contents.value.contains("Number"), "typed function hover");
+System.print("Napalm intelligence smoke tests passed");

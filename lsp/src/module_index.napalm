@@ -250,7 +250,13 @@ function environmentRoots(name, base) {
 }
 
 class ModuleIndexer {
-    constructor(documents, roots) {
+    constructor(documents, roots, previous, dirtyPaths) {
+        this.previous = previous;
+        this.dirty = new Set();
+        this.stats = {parsed: 0, reused: 0};
+        if (dirtyPaths !== null) for (const path of dirtyPaths) {
+            if (typeof path === "String" && path.length > 0) this.dirty.add(keyForPath(path));
+        }
         this.modules = new Map();
         this.openPaths = new Map();
         this.roots = roots;
@@ -344,16 +350,25 @@ class ModuleIndexer {
         const buffer = this.openPaths.get(key);
         const uri = buffer === null ? displayUri(path) : buffer.uri;
         if (uri === null) return null;
+        const cached = this.previous === null ? null : this.previous.modules.get(key);
+        // Closed files can reuse their snapshot until a watched-file notification
+        // invalidates them. Open buffers are always checked against their text.
+        const canReuseDisk = buffer === null && cached !== null && !this.dirty.has(key) &&
+            !this.previous.openPaths.has(key);
         if (buffer !== null) source = buffer.text;
+        else if (canReuseDisk) source = cached.source;
         else {
             try { source = Fs.readText(path); }
             catch (error) { return null; }
         }
         if (typeof source !== "String") return null;
         if (source.utf8Length > MAX_MODULE_SOURCE_BYTES) return null;
-        const lexical = tokenize(source);
-        const parsed = parseLexed(source, lexical);
-        const semantic = analyze(parsed.ast);
+        const reuse = cached !== null && !this.dirty.has(key) && cached.source === source;
+        const lexical = reuse ? cached.lexical : tokenize(source);
+        const parsed = reuse ? cached.parsed : parseLexed(source, lexical);
+        const semantic = reuse ? cached.semantic : analyze(parsed.ast);
+        if (reuse) this.stats.reused++;
+        else this.stats.parsed++;
         const record = {key: key, path: path, uri: uri, source: source, ast: parsed.ast,
             lexical: lexical, parsed: parsed, semantic: semantic, moduleDiagnostics: [],
             exports: new Map(), imports: [], locals: new Map(), links: new Map(),
@@ -485,13 +500,33 @@ class ModuleIndexer {
 }
 
 export function buildModuleIndex(documents, roots) {
-    const index = new ModuleIndexer(documents, roots);
+    return updateModuleIndex(null, documents, roots, []);
+}
+
+// Reuse immutable lexical, AST, and semantic snapshots for unchanged modules.
+// Module links and diagnostics are always rebuilt, so updates to re-exports,
+// new files, or removed dependencies cannot leave stale cross-module results.
+export function updateModuleIndex(previous, documents, roots, dirtyPaths) {
+    if (previous !== null && previous.roots.join("\n") !== roots.join("\n")) previous = null;
+    const index = new ModuleIndexer(documents, roots, previous, dirtyPaths);
     for (const uri of documents.keys()) {
         const path = pathFromUri(uri);
         if (path !== null) index.load(path);
     }
     index.linkAll();
+    // Do not retain the complete previous graph through successive revisions.
+    // Its immutable source snapshots are already shared by the new records.
+    index.previous = null;
     return index;
+}
+
+export function filePathForUri(uri) {
+    return pathFromUri(uri);
+}
+
+export function moduleIdentityAt(index, uri, position) {
+    const record = recordForUri(index, uri);
+    return record === null ? null : resolvedAt(record, position);
 }
 
 export function recordForUri(index, uri) {

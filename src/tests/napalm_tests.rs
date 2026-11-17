@@ -1,5 +1,96 @@
 // Production frontend -> HIR -> optimizer -> bytecode -> interpreter/JIT.
 #[test]
+fn napalm_bitwise_assignments_values_precedence_and_captures() {
+    run_napalm(r#"
+        let bits = 0;
+        const values = [bits |= 5, bits &= 3, bits ^= 2, bits <<= 2, bits >>= 1];
+        let left = 1;
+        let right = 2;
+        const chained = (left |= right <<= 1 + 1);
+        let shifted = 3;
+        shifted <<= 1 + 1;
+        shifted >>= 1;
+        let mixed = 1;
+        mixed |= 2 & 6;
+        let negative = -1;
+        negative >>= 1;
+        let wrapped = 1;
+        wrapped <<= 33;
+        let fractional = 7.9;
+        fractional &= 3;
+        function captured() { bits ^= 3; return bits; }
+        const capturedValue = captured();
+        const result = [values, bits, chained, left, right, shifted, mixed,
+                        negative, wrapped, fractional, capturedValue];
+    "#, "[[5, 1, 3, 12, 6], 5, 9, 9, 8, 6, 3, 2147483647, 2, 3, 5]");
+}
+
+#[test]
+fn napalm_bitwise_assignments_evaluate_destinations_once_in_order() {
+    run_napalm(r#"
+        let log = '';
+        class Box {
+            value = 5;
+            get bits() { log += 'g'; return this.value; }
+            set bits(value) { log += 's'; this.value = value; }
+        }
+        const box = new Box();
+        function receiver() { log += 'r'; return box; }
+        function rhs(value) { log += 'v'; return value; }
+        const values = [receiver().bits |= rhs(2), receiver().bits &= rhs(6),
+                        receiver().bits ^= rhs(3), receiver().bits <<= rhs(1),
+                        receiver().bits >>= rhs(1)];
+        const items = [5];
+        function list() { log += 'l'; return items; }
+        function key() { log += 'k'; return 0; }
+        list()[key()] |= rhs(2);
+        list()[key()] &= rhs(6);
+        list()[key()] ^= rhs(3);
+        list()[key()] <<= rhs(1);
+        list()[key()] >>= rhs(1);
+        const object = {bits: 1};
+        object.bits |= 2;
+        object['bits'] <<= 1;
+        let current = 1;
+        function change() { current = 8; return 2; }
+        current |= change();
+        const result = [values, box.value, items[0], object.bits, current, log];
+    "#, "[[7, 6, 5, 10, 5], 5, 5, 6, 3, rgvsrgvsrgvsrgvsrgvslkvlkvlkvlkvlkv]");
+}
+
+#[test]
+fn napalm_bitwise_assignments_in_native_loops() {
+    run_napalm_checked(r#"
+        let bits = 0;
+        for (let i = 0; i < 100; i++) {
+            bits |= 5;
+            bits &= 7;
+            bits ^= 2;
+            bits <<= 1;
+            bits >>= 1;
+        }
+        const result = bits;
+    "#, "5", true);
+}
+
+#[test]
+fn napalm_bitwise_assignments_reject_invalid_destinations() {
+    for op in ["|=", "&=", "^=", "<<=", ">>="] {
+        for (source, message) in [
+            (format!("const bits = 1; bits {op} 2;"), "immutable binding"),
+            (format!("const bits = 1; function change() {{ bits {op} 2; }}"), "immutable binding"),
+            (format!("(1 + 2) {op} 3;"), "invalid assignment target"),
+            (format!("let bits = 1; [bits] {op} 2;"), "invalid assignment target"),
+        ] {
+            let parsed = crate::napalm_front_main::parse("test.napalm", &source);
+            assert!(parsed.has_errors(), "accepted {source}");
+            assert!(parsed.diagnostics.iter().any(|d| d.message.contains(message)),
+                "{source}: {:?}", parsed.diagnostics);
+        }
+    }
+}
+
+#[test]
 fn napalm_uncaught_throw_displays_value_and_source_location() {
     for (source, expected) in [
         (r#"function expect(ok, message) { if (!ok) throw message; }

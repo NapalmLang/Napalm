@@ -32,7 +32,7 @@ enum Kind {
     #[token("'", string)]
     #[token("`", string)]
     String,
-    #[regex(r"===|!==|>>>|\?\?=|&&=|\|\|=|\*\*=|\?\.|\?\?|\.\.\.|\|>|==|!=|<=|>=|=>|\+\+|--|\+=|-=|\*=|/=|%=|\*\*|&&|\|\||<<|>>|[{}()\[\],;:.?+*/%~!&|^=<>@-]")]
+    #[regex(r"===|!==|>>>|\?\?=|&&=|\|\|=|\*\*=|<<=|>>=|&=|\|=|\^=|\?\.|\?\?|\.\.\.|\|>|==|!=|<=|>=|=>|\+\+|--|\+=|-=|\*=|/=|%=|\*\*|&&|\|\||<<|>>|[{}()\[\],;:.?+*/%~!&|^=<>@-]")]
     Symbol,
     Eof,
 }
@@ -173,7 +173,7 @@ struct Parser<'a> {
     source: &'a str,
     arena: &'a Bump,
     tokens: BumpVec<'a, Tok>,
-    // Only splitting a `>>` token mutates the stream during type lookahead.
+    // Splitting closing-angle tokens mutates the stream during type lookahead.
     token_splits: SmallVec<[(usize, Tok); 4]>,
     pos: usize,
     depth: usize,
@@ -2453,7 +2453,7 @@ impl<'a> Parser<'a> {
 
     fn type_close(&mut self) -> Result<()> {
         self.lines();
-        if self.at(">>") {
+        if matches!(self.text(), ">>" | ">>=" | ">=") {
             let original = self.peek();
             let span = original.span;
             self.token_splits.push((self.pos, original));
@@ -2902,7 +2902,7 @@ impl<'a> Parser<'a> {
                 );
                 continue;
             }
-            if min <= 1 && matches!(self.text(), "=" | "+=" | "-=" | "*=" | "/=" | "%=") {
+            if min <= 1 && matches!(self.text(), "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "|=" | "&=" | "^=" | "<<=" | ">>=") {
                 let op = self.text();
                 self.bump();
                 if op == "=" { self.destructuring_target(&left)?; }
@@ -2917,7 +2917,7 @@ impl<'a> Parser<'a> {
                 } else {
                     ExprKind::Update {
                         target: Box::new(left),
-                        operator: infix(&op[..1]).unwrap().1,
+                        operator: infix(&op[..op.len() - 1]).unwrap().1,
                         value,
                         postfix: false,
                     }
@@ -6103,6 +6103,23 @@ mod napalm_syntax_tests {
             const shifted = 8 >> 1;
         "#);
         assert_eq!(module.statements.len(), 5);
+    }
+
+    #[test]
+    fn bitwise_assignment_tokens_preserve_generic_type_closings() {
+        // >>= must still close two nested types followed by an initializer.
+        assert_parses("let nested: Array<Array<number>>=[[1]]; nested[0][0] >>= 1;");
+
+        let source = "<Outer<Inner>>= 1";
+        let arena = Bump::new();
+        let mut parser = Parser::new(source, 0, source.len(), &arena);
+        let original: Vec<_> = parser.tokens.iter().map(|t| (t.kind, t.span)).collect();
+        for _ in 0..3 {
+            assert!(!parser.try_call_type_arguments());
+            assert_eq!(parser.pos, 0);
+            assert!(parser.diagnostics.is_empty());
+            assert_eq!(parser.tokens.iter().map(|t| (t.kind, t.span)).collect::<Vec<_>>(), original);
+        }
     }
 
     fn assert_parses(source: &str) -> ModuleAst {

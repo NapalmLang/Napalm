@@ -595,7 +595,7 @@ type.
 | Logical | `&&`, `||`, `??`. |
 | Pipeline | `|>`; thread-first and left-associative. |
 | Conditional | `condition ? yes : no`. |
-| Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `&&=`, `||=`, `??=`. |
+| Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `|=`, `&=`, `^=`, `<<=`, `>>=`, `&&=`, `||=`, `??=`. |
 
 From highest to lowest, the parser gives precedence to member access/calls,
 updates, prefixes, exponentiation, multiplication, addition, shifts,
@@ -641,6 +641,19 @@ System.print(10 & 3);   // 2
 Numeric operands are converted to the 32-bit domain; the shift amount is reduced
 to its five lowest bits. Do not use these operators for exact 64-bit integer
 arithmetic.
+
+The compound forms `|=`, `&=`, `^=`, `<<=`, and `>>=` apply the corresponding
+bitwise operation and store its result in the left-hand destination. They return
+the stored value and evaluate the destination's receiver and key only once.
+
+```napalm
+let flags = 0;
+flags |= 5;   // 5
+flags &= 3;   // 1
+flags ^= 2;   // 3
+flags <<= 2;  // 12
+flags >>= 1;  // 6 (unsigned shift, just like >>)
+```
 
 ### 5.4 Short-Circuiting and Optional Access
 

@@ -2134,11 +2134,12 @@ Napalm has native publish/subscribe built from four global types:
 | --- | --- |
 | `Emitter<T>` | Publishes events. |
 | `Channel<T>` | A pipe that carries events from emitters to receivers. |
-| `Receiver<T>` | Subscribes to channels and receives their events. |
+| `Receiver<T>` | Subscribes to channels, with one handler per channel. |
 | `Event<T>` | One published occurrence. Its `data` holds the payload. |
 
 You create each endpoint on its own and then connect them. An emitter
-**publishes to** channels, and a receiver **subscribes from** channels:
+**publishes to** channels. A receiver **subscribes from** a channel and gives
+the handler that runs for every event arriving through that channel:
 
 ```napalm
 const channel = new Channel();
@@ -2146,24 +2147,24 @@ const emitter = new Emitter();
 const receiver = new Receiver();
 
 emitter.publish_to(channel);
-receiver.subscribe_from(channel);
+receiver.subscribe_from(channel, (event) => {
+    System.print(event.data.obj);
+});
 
-emitter.emit({ obj: "yes" });
-
-const event = receiver.tryReceive();
-System.print(event.data.obj); // yes
+emitter.emit({ obj: "yes" }); // prints: yes
 ```
 
 `emitter.emit(data)` wraps `data` in a new `Event`. That Event travels through
-every channel the emitter publishes to, and every receiver subscribed to any of
-those channels gets it.
+every channel the emitter publishes to. For each receiver subscribed to one of
+those channels, the handler of that subscription is called with the Event.
 
 #### Many-to-many connections
 
 Connections are many-to-many:
 
 - One emitter can publish to many channels.
-- One receiver can subscribe from many channels.
+- One receiver can subscribe from many channels, with a different handler for
+  each one.
 - One channel can be shared by many emitters and many receivers.
 
 ```napalm
@@ -2177,22 +2178,67 @@ const reporter = new Emitter();
 reporter.publish_to(sports);
 
 const reader = new Receiver();
-reader.subscribe_from(news);
+reader.subscribe_from(news, (event) => System.print(`reader: ${event.data}`));
 
 const fan = new Receiver();
-fan.subscribe_from(sports).subscribe_from(news);
+fan.subscribe_from(sports, (event) => System.print(`fan, sports: ${event.data}`))
+   .subscribe_from(news, (event) => System.print(`fan, news: ${event.data}`));
 
-editor.emit("headline");   // reader and fan each receive it once
-reporter.emit("score");    // only fan receives it
+editor.emit("headline");
+reporter.emit("score");
 ```
 
-One `emit()` is one Event. A receiver that can be reached through several
-channels (like `fan` above, for `editor`'s events) still receives that Event
-only **once**, not once per channel.
+Output:
 
-Connecting the same pair again has no effect. `unpublish_from(channel)` and
+```text
+reader: headline
+fan, news: headline
+fan, sports: headline
+fan, sports: score
+```
+
+Because handlers belong to subscriptions, an Event that reaches the same
+receiver through two channels runs **both** channel handlers, as `fan` shows
+for `"headline"`. Handlers run in this order: the emitter's channels in the
+order it connected to them, then each channel's receivers in the order they
+subscribed.
+
+Each receiver has one handler per channel. Calling
+`subscribe_from(channel, handler)` again for a channel it already subscribes
+from replaces that handler. `unpublish_from(channel)` and
 `unsubscribe_from(channel)` remove a connection and return whether one
 existed.
+
+#### Handlers
+
+A handler is an ordinary or `async` function that takes the `Event` as its
+only parameter, or no parameters at all:
+
+```napalm
+const channel = new Channel<number>();
+const emitter = new Emitter<number>();
+const receiver = new Receiver<number>();
+emitter.publish_to(channel);
+
+receiver.subscribe_from(channel, async function (event) {
+    const doubled = await Promise.resolve(event.data * 2);
+    System.print(doubled);
+});
+
+const event = emitter.emit(21); // emit() also returns the Event
+System.print(event.data);       // 21, printed before 42
+```
+
+Handlers run on the VM's **microtask queue**, not inside `emit()`. `emit()`
+returns first, and the handlers run afterwards in the order described above.
+This prevents a handler from re-entering the code that is emitting.
+
+The routes are fixed when the event is emitted. Unsubscribing after `emit()`
+does not cancel a handler call that is already queued. Closing the receiver
+does cancel it (see Closing).
+
+A `concurrent function` cannot be a handler directly; use an ordinary or
+async handler that calls `launch`.
 
 #### Generic payloads
 
@@ -2209,7 +2255,7 @@ class Bird { name: string = "tweety"; }
 
 const emitter = new Emitter<Noded>();
 const birds = new Channel<Bird>();
-emitter.publish_to(birds); // error: payload types must match
+emitter.publish_to(birds); // error: cannot connect Emitter<Noded> to Channel<Bird>
 ```
 
 The compiler reports this when it knows both types. The runtime checks it
@@ -2219,7 +2265,7 @@ around it. A typed endpoint also cannot connect to an untyped one: an
 
 ```napalm runtime-error
 const receiver = new Receiver<number>();
-receiver.subscribe_from(new Channel()); // Receiver<Number> vs untyped Channel
+receiver.subscribe_from(new Channel(), (event) => {}); // Receiver<Number> vs untyped Channel
 ```
 
 `Emitter<T>.emit(data)` checks `data` against `T`. This check is a
@@ -2232,93 +2278,20 @@ dynamic.emit("not a number");
 ```
 
 Give an endpoint its type argument when you create it
-(`new Channel<Bird>()`) or when you first bind it (`const c: Channel<Bird> = new Channel()`).
-You cannot change an endpoint's payload type after it has been connected or
-has received events.
-
-#### Receiving events
-
-A receiver keeps its own FIFO queue of events. You can read the queue directly
-or register callbacks.
-
-**Reading the queue:**
-
-```napalm
-const channel = new Channel<number>();
-const emitter = new Emitter<number>();
-const receiver = new Receiver<number>();
-emitter.publish_to(channel);
-receiver.subscribe_from(channel);
-
-const pending = receiver.receive(); // waits: the queue is empty
-emitter.emit(10);
-emitter.emit(20);
-
-System.print((await pending).data);            // 10
-System.print((await receiver.receive()).data); // 20
-System.print(receiver.tryReceive());           // null: nothing queued
-
-receiver.close();
-System.print(await receiver.receive());        // null: closed
-```
-
-- `receive()` returns a `Promise<Event<T> | null>`. It resolves right away
-  with the oldest queued event, or waits for the next one.
-- `tryReceive()` returns the oldest queued event, or `null` if the queue is
-  empty. It never waits.
-
-**Callbacks:**
-
-```napalm
-const channel = new Channel<number>();
-const emitter = new Emitter<number>();
-const receiver = new Receiver<number>();
-emitter.publish_to(channel);
-receiver.subscribe_from(channel);
-
-const token = receiver.on((event) => {
-    System.print(`got ${event.data}`);
-});
-
-receiver.once((event) => {
-    System.print(`first only: ${event.data}`);
-});
-
-emitter.emit(1); // got 1, first only: 1
-emitter.emit(2); // got 2
-
-receiver.off(token);
-```
-
-- `on(callback)` registers a persistent listener and returns a token.
-- `once(callback)` registers a listener that is removed by the first event it
-  sees.
-- `off(token)` or `off(callback)` removes listeners.
-
-Callbacks run on the VM's **microtask queue**, not inside `emit()`. This
-prevents a listener from re-entering the code that is emitting. A callback can
-take zero parameters or one (the `Event`). The set of listeners is fixed when
-the event is emitted: `off()` after `emit()` does not cancel a delivery that is
-already queued. A `concurrent function` cannot be a listener directly; use an
-ordinary or async listener that calls `launch`.
-
-While a receiver has at least one listener, its events go to the listeners
-and are **not** added to its queue. A `receive()` call that is already waiting
-still gets the event as well. When the last listener is removed, new events
-are queued again.
+(`new Channel<Bird>()`) or when you first bind it
+(`const c: Channel<Bird> = new Channel()`). You cannot change an endpoint's
+payload type after it has been connected.
 
 #### Closing
 
 `close()` exists on emitters, channels, and receivers. It returns `true` the
-first time and `false` if the endpoint was already closed.
+first time and `false` if the endpoint was already closed. A closed endpoint
+cannot be connected again.
 
 - **Emitter:** unpublishes from all channels. Later `emit()` calls are errors.
 - **Channel:** disconnects all of its emitters and receivers.
-- **Receiver:** unsubscribes from all channels and removes all listeners.
-  `receive()` calls that are waiting resolve with `null`. Events already in the
-  queue can still be read; after that, `receive()` resolves with `null`.
-
-A closed endpoint cannot be connected again.
+- **Receiver:** unsubscribes from all channels. Handler calls that were queued
+  but have not run yet are dropped.
 
 #### Reference
 
@@ -2329,27 +2302,17 @@ A closed endpoint cannot be connected again.
 | `event.data` | The payload passed to `emit()`. |
 | `emitter.publish_to(channel)` | Connect to a channel. Returns the emitter. |
 | `emitter.unpublish_from(channel)` | Disconnect. Returns whether a connection existed. |
-| `emitter.emit(data)` | Create an `Event<T>` holding `data`, deliver it, and return it. `data` is optional (`null`). |
+| `emitter.emit(data)` | Create an `Event<T>` holding `data`, queue it for every reachable handler, and return it. `data` is optional (`null`). |
 | `emitter.channelCount` | Number of channels the emitter publishes to. |
 | `channel.emitterCount` | Number of emitters publishing to the channel. |
 | `channel.receiverCount` | Number of receivers subscribed to the channel. |
-| `receiver.subscribe_from(channel)` | Connect to a channel. Returns the receiver. |
-| `receiver.unsubscribe_from(channel)` | Disconnect. Returns whether a connection existed. |
-| `receiver.receive()` | `Promise<Event<T> \| null>`: the oldest queued event, or the next one. |
-| `receiver.tryReceive()` | The oldest queued event, or `null`. |
-| `receiver.on(callback)` | Add a persistent listener. Returns a token. |
-| `receiver.once(callback)` | Add a listener for one event. Returns a token. |
-| `receiver.off(tokenOrCallback)` | Remove listeners. Returns whether any were removed. |
-| `receiver.listenerCount` | Number of registered listeners. |
-| `receiver.length` | Number of queued events. |
+| `receiver.subscribe_from(channel, handler)` | Subscribe with `handler` for that channel, or replace its handler. Returns the receiver. |
+| `receiver.unsubscribe_from(channel)` | Disconnect. Returns whether a subscription existed. |
 | `receiver.channelCount` | Number of channels the receiver subscribes from. |
 | `x.close()`, `x.closed` | Close an emitter, channel, or receiver; check whether it is closed. |
 
-The connecting methods also accept camelCase spellings (`publishTo`,
-`unpublishFrom`, `subscribeFrom`, `unsubscribeFrom`), and `tryReceive` also
-accepts `try_receive`.
-
-The receiver queue has no size limit.
+The connecting methods also accept camelCase spellings: `publishTo`,
+`unpublishFrom`, `subscribeFrom`, and `unsubscribeFrom`.
 
 These endpoints are **VM-local**. Fibers and tasks in one Interpreter can use
 them, but they cannot cross the `launch concurrent` worker boundary (§21.3).
@@ -2862,9 +2825,9 @@ imply a fivefold speedup.
 ### 21.4 Channels Inside One Interpreter
 
 `Channel<T>` is the pipe between emitters and receivers described in §15.3,
-not a bounded queue. Use it to pass events between cooperative tasks and
-Fibers in one Interpreter: one task emits, another awaits
-`receiver.receive()`.
+not a queue: events are not stored, they are handed to the subscribed
+handlers. Use it to pass events between cooperative tasks and Fibers in one
+Interpreter: one task emits, and the handlers run as microtasks.
 
 Emitters, channels, receivers, and events are **VM-local** and cannot cross
 `launch concurrent`. The worker boundary copies supported values into an

@@ -1392,16 +1392,13 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         (BuiltinClass::Emitter, "unpublishFrom", 1, PubSubNative::UnpublishFrom),
         (BuiltinClass::Emitter, "emit", 0, PubSubNative::Emit),
         (BuiltinClass::Emitter, "emit", 1, PubSubNative::Emit),
+        // Arity 1 is registered only to report the missing handler clearly.
         (BuiltinClass::Receiver, "subscribe_from", 1, PubSubNative::SubscribeFrom),
         (BuiltinClass::Receiver, "subscribeFrom", 1, PubSubNative::SubscribeFrom),
+        (BuiltinClass::Receiver, "subscribe_from", 2, PubSubNative::SubscribeFrom),
+        (BuiltinClass::Receiver, "subscribeFrom", 2, PubSubNative::SubscribeFrom),
         (BuiltinClass::Receiver, "unsubscribe_from", 1, PubSubNative::UnsubscribeFrom),
         (BuiltinClass::Receiver, "unsubscribeFrom", 1, PubSubNative::UnsubscribeFrom),
-        (BuiltinClass::Receiver, "receive", 0, PubSubNative::Receive),
-        (BuiltinClass::Receiver, "tryReceive", 0, PubSubNative::TryReceive),
-        (BuiltinClass::Receiver, "try_receive", 0, PubSubNative::TryReceive),
-        (BuiltinClass::Receiver, "on", 1, PubSubNative::On),
-        (BuiltinClass::Receiver, "once", 1, PubSubNative::Once),
-        (BuiltinClass::Receiver, "off", 1, PubSubNative::Off),
     ] {
         manifest.register_native(program, instance(class), name, MethodKind::Method, arity, NativeBuiltin::PubSub(native));
     }
@@ -1414,8 +1411,6 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         (BuiltinClass::Channel, "emitterCount", PubSubNative::EmitterCount),
         (BuiltinClass::Channel, "receiverCount", PubSubNative::ReceiverCount),
         (BuiltinClass::Receiver, "channelCount", PubSubNative::ChannelCount),
-        (BuiltinClass::Receiver, "listenerCount", PubSubNative::ListenerCount),
-        (BuiltinClass::Receiver, "length", PubSubNative::Length),
     ] {
         manifest.register_native(program, instance(class), name, MethodKind::Getter, 0, NativeBuiltin::PubSub(native));
     }

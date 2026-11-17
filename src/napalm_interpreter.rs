@@ -2994,12 +2994,6 @@ impl fmt::Debug for PromiseCell {
 }
 
 
-#[derive(Clone, Copy, Debug)]
-struct NativeEventListener {
-    token: u64,
-    callback: Value,
-    once: bool,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResponseDecodedKind {

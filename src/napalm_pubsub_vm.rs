@@ -1,23 +1,33 @@
 //! VM-local many-to-many event routing. Connections are GC edges, not Arc
-//! cycles. Each receiver owns its queue, waiters and callback registrations.
+//! cycles. A receiver owns one handler per subscribed channel; events are not
+//! buffered, they are handed to that handler as a microtask.
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PubSubNative {
     EventNew, EventData, EmitterNew, ChannelNew, ReceiverNew,
     PublishTo, UnpublishFrom, SubscribeFrom, UnsubscribeFrom, Emit,
-    Receive, TryReceive, On, Once, Off, ListenerCount, Length,
     ChannelCount, EmitterCount, ReceiverCount, Close, Closed,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NativeSubscription {
+    channel: Value,
+    handler: Value,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct NativeReceiverState {
-    channels: Vec<Value>,
-    queue: VecDeque<Value>,
-    waiters: VecDeque<Value>,
-    listeners: Vec<NativeEventListener>,
-    next_token: u64,
+    subscriptions: Vec<NativeSubscription>,
+    /// Handler microtasks queued but not yet run. A receiver with in-flight
+    /// deliveries cannot be retyped.
     deliveries: usize,
+}
+
+impl NativeReceiverState {
+    fn handler_for(&self, channel: Value) -> Option<Value> {
+        self.subscriptions.iter().find(|subscription| subscription.channel == channel).map(|subscription| subscription.handler)
+    }
 }
 
 #[derive(Debug)]
@@ -44,9 +54,10 @@ impl NativeEndpointState {
                 emitters.iter().chain(receivers).copied().for_each(visit);
             }
             NativeEndpointData::Receiver(receiver) => {
-                receiver.channels.iter().chain(&receiver.queue).chain(&receiver.waiters)
-                    .copied().for_each(&mut visit);
-                receiver.listeners.iter().for_each(|listener| visit(listener.callback));
+                for subscription in &receiver.subscriptions {
+                    visit(subscription.channel);
+                    visit(subscription.handler);
+                }
             }
         }
     }
@@ -58,21 +69,18 @@ impl NativeEndpointState {
             NativeEndpointData::Channel { emitters, receivers } =>
                 (emitters.capacity() + receivers.capacity()) * std::mem::size_of::<Value>(),
             NativeEndpointData::Receiver(receiver) => std::mem::size_of::<NativeReceiverState>()
-                + (receiver.channels.capacity() + receiver.queue.capacity() + receiver.waiters.capacity())
-                    * std::mem::size_of::<Value>()
-                + receiver.listeners.capacity() * std::mem::size_of::<NativeEventListener>(),
+                + receiver.subscriptions.capacity() * std::mem::size_of::<NativeSubscription>(),
         }
     }
 
     // Retyping a live network would silently invalidate its other endpoints or
-    // promises. Install an endpoint's generic contract before connecting/using it.
+    // queued handler calls. Install an endpoint's generic contract before using it.
     pub(super) fn can_set_payload_type(&self) -> bool {
         match &self.data {
             NativeEndpointData::Event(_) => true,
             NativeEndpointData::Emitter(channels) => channels.is_empty(),
             NativeEndpointData::Channel { emitters, receivers } => emitters.is_empty() && receivers.is_empty(),
-            NativeEndpointData::Receiver(receiver) => receiver.channels.is_empty()
-                && receiver.queue.is_empty() && receiver.waiters.is_empty() && receiver.deliveries == 0,
+            NativeEndpointData::Receiver(receiver) => receiver.subscriptions.is_empty() && receiver.deliveries == 0,
         }
     }
 }
@@ -118,7 +126,17 @@ impl Interpreter<'_> {
         })
     }
 
-    fn endpoint_connect(&mut self, owner: Value, channel: Value, publishing: bool) -> Result<Value, RuntimeError> {
+    /// Connect an Emitter (`handler == None`) or a Receiver (`Some(handler)`)
+    /// to a Channel. Re-subscribing an already connected receiver replaces its
+    /// handler for that channel.
+    fn endpoint_connect(&mut self, owner: Value, channel: Value, handler: Option<Value>) -> Result<Value, RuntimeError> {
+        let publishing = handler.is_none();
+        if let Some(handler) = handler {
+            if handler == Value::NULL {
+                return Err(RuntimeError::new("Receiver.subscribe_from(channel, handler) requires a handler function"));
+            }
+            self.receiver_handler_function(handler)?;
+        }
         let owner_cell = self.endpoint(owner)?;
         let channel_cell = self.endpoint(channel)?;
         let owner_state = unsafe { owner_cell.get() };
@@ -126,9 +144,9 @@ impl Interpreter<'_> {
         if !matches!(channel_state.data, NativeEndpointData::Channel { .. }) {
             return Err(RuntimeError::new("connection target must be a Channel"));
         }
-        let channels = match (&owner_state.data, publishing) {
-            (NativeEndpointData::Emitter(channels), true) => channels,
-            (NativeEndpointData::Receiver(receiver), false) => &receiver.channels,
+        let already = match (&owner_state.data, publishing) {
+            (NativeEndpointData::Emitter(channels), true) => channels.contains(&channel),
+            (NativeEndpointData::Receiver(receiver), false) => receiver.handler_for(channel).is_some(),
             _ => return Err(RuntimeError::new("invalid connection endpoint")),
         };
         if owner_state.closed || channel_state.closed {
@@ -145,16 +163,26 @@ impl Interpreter<'_> {
                 describe("Channel", &channel_state.payload_type),
             )));
         }
-        if channels.contains(&channel) { return Ok(owner); }
-        match &mut unsafe { owner_cell.get_mut() }.data {
-            NativeEndpointData::Emitter(channels) => channels.push(channel),
-            NativeEndpointData::Receiver(receiver) => receiver.channels.push(channel),
+        match (&mut unsafe { owner_cell.get_mut() }.data, handler) {
+            (NativeEndpointData::Emitter(channels), None) => {
+                if already { return Ok(owner); }
+                channels.push(channel);
+            }
+            (NativeEndpointData::Receiver(receiver), Some(handler)) => {
+                if let Some(subscription) = receiver.subscriptions.iter_mut().find(|s| s.channel == channel) {
+                    subscription.handler = handler;
+                } else {
+                    receiver.subscriptions.push(NativeSubscription { channel, handler });
+                }
+            }
             _ => unreachable!(),
         }
-        let NativeEndpointData::Channel { emitters, receivers } = &mut unsafe { channel_cell.get_mut() }.data else { unreachable!() };
-        if publishing { emitters.push(owner); } else { receivers.push(owner); }
+        if !already {
+            let NativeEndpointData::Channel { emitters, receivers } = &mut unsafe { channel_cell.get_mut() }.data else { unreachable!() };
+            if publishing { emitters.push(owner); } else { receivers.push(owner); }
+            self.endpoint_changed(channel);
+        }
         self.endpoint_changed(owner);
-        self.endpoint_changed(channel);
         Ok(owner)
     }
 
@@ -164,14 +192,19 @@ impl Interpreter<'_> {
         if !matches!(unsafe { channel_cell.get() }.data, NativeEndpointData::Channel { .. }) {
             return Err(RuntimeError::new("connection target must be a Channel"));
         }
-        let channels = match (&mut unsafe { owner_cell.get_mut() }.data, publishing) {
-            (NativeEndpointData::Emitter(channels), true) => channels,
-            (NativeEndpointData::Receiver(receiver), false) => &mut receiver.channels,
+        let removed = match (&mut unsafe { owner_cell.get_mut() }.data, publishing) {
+            (NativeEndpointData::Emitter(channels), true) => {
+                let before = channels.len();
+                channels.retain(|value| *value != channel);
+                channels.len() != before
+            }
+            (NativeEndpointData::Receiver(receiver), false) => {
+                let before = receiver.subscriptions.len();
+                receiver.subscriptions.retain(|subscription| subscription.channel != channel);
+                receiver.subscriptions.len() != before
+            }
             _ => return Err(RuntimeError::new("invalid connection endpoint")),
         };
-        let before = channels.len();
-        channels.retain(|value| *value != channel);
-        let removed = channels.len() != before;
         let NativeEndpointData::Channel { emitters, receivers } = &mut unsafe { channel_cell.get_mut() }.data else { unreachable!() };
         if publishing { emitters.retain(|value| *value != owner); }
         else { receivers.retain(|value| *value != owner); }
@@ -188,132 +221,59 @@ impl Interpreter<'_> {
         let payload_type = state.payload_type.clone();
         let channels = channels.clone();
         if let Some(expected) = &payload_type { self.heap.bind_contract(data, expected)?; }
-        // Snapshot every route first. One emit is one Event: a receiver reachable
-        // through several channels still observes it exactly once, in first-route order.
-        let mut destinations = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        // Snapshot every (receiver, handler) route before queueing anything. The
+        // handler is per subscription, so a receiver reached through two channels
+        // runs the handler of each channel.
+        let mut routes = Vec::new();
         for channel in channels {
             let cell = self.endpoint(channel)?;
             let state = unsafe { cell.get() };
             if state.closed { continue; }
             let NativeEndpointData::Channel { receivers, .. } = &state.data else { unreachable!() };
-            destinations.extend(receivers.iter().copied().filter(|receiver| seen.insert(receiver.word().0)));
-        }
-        let event = self.allocate_event(data, payload_type);
-        let root = self.add_root(event);
-        let roots: Vec<_> = destinations.iter().map(|&value| self.add_root(value)).collect();
-        let delivered = (|| {
-            for receiver in destinations { self.pubsub_deliver(receiver, event)?; }
-            Ok(event)
-        })();
-        for root in roots { self.release_root(root); }
-        self.release_root(root);
-        delivered
-    }
-
-    fn pubsub_deliver(&mut self, receiver: Value, event: Value) -> Result<(), RuntimeError> {
-        let cell = self.endpoint(receiver)?;
-        if unsafe { cell.get() }.closed { return Ok(()); }
-        let NativeEndpointData::Receiver(state) = &mut unsafe { cell.get_mut() }.data else { unreachable!() };
-        // Cancelled receives must not consume an event that a later waiter needs.
-        let mut waiter = None;
-        while let Some(promise) = state.waiters.pop_front() {
-            if self.promise_cell(promise).is_ok_and(|cell|
-                matches!(unsafe { cell.get() }, PromiseState::Pending { .. })) {
-                waiter = Some(promise);
-                break;
+            for &receiver in receivers {
+                let receiver_cell = self.endpoint(receiver)?;
+                let receiver_state = unsafe { receiver_cell.get() };
+                if receiver_state.closed { continue; }
+                let NativeEndpointData::Receiver(subscriptions) = &receiver_state.data else { unreachable!() };
+                if let Some(handler) = subscriptions.handler_for(channel) {
+                    routes.push((receiver, handler));
+                }
             }
         }
-        let callbacks: Vec<_> = state.listeners.iter().map(|listener| listener.callback).collect();
-        state.listeners.retain(|listener| !listener.once);
-        state.deliveries += callbacks.len();
-        // Callback mode doesn't accumulate an unread queue. A pending receive
-        // still gets its event, independently of registered callback observers.
-        if waiter.is_none() && callbacks.is_empty() { state.queue.push_back(event); }
-        self.endpoint_changed(receiver);
-        for callback in callbacks {
-            self.event_loop.enqueue_microtask(RuntimeEvent::ReceiverDelivery { receiver, callback, event });
+        let event = self.allocate_event(data, payload_type);
+        for (receiver, handler) in routes {
+            let cell = self.endpoint(receiver)?;
+            if let NativeEndpointData::Receiver(state) = &mut unsafe { cell.get_mut() }.data {
+                state.deliveries += 1;
+            }
+            // Queued RuntimeEvents are VM roots: receiver, handler and event stay
+            // alive until the handler runs, even if the network is dropped.
+            self.event_loop.enqueue_microtask(RuntimeEvent::ReceiverDelivery { receiver, callback: handler, event });
         }
-        if let Some(promise) = waiter {
-            let root = self.add_root(promise);
-            let result = self.settle_promise_outcome(promise, PromiseOutcome::Fulfilled(event));
-            self.release_root(root);
-            result?;
-        }
-        Ok(())
+        Ok(event)
     }
 
-    fn pubsub_receive(&mut self, receiver: Value, wait: bool) -> Result<Value, RuntimeError> {
-        let cell = self.endpoint(receiver)?;
-        let state = unsafe { cell.get_mut() };
-        let NativeEndpointData::Receiver(receiver_state) = &mut state.data else {
-            return Err(RuntimeError::new("receive receiver must be a Receiver"));
-        };
-        let immediate = receiver_state.queue.pop_front().or_else(|| state.closed.then_some(Value::NULL));
-        if !wait { return Ok(immediate.unwrap_or(Value::NULL)); }
-        if let Some(value) = immediate {
-            let root = self.add_root(value);
-            let promise = self.allocate_promise(PromiseState::Fulfilled(value));
-            self.release_root(root);
-            return Ok(promise);
-        }
-        let promise = self.allocate_pending_promise();
-        receiver_state.waiters.push_back(promise);
-        self.endpoint_changed(receiver);
-        Ok(promise)
-    }
-
-    fn receiver_callback_function(&self, callback: Value) -> Result<(u32, u8), RuntimeError> {
-        let function = match self.heap.get(callback) {
+    fn receiver_handler_function(&self, handler: Value) -> Result<(u32, u8), RuntimeError> {
+        let function = match self.heap.get(handler) {
             Some(HeapObject::Closure { function_index, .. }) => *function_index,
-            _ => return Err(RuntimeError::new("Receiver listener must be a function")),
+            _ => return Err(RuntimeError::new("Receiver handler must be a function")),
         };
         let prepared = &self.prepared.functions[function as usize];
         if prepared.is_concurrent || prepared.arity > 1 {
-            return Err(RuntimeError::new("Receiver listener must be a normal/async function taking zero or one Event argument"));
+            return Err(RuntimeError::new("Receiver handler must be a normal/async function taking zero or one Event argument"));
         }
         Ok((function, prepared.arity))
     }
 
-    fn pubsub_listen(&mut self, receiver: Value, callback: Value, once: bool) -> Result<Value, RuntimeError> {
-        self.receiver_callback_function(callback)?;
-        let cell = self.endpoint(receiver)?;
-        let state = unsafe { cell.get_mut() };
-        if state.closed { return Err(RuntimeError::new("Receiver is closed")); }
-        let NativeEndpointData::Receiver(state) = &mut state.data else {
-            return Err(RuntimeError::new("listener receiver must be a Receiver"));
-        };
-        let token = state.next_token + 1;
-        if token > 9_007_199_254_740_991 { return Err(RuntimeError::new("Receiver listener tokens exhausted")); }
-        state.next_token = token;
-        state.listeners.push(NativeEventListener { token, callback, once });
-        self.endpoint_changed(receiver);
-        Ok(Value::from_num(token as f64))
-    }
-
-    fn pubsub_off(&mut self, receiver: Value, key: Value) -> Result<Value, RuntimeError> {
-        let token = if let Some(number) = key.as_num() {
-            if !number.is_finite() || number < 1.0 || number.fract() != 0.0 || number > 9_007_199_254_740_991.0 {
-                return Err(RuntimeError::new("Receiver.off expects a listener token or function"));
-            }
-            Some(number as u64)
-        } else if matches!(self.heap.get(key), Some(HeapObject::Closure { .. })) { None }
-        else { return Err(RuntimeError::new("Receiver.off expects a listener token or function")); };
-        let cell = self.endpoint(receiver)?;
-        let NativeEndpointData::Receiver(state) = &mut unsafe { cell.get_mut() }.data else {
-            return Err(RuntimeError::new("off receiver must be a Receiver"));
-        };
-        let before = state.listeners.len();
-        state.listeners.retain(|listener| token.map_or(listener.callback != key, |token| listener.token != token));
-        Ok(Value::from_bool(state.listeners.len() != before))
-    }
-
     pub(super) fn deliver_receiver_callback(&mut self, receiver: Value, callback: Value, event: Value) -> Result<Value, RuntimeError> {
         let cell = self.endpoint(receiver)?;
-        if let NativeEndpointData::Receiver(state) = &mut unsafe { cell.get_mut() }.data {
-            state.deliveries = state.deliveries.saturating_sub(1);
+        let state = unsafe { cell.get_mut() };
+        if let NativeEndpointData::Receiver(receiver_state) = &mut state.data {
+            receiver_state.deliveries = receiver_state.deliveries.saturating_sub(1);
         }
-        let (function, arity) = self.receiver_callback_function(callback)?;
+        // Closing a receiver drops deliveries that were queued but not yet run.
+        if state.closed { return Ok(Value::NULL); }
+        let (function, arity) = self.receiver_handler_function(callback)?;
         let word = event.word();
         let args = if arity == 0 { &[][..] } else { std::slice::from_ref(&word) };
         self.spawn_async_task(function, None, args, Some(callback), None)
@@ -323,32 +283,17 @@ impl Interpreter<'_> {
         let cell = self.endpoint(endpoint)?;
         let state = unsafe { cell.get_mut() };
         if state.closed { return Ok(Value::FALSE); }
-        state.closed = true;
-        let mut waiters = Vec::new();
-        let mut links = Vec::new();
-        match &mut state.data {
-            NativeEndpointData::Emitter(channels) => {
-                links.extend(channels.iter().map(|&channel| (endpoint, channel, true)));
-            }
-            NativeEndpointData::Channel { emitters, receivers } => {
-                links.extend(emitters.iter().map(|&owner| (owner, endpoint, true)));
-                links.extend(receivers.iter().map(|&owner| (owner, endpoint, false)));
-            }
-            NativeEndpointData::Receiver(state) => {
-                links.extend(state.channels.iter().map(|&channel| (endpoint, channel, false)));
-                state.listeners.clear();
-                waiters.extend(state.waiters.drain(..));
-            }
+        let links: Vec<(Value, Value, bool)> = match &state.data {
+            NativeEndpointData::Emitter(channels) => channels.iter().map(|&channel| (endpoint, channel, true)).collect(),
+            NativeEndpointData::Channel { emitters, receivers } => emitters.iter().map(|&owner| (owner, endpoint, true))
+                .chain(receivers.iter().map(|&owner| (owner, endpoint, false))).collect(),
+            NativeEndpointData::Receiver(receiver) => receiver.subscriptions.iter()
+                .map(|subscription| (endpoint, subscription.channel, false)).collect(),
             NativeEndpointData::Event(_) => return Err(RuntimeError::new("Events cannot be closed")),
-        }
+        };
+        state.closed = true;
         for (owner, channel, publishing) in links { self.endpoint_disconnect(owner, channel, publishing)?; }
-        let roots: Vec<_> = waiters.iter().map(|&promise| self.add_root(promise)).collect();
-        let result = (|| {
-            for promise in waiters { self.settle_promise_outcome(promise, PromiseOutcome::Fulfilled(Value::NULL))?; }
-            Ok(Value::TRUE)
-        })();
-        for root in roots { self.release_root(root); }
-        result
+        Ok(Value::TRUE)
     }
 
     fn pubsub_operation(&mut self, native: PubSubNative, receiver: Value, args: &[RegisterWord]) -> Result<Value, RuntimeError> {
@@ -370,12 +315,10 @@ impl Interpreter<'_> {
                 };
                 return Ok(self.heap.alloc(object));
             }
-            PublishTo | SubscribeFrom => return self.endpoint_connect(receiver, arg(0), native == PublishTo),
+            PublishTo => return self.endpoint_connect(receiver, arg(0), None),
+            SubscribeFrom => return self.endpoint_connect(receiver, arg(0), Some(arg(1))),
             UnpublishFrom | UnsubscribeFrom => return self.endpoint_disconnect(receiver, arg(0), native == UnpublishFrom).map(Value::from_bool),
             Emit => return self.pubsub_emit(receiver, arg(0)),
-            Receive | TryReceive => return self.pubsub_receive(receiver, native == Receive),
-            On | Once => return self.pubsub_listen(receiver, arg(0), native == Once),
-            Off => return self.pubsub_off(receiver, arg(0)),
             Close => return self.pubsub_close(receiver),
             _ => {}
         }
@@ -385,11 +328,9 @@ impl Interpreter<'_> {
         let count = match (native, &state.data) {
             (EventData, NativeEndpointData::Event(value)) => return Ok(*value),
             (ChannelCount, NativeEndpointData::Emitter(channels)) => channels.len(),
-            (ChannelCount, NativeEndpointData::Receiver(state)) => state.channels.len(),
+            (ChannelCount, NativeEndpointData::Receiver(state)) => state.subscriptions.len(),
             (EmitterCount, NativeEndpointData::Channel { emitters, .. }) => emitters.len(),
             (ReceiverCount, NativeEndpointData::Channel { receivers, .. }) => receivers.len(),
-            (ListenerCount, NativeEndpointData::Receiver(state)) => state.listeners.len(),
-            (Length, NativeEndpointData::Receiver(state)) => state.queue.len(),
             _ => return Err(RuntimeError::new("invalid pub/sub operation")),
         };
         Ok(Value::from_num(count as f64))

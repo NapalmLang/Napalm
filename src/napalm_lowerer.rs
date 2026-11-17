@@ -5946,11 +5946,9 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         match (*builtin, name, arity) {
             (BuiltinId::Emitter, "emit", 1) => Type::Builtin(BuiltinId::Event, element.clone()),
             (BuiltinId::Emitter, "publish_to" | "publishTo", 1)
-            | (BuiltinId::Receiver, "subscribe_from" | "subscribeFrom", 1) => receiver_type.clone(),
+            | (BuiltinId::Receiver, "subscribe_from" | "subscribeFrom", 2) => receiver_type.clone(),
             (BuiltinId::Emitter, "unpublish_from" | "unpublishFrom", 1)
             | (BuiltinId::Receiver, "unsubscribe_from" | "unsubscribeFrom", 1) => Type::Bool,
-            (BuiltinId::Receiver, "on" | "once", 1) => Type::Num,
-            (BuiltinId::Receiver, "off", 1) => Type::Bool,
             _ => Type::Top,
         }
     }
@@ -6900,7 +6898,6 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let typed_payload = element.as_deref();
 
         let event_type = Type::Builtin(BuiltinId::Event, element.clone());
-        let nullable_event = Type::Union(vec![event_type.clone(), Type::Null]);
         let result_type = match (*builtin, kind, name, arity) {
             (BuiltinId::Event, MethodKind::Getter, "data", 0) => match element {
                 Some(element) => (**element).clone(),
@@ -6908,7 +6905,15 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             },
 
             (BuiltinId::Emitter, MethodKind::Method, "publish_to" | "publishTo", 1)
-            | (BuiltinId::Receiver, MethodKind::Method, "subscribe_from" | "subscribeFrom", 1) => {
+            | (BuiltinId::Receiver, MethodKind::Method, "subscribe_from" | "subscribeFrom", 2) => {
+                receiver_type.clone()
+            }
+            (BuiltinId::Receiver, MethodKind::Method, "subscribe_from" | "subscribeFrom", 1) => {
+                self.diagnostics.push(Diagnostic::error(
+                    "NAPALM-T006",
+                    format!("Receiver.{name}(channel, handler) requires a handler for that channel"),
+                    span,
+                ));
                 receiver_type.clone()
             }
             (BuiltinId::Emitter, MethodKind::Method, "unpublish_from" | "unpublishFrom", 1)
@@ -6918,14 +6923,6 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             | (BuiltinId::Channel, MethodKind::Getter, "emitterCount" | "receiverCount", 0) => Type::Num,
             (BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver, MethodKind::Method, "close", 0)
             | (BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver, MethodKind::Getter, "closed", 0) => Type::Bool,
-
-            (BuiltinId::Receiver, MethodKind::Method, "receive", 0) => {
-                Type::Builtin(BuiltinId::Promise, Some(Box::new(nullable_event)))
-            }
-            (BuiltinId::Receiver, MethodKind::Method, "tryReceive" | "try_receive", 0) => nullable_event,
-            (BuiltinId::Receiver, MethodKind::Method, "on" | "once", 1) => Type::Num,
-            (BuiltinId::Receiver, MethodKind::Method, "off", 1) => Type::Bool,
-            (BuiltinId::Receiver, MethodKind::Getter, "listenerCount" | "length", 0) => Type::Num,
 
             _ => return None,
         };

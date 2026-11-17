@@ -557,13 +557,13 @@ pub enum BuiltinId {
     HttpPostJson = 30,
     SetTimeout = 31,
     Print = 32,
-    /// Read-only subscription surface paired with Emitter.
+    /// Immutable event envelope carrying an optional typed payload.
     Event = 33,
     /// One-to-many native event publisher.
     Emitter = 34,
-    /// FIFO native message sender paired with Receiver.
+    /// Many-to-many conduit between independently created publishers and receivers.
     Channel = 35,
-    /// FIFO native message receiver.
+    /// Subscriber with its own FIFO of Event values.
     Receiver = 36,
     ConcurrentMap = 37,
     ConcurrentSet = 38,

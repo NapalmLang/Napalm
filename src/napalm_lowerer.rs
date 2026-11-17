@@ -5828,10 +5828,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         // their mutating operation is reached through a pipeline.
         if invoke.args.is_empty() {
             if let Type::Builtin(builtin, Some(expected)) = &receiver_type {
-                if matches!(
-                    (*builtin, invoke.name.value.as_str()),
-                    (BuiltinId::Emitter, "emit") | (BuiltinId::Channel, "send")
-                ) {
+                if matches!((*builtin, invoke.name.value.as_str()), (BuiltinId::Emitter, "emit")) {
                     let actual = self.builder.value_type(input).clone();
                     if assignment_is_known_incompatible(expected, &actual) {
                         self.diagnostics.push(Diagnostic::error(
@@ -5942,15 +5939,18 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         name: &str,
         arity: usize,
     ) -> Type {
-        let Type::Builtin(builtin, _) = receiver_type else {
+        let Type::Builtin(builtin, element) = receiver_type else {
             return Type::Top;
         };
 
         match (*builtin, name, arity) {
-            (BuiltinId::Emitter, "emit", 1) => Type::Num,
-            (BuiltinId::Event, "on" | "once", 1) => Type::Num,
-            (BuiltinId::Event, "off", 1) => Type::Bool,
-            (BuiltinId::Channel, "send", 1) => Type::Bool,
+            (BuiltinId::Emitter, "emit", 1) => Type::Builtin(BuiltinId::Event, element.clone()),
+            (BuiltinId::Emitter, "publish_to" | "publishTo", 1)
+            | (BuiltinId::Receiver, "subscribe_from" | "subscribeFrom", 1) => receiver_type.clone(),
+            (BuiltinId::Emitter, "unpublish_from" | "unpublishFrom", 1)
+            | (BuiltinId::Receiver, "unsubscribe_from" | "unsubscribeFrom", 1) => Type::Bool,
+            (BuiltinId::Receiver, "on" | "once", 1) => Type::Num,
+            (BuiltinId::Receiver, "off", 1) => Type::Bool,
             _ => Type::Top,
         }
     }
@@ -6794,8 +6794,10 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 ("ConcurrentSet", "new") => Some(Type::Builtin(BuiltinId::ConcurrentSet, None)),
                 ("Map", "new") => Some(Type::Map),
                 ("Set", "new") => Some(Type::Set(None)),
+                ("Event", "new") => Some(Type::Builtin(BuiltinId::Event, None)),
                 ("Emitter", "new") => Some(Type::Builtin(BuiltinId::Emitter, None)),
                 ("Channel", "new") => Some(Type::Builtin(BuiltinId::Channel, None)),
+                ("Receiver", "new") => Some(Type::Builtin(BuiltinId::Receiver, None)),
                 _ => None,
             }
         });
@@ -6897,47 +6899,33 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let arity = invoke.args.len();
         let typed_payload = element.as_deref();
 
+        let event_type = Type::Builtin(BuiltinId::Event, element.clone());
+        let nullable_event = Type::Union(vec![event_type.clone(), Type::Null]);
         let result_type = match (*builtin, kind, name, arity) {
-            (BuiltinId::Emitter, MethodKind::Getter, "event", 0) => {
-                Type::Builtin(BuiltinId::Event, element.clone())
-            }
-            (BuiltinId::Emitter, MethodKind::Getter, "listenerCount", 0) => Type::Num,
-            (BuiltinId::Emitter, MethodKind::Getter, "closed", 0) => Type::Bool,
-            (BuiltinId::Emitter, MethodKind::Method, "emit", 1) => Type::Num,
-            (BuiltinId::Emitter, MethodKind::Method, "clear", 0) => Type::Num,
-            (BuiltinId::Emitter, MethodKind::Method, "close", 0) => Type::Bool,
+            (BuiltinId::Event, MethodKind::Getter, "data", 0) => match element {
+                Some(element) => (**element).clone(),
+                None => Type::Top,
+            },
 
-            (BuiltinId::Event, MethodKind::Method, "on", 1)
-            | (BuiltinId::Event, MethodKind::Method, "once", 1) => Type::Num,
-            (BuiltinId::Event, MethodKind::Method, "off", 1) => Type::Bool,
-            (BuiltinId::Event, MethodKind::Getter, "listenerCount", 0) => Type::Num,
-            (BuiltinId::Event, MethodKind::Getter, "closed", 0) => Type::Bool,
-
-            (BuiltinId::Channel, MethodKind::Getter, "receiver", 0) => {
-                Type::Builtin(BuiltinId::Receiver, element.clone())
+            (BuiltinId::Emitter, MethodKind::Method, "publish_to" | "publishTo", 1)
+            | (BuiltinId::Receiver, MethodKind::Method, "subscribe_from" | "subscribeFrom", 1) => {
+                receiver_type.clone()
             }
-            (BuiltinId::Channel, MethodKind::Method, "send", 1) => Type::Bool,
-            (BuiltinId::Channel, MethodKind::Method, "close", 0) => Type::Bool,
-            (BuiltinId::Channel, MethodKind::Getter, "closed", 0) => Type::Bool,
-            (BuiltinId::Channel, MethodKind::Getter, "length", 0)
-            | (BuiltinId::Channel, MethodKind::Getter, "capacity", 0) => Type::Num,
+            (BuiltinId::Emitter, MethodKind::Method, "unpublish_from" | "unpublishFrom", 1)
+            | (BuiltinId::Receiver, MethodKind::Method, "unsubscribe_from" | "unsubscribeFrom", 1) => Type::Bool,
+            (BuiltinId::Emitter, MethodKind::Method, "emit", 0 | 1) => event_type,
+            (BuiltinId::Emitter | BuiltinId::Receiver, MethodKind::Getter, "channelCount", 0)
+            | (BuiltinId::Channel, MethodKind::Getter, "emitterCount" | "receiverCount", 0) => Type::Num,
+            (BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver, MethodKind::Method, "close", 0)
+            | (BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver, MethodKind::Getter, "closed", 0) => Type::Bool,
 
             (BuiltinId::Receiver, MethodKind::Method, "receive", 0) => {
-                let result = match element {
-                    Some(element) => Type::Union(vec![(**element).clone(), Type::Null]),
-                    None => Type::Top,
-                };
-                Type::Builtin(BuiltinId::Promise, Some(Box::new(result)))
+                Type::Builtin(BuiltinId::Promise, Some(Box::new(nullable_event)))
             }
-            (BuiltinId::Receiver, MethodKind::Method, "tryReceive", 0) => {
-                match element {
-                    Some(element) => Type::Union(vec![(**element).clone(), Type::Null]),
-                    None => Type::Top,
-                }
-            }
-            (BuiltinId::Receiver, MethodKind::Method, "close", 0) => Type::Bool,
-            (BuiltinId::Receiver, MethodKind::Getter, "closed", 0) => Type::Bool,
-            (BuiltinId::Receiver, MethodKind::Getter, "length", 0) => Type::Num,
+            (BuiltinId::Receiver, MethodKind::Method, "tryReceive" | "try_receive", 0) => nullable_event,
+            (BuiltinId::Receiver, MethodKind::Method, "on" | "once", 1) => Type::Num,
+            (BuiltinId::Receiver, MethodKind::Method, "off", 1) => Type::Bool,
+            (BuiltinId::Receiver, MethodKind::Getter, "listenerCount" | "length", 0) => Type::Num,
 
             _ => return None,
         };
@@ -6946,12 +6934,76 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return None;
         }
 
-        let mut args = self.lower_call_args(&invoke.args, span);
-        if matches!(
-            (*builtin, kind, name),
-            (BuiltinId::Emitter, MethodKind::Method, "emit")
-                | (BuiltinId::Channel, MethodKind::Method, "send")
-        ) {
+        let args = self.lower_call_args(&invoke.args, span);
+        if let Some(message) = self.endpoint_connection_mismatch(receiver_type, name, args.first().copied()) {
+            self.diagnostics.push(Diagnostic::error("NAPALM-T006", message, invoke.args[0].span));
+        }
+        self.finish_native_endpoint_invoke(receiver, *builtin, typed_payload, invoke, kind, args, result_type)
+    }
+
+    /// Connections are only legal between endpoints with the same payload type.
+    /// Report it statically when both sides are known to be typed differently.
+    fn endpoint_connection_mismatch(&self, receiver_type: &Type, name: &str, channel: Option<ValueId>) -> Option<String> {
+        let Type::Builtin(owner @ (BuiltinId::Emitter | BuiltinId::Receiver), owner_element) = receiver_type else {
+            return None;
+        };
+        let connecting = match owner {
+            BuiltinId::Emitter => matches!(name, "publish_to" | "publishTo"),
+            _ => matches!(name, "subscribe_from" | "subscribeFrom"),
+        };
+        if !connecting { return None; }
+        let channel_type = semantic_source_type(self.builder.value_type(channel?));
+        // Interfaces and class instances display structurally; recover the
+        // declared name so the message reads `Emitter<Noded>`, not `Emitter<interface>`.
+        let payload_name = |ty: &Type| -> String {
+            let declared = match ty {
+                Type::Instance(classes) => match classes.as_slice() {
+                    [class] => self.context.top_level_classes
+                        .iter().find(|(_, id)| *id == class).map(|(name, _)| name.to_string()),
+                    _ => None,
+                },
+                Type::Interface(_) | Type::Record(_) => self.context.interface_types
+                    .iter().find(|(_, contract)| *contract == ty).map(|(name, _)| name.to_string()),
+                _ => None,
+            };
+            declared.unwrap_or_else(|| display_source_type(ty))
+        };
+        let display = |builtin: BuiltinId, element: &Option<Box<Type>>| match element {
+            Some(element) => format!("{}<{}>", builtin.name(), payload_name(element)),
+            None => builtin.name().to_string(),
+        };
+        match &channel_type {
+            Type::Builtin(BuiltinId::Channel, channel_element) => {
+                // An untyped static type may still hold a typed endpoint at runtime,
+                // so only two known, different payload types are a static error.
+                match (owner_element, channel_element) {
+                    (Some(a), Some(b)) if a != b => Some(format!(
+                        "cannot connect {} to {}: payload types must match",
+                        display(*owner, owner_element), display(BuiltinId::Channel, channel_element),
+                    )),
+                    _ => None,
+                }
+            }
+            Type::Builtin(other, element) => Some(format!(
+                "{}.{name} expects a Channel, got {}", owner.name(), display(*other, element),
+            )),
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_native_endpoint_invoke(
+        &mut self,
+        receiver: ValueId,
+        builtin: BuiltinId,
+        typed_payload: Option<&Type>,
+        invoke: &front::InvokeExpr,
+        kind: MethodKind,
+        mut args: Vec<ValueId>,
+        result_type: Type,
+    ) -> Option<ValueId> {
+        let name = invoke.name.value.as_str();
+        if matches!((builtin, kind, name), (BuiltinId::Emitter, MethodKind::Method, "emit")) {
             if let (Some(expected), Some(value)) = (typed_payload, args.first().copied()) {
                 let actual = self.builder.value_type(value).clone();
                 if assignment_is_known_incompatible(expected, &actual) {

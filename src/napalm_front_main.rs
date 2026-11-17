@@ -3663,14 +3663,16 @@ impl<'a> Parser<'a> {
                     let type_start = self.peek().span.start;
                     self.type_arguments()?;
                     let type_end = self.tokens[self.pos - 1].span.end;
-                    if matches!(collection_name.as_str(), "Map" | "Set" | "ConcurrentMap" | "ConcurrentSet" | "Emitter" | "Channel") {
+                    if matches!(collection_name.as_str(), "Map" | "Set" | "ConcurrentMap" | "ConcurrentSet" | "Event" | "Emitter" | "Channel" | "Receiver") {
                         let spelling = format!("{}{}", collection_name, &self.source[type_start..type_end]);
                         let annotation = classify_variable_type(&spelling, self.end(start));
                         if matches!(annotation.kind, TypeAnnotationKind::Never) {
                             return self.error(match collection_name.as_str() {
                                 "Map" => "Map expects two type arguments",
                                 "Set" => "Set expects one type argument",
-                                "Emitter" => "Emitter expects one event type argument",
+                                "Event" => "Event expects one payload type argument",
+                                "Receiver" => "Receiver expects one payload type argument",
+                                "Emitter" => "Emitter expects one payload type argument",
                                 "Channel" => "Channel expects one message type argument",
                                 _ => "invalid generic constructor",
                             });

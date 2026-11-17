@@ -17,7 +17,7 @@ use chrono::{
     NaiveDateTime, Offset, TimeZone, Timelike, Utc,
 };
 use crate::napalm_interpreter::{DatabaseMode, MxNative};
-use crate::napalm_interpreter::RegexNative;
+use crate::napalm_interpreter::{RegexNative, PubSubNative};
 
 #[derive(Clone, Copy, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1374,41 +1374,51 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, instance(BuiltinClass::Promise), "isRejected", MethodKind::Getter, 0, NativeBuiltin::PromiseIsRejected);
     manifest.register_native(program, instance(BuiltinClass::Promise), "isCancelled", MethodKind::Getter, 0, NativeBuiltin::PromiseIsCancelled);
 
-    // Event/Emitter provide one-to-many notifications. Emitter owns the publish
-    // capability; `event` returns a read-only Event view sharing the same native
-    // listener state. Delivery is queued as runtime microtasks to avoid arbitrary
-    // reentrant VM calls from emit().
-    manifest.register_native(program, static_(BuiltinId::Emitter), "new", MethodKind::Method, 0, NativeBuiltin::EmitterNew);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "event", MethodKind::Getter, 0, NativeBuiltin::EmitterEvent);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "emit", MethodKind::Method, 1, NativeBuiltin::EmitterEmit);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "listenerCount", MethodKind::Getter, 0, NativeBuiltin::EmitterListenerCount);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "clear", MethodKind::Method, 0, NativeBuiltin::EmitterClear);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "close", MethodKind::Method, 0, NativeBuiltin::EmitterClose);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "closed", MethodKind::Getter, 0, NativeBuiltin::EmitterClosed);
-
-    manifest.register_native(program, instance(BuiltinClass::Event), "on", MethodKind::Method, 1, NativeBuiltin::EventOn);
-    manifest.register_native(program, instance(BuiltinClass::Event), "once", MethodKind::Method, 1, NativeBuiltin::EventOnce);
-    manifest.register_native(program, instance(BuiltinClass::Event), "off", MethodKind::Method, 1, NativeBuiltin::EventOff);
-    manifest.register_native(program, instance(BuiltinClass::Event), "listenerCount", MethodKind::Getter, 0, NativeBuiltin::EventListenerCount);
-    manifest.register_native(program, instance(BuiltinClass::Event), "closed", MethodKind::Getter, 0, NativeBuiltin::EventClosed);
-
-    // Channel/Receiver are split FIFO capabilities. Channel.send() never blocks;
-    // a bounded full queue returns false. Receiver.receive() returns a Promise and
-    // is fulfilled immediately when data is already buffered.
-    manifest.register_native(program, static_(BuiltinId::Channel), "new", MethodKind::Method, 0, NativeBuiltin::ChannelNew);
-    manifest.register_native(program, static_(BuiltinId::Channel), "new", MethodKind::Method, 1, NativeBuiltin::ChannelNew);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "receiver", MethodKind::Getter, 0, NativeBuiltin::ChannelReceiver);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "send", MethodKind::Method, 1, NativeBuiltin::ChannelSend);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "close", MethodKind::Method, 0, NativeBuiltin::ChannelClose);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "closed", MethodKind::Getter, 0, NativeBuiltin::ChannelClosed);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "length", MethodKind::Getter, 0, NativeBuiltin::ChannelLength);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "capacity", MethodKind::Getter, 0, NativeBuiltin::ChannelCapacity);
-
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "receive", MethodKind::Method, 0, NativeBuiltin::ReceiverReceive);
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "tryReceive", MethodKind::Method, 0, NativeBuiltin::ReceiverTryReceive);
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "close", MethodKind::Method, 0, NativeBuiltin::ReceiverClose);
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "closed", MethodKind::Getter, 0, NativeBuiltin::ReceiverClosed);
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "length", MethodKind::Getter, 0, NativeBuiltin::ReceiverLength);
+    // Independent publishers/subscribers connected through many-to-many channels.
+    for (builtin, native) in [
+        (BuiltinId::Event, PubSubNative::EventNew),
+        (BuiltinId::Emitter, PubSubNative::EmitterNew),
+        (BuiltinId::Channel, PubSubNative::ChannelNew),
+        (BuiltinId::Receiver, PubSubNative::ReceiverNew),
+    ] {
+        manifest.register_native(program, static_(builtin), "new", MethodKind::Method, 0, NativeBuiltin::PubSub(native));
+    }
+    manifest.register_native(program, static_(BuiltinId::Event), "new", MethodKind::Method, 1, NativeBuiltin::PubSub(PubSubNative::EventNew));
+    manifest.register_native(program, instance(BuiltinClass::Event), "data", MethodKind::Getter, 0, NativeBuiltin::PubSub(PubSubNative::EventData));
+    for (class, name, arity, native) in [
+        (BuiltinClass::Emitter, "publish_to", 1, PubSubNative::PublishTo),
+        (BuiltinClass::Emitter, "publishTo", 1, PubSubNative::PublishTo),
+        (BuiltinClass::Emitter, "unpublish_from", 1, PubSubNative::UnpublishFrom),
+        (BuiltinClass::Emitter, "unpublishFrom", 1, PubSubNative::UnpublishFrom),
+        (BuiltinClass::Emitter, "emit", 0, PubSubNative::Emit),
+        (BuiltinClass::Emitter, "emit", 1, PubSubNative::Emit),
+        (BuiltinClass::Receiver, "subscribe_from", 1, PubSubNative::SubscribeFrom),
+        (BuiltinClass::Receiver, "subscribeFrom", 1, PubSubNative::SubscribeFrom),
+        (BuiltinClass::Receiver, "unsubscribe_from", 1, PubSubNative::UnsubscribeFrom),
+        (BuiltinClass::Receiver, "unsubscribeFrom", 1, PubSubNative::UnsubscribeFrom),
+        (BuiltinClass::Receiver, "receive", 0, PubSubNative::Receive),
+        (BuiltinClass::Receiver, "tryReceive", 0, PubSubNative::TryReceive),
+        (BuiltinClass::Receiver, "try_receive", 0, PubSubNative::TryReceive),
+        (BuiltinClass::Receiver, "on", 1, PubSubNative::On),
+        (BuiltinClass::Receiver, "once", 1, PubSubNative::Once),
+        (BuiltinClass::Receiver, "off", 1, PubSubNative::Off),
+    ] {
+        manifest.register_native(program, instance(class), name, MethodKind::Method, arity, NativeBuiltin::PubSub(native));
+    }
+    for class in [BuiltinClass::Emitter, BuiltinClass::Channel, BuiltinClass::Receiver] {
+        manifest.register_native(program, instance(class), "close", MethodKind::Method, 0, NativeBuiltin::PubSub(PubSubNative::Close));
+        manifest.register_native(program, instance(class), "closed", MethodKind::Getter, 0, NativeBuiltin::PubSub(PubSubNative::Closed));
+    }
+    for (class, name, native) in [
+        (BuiltinClass::Emitter, "channelCount", PubSubNative::ChannelCount),
+        (BuiltinClass::Channel, "emitterCount", PubSubNative::EmitterCount),
+        (BuiltinClass::Channel, "receiverCount", PubSubNative::ReceiverCount),
+        (BuiltinClass::Receiver, "channelCount", PubSubNative::ChannelCount),
+        (BuiltinClass::Receiver, "listenerCount", PubSubNative::ListenerCount),
+        (BuiltinClass::Receiver, "length", PubSubNative::Length),
+    ] {
+        manifest.register_native(program, instance(class), name, MethodKind::Getter, 0, NativeBuiltin::PubSub(native));
+    }
 
     // Timer is a static-only engine class. All operations return cancellable
     // Promises; trailing Napalm blocks are simply the final closure argument.

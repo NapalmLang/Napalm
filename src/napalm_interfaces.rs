@@ -266,44 +266,37 @@ impl Heap {
             }
             Type::Builtin(builtin, element) => {
                 let object = self.get(value);
-                let state_payload_type = match (builtin, object) {
+                let state = match (builtin, object) {
                     (BuiltinId::Event, Some(HeapObject::Event { state }))
-                    | (BuiltinId::Emitter, Some(HeapObject::Emitter { state, .. })) => {
-                        unsafe { state.get() }.payload_type.as_ref()
-                    }
-                    (BuiltinId::Channel, Some(HeapObject::Channel { state, .. }))
-                    | (BuiltinId::Receiver, Some(HeapObject::Receiver { state })) => {
-                        unsafe { state.get() }.payload_type.as_ref()
-                    }
-                    // Never install a contract on a Promise: its handle entry reuses
-                    // the contract-pointer word for the settled payload. `await`
-                    // validates the settled value against `Promise<T>` instead.
+                    | (BuiltinId::Emitter, Some(HeapObject::Emitter { state }))
+                    | (BuiltinId::Channel, Some(HeapObject::Channel { state }))
+                    | (BuiltinId::Receiver, Some(HeapObject::Receiver { state })) => unsafe { state.get() },
+                    // Promise payloads are checked when awaited, not stored as handle contracts.
                     (BuiltinId::Promise, Some(HeapObject::Promise { .. })) => return Ok(()),
                     _ => return Err(mismatch(path, expected)),
                 };
-
                 if let Some(element) = element {
-                    if let Some(existing) = state_payload_type {
+                    let planned = plan.iter().find_map(|(owner, ty)| {
+                        if *owner != value { return None; }
+                        match ty {
+                            Type::Builtin(_, Some(element)) => Some(element.as_ref()),
+                            _ => None,
+                        }
+                    });
+                    if let Some(existing) = planned.or(state.payload_type.as_ref()) {
                         if existing != element.as_ref() {
                             return Err(RuntimeError::new(format!(
                                 "{TYPE_ERROR}{path} already carries incompatible payload contract {existing:?}"
                             )));
                         }
+                    } else if !state.can_set_payload_type() {
+                        return Err(RuntimeError::new(format!(
+                            "{TYPE_ERROR}{path}: set generic endpoint types before connecting or receiving events"
+                        )));
                     }
-
-                    // Channel/Receiver may already contain buffered values when a
-                    // typed alias is installed. Validate the existing queue before
-                    // publishing the persistent shared-state contract.
-                    if let Some(state) = match object {
-                        Some(HeapObject::Channel { state, .. })
-                        | Some(HeapObject::Receiver { state }) => Some(state),
-                        _ => None,
-                    } {
-                        for (index, item) in unsafe { state.get() }.queue.iter().copied().enumerate() {
-                            self.plan_contract(item, element, &format!("channel item {index}"), plan)?;
-                        }
+                    if let NativeEndpointData::Event(data) = &state.data {
+                        self.plan_contract(*data, element, "event.data", plan)?;
                     }
-
                     plan.push((value, expected.clone()));
                 }
                 true
@@ -389,19 +382,16 @@ impl Heap {
             let managed = unsafe { managed_object_mut(object) };
             self.handle_table.stage_contract(handle, ty.clone());
 
-            // Event/Emitter and Channel/Receiver share their payload contract in
-            // native sidecar state. This makes the contract capability-wide rather
-            // than handle-local: an untyped alias cannot bypass a typed endpoint.
+            // An endpoint owns its payload contract independently; aliases through
+            // any still reach this state. Connections require identical contracts.
             if let Type::Builtin(
                 BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet | BuiltinId::Generator,
                 Some(element),
             ) = &ty
             {
                 match &mut managed.object {
-                    HeapObject::Event { state } | HeapObject::Emitter { state, .. } => {
-                        unsafe { state.get_mut() }.payload_type = Some((**element).clone());
-                    }
-                    HeapObject::Channel { state, .. } | HeapObject::Receiver { state } => {
+                    HeapObject::Event { state } | HeapObject::Emitter { state }
+                    | HeapObject::Channel { state } | HeapObject::Receiver { state } => {
                         unsafe { state.get_mut() }.payload_type = Some((**element).clone());
                     }
                     _ => {}

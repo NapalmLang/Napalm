@@ -108,6 +108,10 @@ mod package_vm;
 #[path = "napalm_regex_vm.rs"]
 mod regex_vm;
 pub use regex_vm::RegexNative;
+#[path = "napalm_pubsub_vm.rs"]
+mod pubsub_vm;
+pub use pubsub_vm::PubSubNative;
+use pubsub_vm::{NativeEndpointCell, NativeEndpointData};
 use crate::napalm_bytes::{NapalmBytes, NapalmByteBuffer};
 use crate::napalm_tracing_jit::{
     JitAction, SharedJitProfile, SharedJitRepository, SmallMapLiteralTraceInfo, TraceActivation,
@@ -2903,12 +2907,11 @@ enum RuntimeEvent {
     /// One microtask drains every watcher queued during the current turn.
     /// Individual callbacks stay rooted in `reactive_pending_watchers`.
     ReactiveFlush,
-    /// Event/Emitter delivery is intentionally a microtask. This keeps emit()
-    /// non-reentrant while preserving listener registration order.
-    EmitterDelivery {
-        event: Value,
+    /// Receiver callbacks run as microtasks, after emit has routed its Event.
+    ReceiverDelivery {
+        receiver: Value,
         callback: Value,
-        payload: Value,
+        event: Value,
     },
     NativeDecoratorFire {
         state: Value,
@@ -2937,10 +2940,10 @@ impl RuntimeEvent {
                 if let Some(callback) = callback { visit(callback); }
             }
             RuntimeEvent::ReactiveFlush => {},
-            RuntimeEvent::EmitterDelivery { event, callback, payload } => {
-                visit(event);
+            RuntimeEvent::ReceiverDelivery { receiver, callback, event } => {
+                visit(receiver);
                 visit(callback);
-                visit(payload);
+                visit(event);
             }
             RuntimeEvent::NativeDecoratorFire { state, .. } => visit(state),
         }
@@ -2996,99 +2999,6 @@ struct NativeEventListener {
     token: u64,
     callback: Value,
     once: bool,
-}
-
-#[derive(Debug)]
-struct NativeEventState {
-    next_token: u64,
-    listeners: Vec<NativeEventListener>,
-    closed: bool,
-    /// Runtime payload contract installed by Event<T>/Emitter<T>. Keeping the
-    /// contract in the shared sidecar means aliases through `any` cannot bypass it.
-    payload_type: Option<Type>,
-}
-
-struct NativeEventCell {
-    state: std::cell::UnsafeCell<NativeEventState>,
-}
-
-impl NativeEventCell {
-    fn new() -> Self {
-        Self {
-            state: std::cell::UnsafeCell::new(NativeEventState {
-                next_token: 1,
-                listeners: Vec::new(),
-                closed: false,
-                payload_type: None,
-            }),
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn get(&self) -> &NativeEventState {
-        unsafe { &*self.state.get() }
-    }
-
-    #[inline(always)]
-    unsafe fn get_mut(&self) -> &mut NativeEventState {
-        unsafe { &mut *self.state.get() }
-    }
-}
-
-unsafe impl Send for NativeEventCell {}
-unsafe impl Sync for NativeEventCell {}
-
-impl fmt::Debug for NativeEventCell {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("NativeEventCell(..)")
-    }
-}
-
-#[derive(Debug)]
-struct NativeChannelState {
-    queue: VecDeque<Value>,
-    waiters: VecDeque<Value>,
-    capacity: Option<usize>,
-    closed: bool,
-    /// Runtime payload contract installed by Channel<T>/Receiver<T>.
-    payload_type: Option<Type>,
-}
-
-struct NativeChannelCell {
-    state: std::cell::UnsafeCell<NativeChannelState>,
-}
-
-impl NativeChannelCell {
-    fn new(capacity: Option<usize>) -> Self {
-        Self {
-            state: std::cell::UnsafeCell::new(NativeChannelState {
-                queue: VecDeque::new(),
-                waiters: VecDeque::new(),
-                capacity,
-                closed: false,
-                payload_type: None,
-            }),
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn get(&self) -> &NativeChannelState {
-        unsafe { &*self.state.get() }
-    }
-
-    #[inline(always)]
-    unsafe fn get_mut(&self) -> &mut NativeChannelState {
-        unsafe { &mut *self.state.get() }
-    }
-}
-
-unsafe impl Send for NativeChannelCell {}
-unsafe impl Sync for NativeChannelCell {}
-
-impl fmt::Debug for NativeChannelCell {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("NativeChannelCell(..)")
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3278,23 +3188,11 @@ enum HeapObject {
     Promise {
         state: Arc<PromiseCell>,
     },
-    /// Read-only subscription view. Event and Emitter share one stable state cell.
-    Event {
-        state: Arc<NativeEventCell>,
-    },
-    Emitter {
-        state: Arc<NativeEventCell>,
-        event: Value,
-    },
-    /// Sender/receiver split endpoint. Queue and pending receive Promises live in
-    /// one shared cell so either endpoint may outlive the other safely.
-    Channel {
-        state: Arc<NativeChannelCell>,
-        receiver: Value,
-    },
-    Receiver {
-        state: Arc<NativeChannelCell>,
-    },
+    /// Immutable event envelope and independently owned routing endpoints.
+    Event { state: Arc<NativeEndpointCell> },
+    Emitter { state: Arc<NativeEndpointCell> },
+    Channel { state: Arc<NativeEndpointCell> },
+    Receiver { state: Arc<NativeEndpointCell> },
     Response(Box<NapalmResponse>),
     Headers(NapalmHeaders),
     /// Scheduler-owned execution context for an async function. It deliberately
@@ -4130,38 +4028,12 @@ unsafe fn trace_promise(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
 }
 
 
-unsafe fn trace_native_event(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
+unsafe fn trace_native_endpoint(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
     let managed = unsafe { managed_object(object) };
     match &managed.object {
-        // Emitter owns the Event view. The view is the unique GC owner of the
-        // shared listener sidecar, so tracing only this edge avoids visiting every
-        // callback twice whenever both capability objects are live.
-        HeapObject::Emitter { event, .. } => visit_value(*event, visitor),
-        HeapObject::Event { state } => {
-            // SAFETY: GC invokes custom tracing while all mutators are stopped.
-            for listener in &unsafe { state.get() }.listeners {
-                visit_value(listener.callback, visitor);
-            }
-        }
-        _ => {}
-    }
-}
-
-unsafe fn trace_native_channel(object: GcObject, visitor: &mut dyn FnMut(GcSlot)) {
-    let managed = unsafe { managed_object(object) };
-    match &managed.object {
-        // Channel owns the Receiver view. Receiver is the unique GC owner of the
-        // queue and pending receive Promises, mirroring external-byte accounting.
-        HeapObject::Channel { receiver, .. } => visit_value(*receiver, visitor),
-        HeapObject::Receiver { state } => {
-            // SAFETY: GC invokes custom tracing while all mutators are stopped.
-            let state = unsafe { state.get() };
-            for &value in &state.queue {
-                visit_value(value, visitor);
-            }
-            for &promise in &state.waiters {
-                visit_value(promise, visitor);
-            }
+        HeapObject::Event { state } | HeapObject::Emitter { state }
+        | HeapObject::Channel { state } | HeapObject::Receiver { state } => {
+            unsafe { state.get() }.visit_values(|value| visit_value(value, visitor));
         }
         _ => {}
     }
@@ -4259,10 +4131,10 @@ gc_descriptor!(GC_CELL, "Napalm.Cell", GcTraceLayout::Custom(trace_cell));
 gc_descriptor!(GC_CLOSURE, "Napalm.Closure", GcTraceLayout::Custom(trace_closure));
 gc_descriptor!(GC_INSTANCE, "Napalm.Instance", GcTraceLayout::Custom(trace_instance));
 gc_descriptor!(GC_PROMISE, "Napalm.Promise", GcTraceLayout::Custom(trace_promise));
-gc_descriptor!(GC_EVENT, "Napalm.Event", GcTraceLayout::Custom(trace_native_event));
-gc_descriptor!(GC_EMITTER, "Napalm.Emitter", GcTraceLayout::Custom(trace_native_event));
-gc_descriptor!(GC_CHANNEL, "Napalm.Channel", GcTraceLayout::Custom(trace_native_channel));
-gc_descriptor!(GC_RECEIVER, "Napalm.Receiver", GcTraceLayout::Custom(trace_native_channel));
+gc_descriptor!(GC_EVENT, "Napalm.Event", GcTraceLayout::Custom(trace_native_endpoint));
+gc_descriptor!(GC_EMITTER, "Napalm.Emitter", GcTraceLayout::Custom(trace_native_endpoint));
+gc_descriptor!(GC_CHANNEL, "Napalm.Channel", GcTraceLayout::Custom(trace_native_endpoint));
+gc_descriptor!(GC_RECEIVER, "Napalm.Receiver", GcTraceLayout::Custom(trace_native_endpoint));
 gc_descriptor!(GC_RESPONSE, "Napalm.Response", GcTraceLayout::Custom(trace_response));
 gc_descriptor!(GC_ASYNC_TASK, "Napalm.AsyncTask", GcTraceLayout::Custom(trace_async_task));
 gc_descriptor!(GC_FIBER, "Napalm.Fiber", GcTraceLayout::Custom(trace_fiber));
@@ -4369,21 +4241,8 @@ fn external_bytes_for(object: &HeapObject) -> usize {
             // SAFETY: this is queried by the owning mutator.
             promise_state_external_bytes(unsafe { state.get() })
         }
-        // Listener storage is accounted to the Event view because registration
-        // mutates through Event.on/once and therefore always has that owner handle.
-        HeapObject::Event { state } => {
-            let state = unsafe { state.get() };
-            state.listeners.capacity() * std::mem::size_of::<NativeEventListener>()
-        }
-        HeapObject::Emitter { .. } => 0,
-        // Queue/waiter storage is accounted to Receiver. Channel keeps the Receiver
-        // handle, so send() can refresh accounting after queue growth as well.
-        HeapObject::Receiver { state } => {
-            let state = unsafe { state.get() };
-            state.queue.capacity() * std::mem::size_of::<Value>()
-                + state.waiters.capacity() * std::mem::size_of::<Value>()
-        }
-        HeapObject::Channel { .. } => 0,
+        HeapObject::Event { state } | HeapObject::Emitter { state }
+        | HeapObject::Channel { state } | HeapObject::Receiver { state } => unsafe { state.get() }.external_bytes(),
         HeapObject::AsyncTaskObject { state, .. } | HeapObject::FiberObject { state, .. } => {
             // SAFETY: this is queried by the owning mutator before publication or
             // while it has exclusive VM access. GC workers never call this helper.
@@ -4582,27 +4441,9 @@ fn collect_heap_object_handles(object: &HeapObject, roots: &mut Vec<u32>) {
                 }
             }
         }
-        HeapObject::Event { state } => {
-            for listener in &unsafe { state.get() }.listeners {
-                push_value_handle(listener.callback, roots);
-            }
-        }
-        HeapObject::Emitter { event, .. } => {
-            // Event is the unique sidecar GC owner; it traces the listeners.
-            push_value_handle(*event, roots);
-        }
-        HeapObject::Receiver { state } => {
-            let state = unsafe { state.get() };
-            for &value in &state.queue {
-                push_value_handle(value, roots);
-            }
-            for &promise in &state.waiters {
-                push_value_handle(promise, roots);
-            }
-        }
-        HeapObject::Channel { receiver, .. } => {
-            // Receiver is the unique sidecar GC owner; it traces queue/waiters.
-            push_value_handle(*receiver, roots);
+        HeapObject::Event { state } | HeapObject::Emitter { state }
+        | HeapObject::Channel { state } | HeapObject::Receiver { state } => {
+            unsafe { state.get() }.visit_values(|value| push_value_handle(value, roots));
         }
         HeapObject::Response(response) => {
             if let Some((_, value)) = response.decoded {
@@ -6416,18 +6257,10 @@ impl HostContext<'_> {
                 PromiseState::Rejected(_) => "<promise:rejected>",
                 PromiseState::Cancelled(_) => "<promise:cancelled>",
             }),
-            Some(HeapObject::Event { state }) => {
-                write!(out, "<Event listeners={}>", unsafe { state.get() }.listeners.len())
-            }
-            Some(HeapObject::Emitter { state, .. }) => {
-                write!(out, "<Emitter listeners={}>", unsafe { state.get() }.listeners.len())
-            }
-            Some(HeapObject::Channel { state, .. }) => {
-                write!(out, "<Channel queued={}>", unsafe { state.get() }.queue.len())
-            }
-            Some(HeapObject::Receiver { state }) => {
-                write!(out, "<Receiver queued={}>", unsafe { state.get() }.queue.len())
-            }
+            Some(HeapObject::Event { .. }) => out.write_str("<Event>"),
+            Some(HeapObject::Emitter { .. }) => out.write_str("<Emitter>"),
+            Some(HeapObject::Channel { .. }) => out.write_str("<Channel>"),
+            Some(HeapObject::Receiver { .. }) => out.write_str("<Receiver>"),
             Some(HeapObject::Response(response)) => write!(out, "<Response {}>", response.status),
             Some(HeapObject::Headers(_)) => out.write_str("<Headers>"),
             Some(HeapObject::AsyncTaskObject { task, .. }) => write!(out, "<async-task#{task}>"),
@@ -7817,6 +7650,7 @@ pub enum NativeBuiltin {
     DecoratorStoreList,
     Database(MxNative),
     Regex(RegexNative),
+    PubSub(PubSubNative),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14313,376 +14147,6 @@ impl<'p> Interpreter<'p> {
         self.spawn_async_task(function, None, &[], Some(callback), Some(index))
     }
 
-    fn native_event_state(&self, endpoint: Value) -> Result<Arc<NativeEventCell>, RuntimeError> {
-        match self.heap.get(endpoint) {
-            Some(HeapObject::Event { state }) | Some(HeapObject::Emitter { state, .. }) => {
-                Ok(state.clone())
-            }
-            _ => Err(RuntimeError::new("receiver is not an Event/Emitter")),
-        }
-    }
-
-    fn native_channel_state(&self, endpoint: Value) -> Result<Arc<NativeChannelCell>, RuntimeError> {
-        match self.heap.get(endpoint) {
-            Some(HeapObject::Channel { state, .. }) | Some(HeapObject::Receiver { state }) => {
-                Ok(state.clone())
-            }
-            _ => Err(RuntimeError::new("receiver is not a Channel/Receiver")),
-        }
-    }
-
-    fn emitter_event_view(&self, emitter: Value) -> Result<Value, RuntimeError> {
-        match self.heap.get(emitter) {
-            Some(HeapObject::Emitter { event, .. }) => Ok(*event),
-            _ => Err(RuntimeError::new("receiver is not an Emitter")),
-        }
-    }
-
-    fn channel_receiver_view(&self, channel: Value) -> Result<Value, RuntimeError> {
-        match self.heap.get(channel) {
-            Some(HeapObject::Channel { receiver, .. }) => Ok(*receiver),
-            _ => Err(RuntimeError::new("receiver is not a Channel")),
-        }
-    }
-
-    fn allocate_emitter(&mut self) -> Value {
-        let state = Arc::new(NativeEventCell::new());
-        let event = self.heap.alloc(HeapObject::Event { state: state.clone() });
-        let event_root = self.add_root(event);
-        let emitter = self.heap.alloc(HeapObject::Emitter { state, event });
-        self.release_root(event_root);
-        emitter
-    }
-
-    fn allocate_channel(&mut self, capacity: Option<usize>) -> Value {
-        let state = Arc::new(NativeChannelCell::new(capacity));
-        let receiver = self.heap.alloc(HeapObject::Receiver { state: state.clone() });
-        let receiver_root = self.add_root(receiver);
-        let channel = self.heap.alloc(HeapObject::Channel { state, receiver });
-        self.release_root(receiver_root);
-        channel
-    }
-
-    fn parse_channel_capacity(&self, value: Value) -> Result<usize, RuntimeError> {
-        let Some(number) = value.as_num() else {
-            return Err(RuntimeError::new("Channel capacity must be a non-negative integer"));
-        };
-        const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-        if !number.is_finite()
-            || number < 0.0
-            || number.fract() != 0.0
-            || number > MAX_SAFE_INTEGER
-            || number > usize::MAX as f64
-        {
-            return Err(RuntimeError::new("Channel capacity must be a non-negative safe integer"));
-        }
-        Ok(number as usize)
-    }
-
-    fn native_event_listener_function(&self, callback: Value) -> Result<(u32, u8), RuntimeError> {
-        let function = match self.heap.get(callback) {
-            Some(HeapObject::Closure { function_index, .. }) => *function_index,
-            _ => return Err(RuntimeError::new("Event listener must be a function")),
-        };
-        let prepared = self
-            .prepared
-            .functions
-            .get(function as usize)
-            .ok_or_else(|| RuntimeError::new("Event listener function does not exist"))?;
-        if prepared.is_concurrent {
-            return Err(RuntimeError::new(
-                "concurrent functions cannot be Event listeners directly; wrap launch in a normal/async function",
-            ));
-        }
-        if prepared.arity > 1 {
-            return Err(RuntimeError::new("Event listener must take zero or one argument"));
-        }
-        Ok((function, prepared.arity))
-    }
-
-    fn spawn_event_listener(&mut self, callback: Value, payload: Value) -> Result<Value, RuntimeError> {
-        let (function, arity) = self.native_event_listener_function(callback)?;
-        let payload_word = payload.word();
-        let args: &[RegisterWord] = if arity == 0 {
-            &[]
-        } else {
-            std::slice::from_ref(&payload_word)
-        };
-        self.spawn_async_task(function, None, args, Some(callback), None)
-    }
-
-    fn validate_event_payload(
-        &mut self,
-        state: &Arc<NativeEventCell>,
-        value: Value,
-    ) -> Result<(), RuntimeError> {
-        let expected = unsafe { state.get() }.payload_type.clone();
-        if let Some(expected) = expected {
-            self.heap.bind_contract(value, &expected)?;
-        }
-        Ok(())
-    }
-
-    fn validate_channel_payload(
-        &mut self,
-        state: &Arc<NativeChannelCell>,
-        value: Value,
-    ) -> Result<(), RuntimeError> {
-        let expected = unsafe { state.get() }.payload_type.clone();
-        if let Some(expected) = expected {
-            self.heap.bind_contract(value, &expected)?;
-        }
-        Ok(())
-    }
-
-    fn event_register_listener(
-        &mut self,
-        event: Value,
-        callback: Value,
-        once: bool,
-    ) -> Result<u64, RuntimeError> {
-        self.native_event_listener_function(callback)?;
-        let state = self.native_event_state(event)?;
-        let state_mut = unsafe { state.get_mut() };
-        if state_mut.closed {
-            return Err(RuntimeError::new("Event is closed"));
-        }
-
-        const MAX_SAFE_TOKEN: u64 = 9_007_199_254_740_991;
-        let mut token = state_mut.next_token.max(1);
-        loop {
-            if !state_mut.listeners.as_slice().iter().any(|listener| listener.token == token) {
-                break;
-            }
-            token = if token >= MAX_SAFE_TOKEN { 1 } else { token + 1 };
-        }
-        state_mut.next_token = if token >= MAX_SAFE_TOKEN { 1 } else { token + 1 };
-        state_mut.listeners.push(NativeEventListener { token, callback, once });
-
-        // The Event object is the generational owner for the listener vector.
-        self.heap.remember_owner(event);
-        let bytes = state_mut.listeners.capacity() * std::mem::size_of::<NativeEventListener>();
-        self.heap.set_external_bytes(event, bytes);
-        Ok(token)
-    }
-
-    fn event_remove_listener(&mut self, event: Value, key: Value) -> Result<bool, RuntimeError> {
-        let state = self.native_event_state(event)?;
-        let state_mut = unsafe { state.get_mut() };
-        let before = state_mut.listeners.len();
-
-        if let Some(number) = key.as_num() {
-            if !number.is_finite()
-                || number < 1.0
-                || number.fract() != 0.0
-                || number > 9_007_199_254_740_991.0
-            {
-                return Err(RuntimeError::new("Event.off expects a listener token or function"));
-            }
-            let token = number as u64;
-            // `as_slice()` pins the plain slice iterator: with simd_json's prelude
-            // in scope, `Vec::iter()` resolves to value-trait's `Array::iter`,
-            // which boxes a `dyn Iterator` that would outlive this condition.
-            if let Some(index) = state_mut.listeners.as_slice().iter().position(|listener| listener.token == token) {
-                state_mut.listeners.remove(index);
-            }
-        } else if matches!(self.heap.get(key), Some(HeapObject::Closure { .. })) {
-            state_mut.listeners.retain(|listener| listener.callback != key);
-        } else {
-            return Err(RuntimeError::new("Event.off expects a listener token or function"));
-        }
-
-        Ok(state_mut.listeners.len() != before)
-    }
-
-    fn event_emit(&mut self, emitter: Value, payload: Value) -> Result<usize, RuntimeError> {
-        let event = self.emitter_event_view(emitter)?;
-        let state = self.native_event_state(emitter)?;
-        if unsafe { state.get() }.closed {
-            return Ok(0);
-        }
-        self.validate_event_payload(&state, payload)?;
-
-        let callbacks = {
-            let state_mut = unsafe { state.get_mut() };
-            if state_mut.closed {
-                return Ok(0);
-            }
-            let mut callbacks: SmallVec<[Value; 8]> =
-                SmallVec::with_capacity(state_mut.listeners.len());
-            let mut index = 0usize;
-            while index < state_mut.listeners.len() {
-                let listener = state_mut.listeners[index];
-                callbacks.push(listener.callback);
-                if listener.once {
-                    state_mut.listeners.remove(index);
-                } else {
-                    index += 1;
-                }
-            }
-            callbacks
-        };
-
-        // Each queued RuntimeEvent is part of the VM root set, so callback and
-        // payload stay alive even if the Event/Emitter is dropped before delivery.
-        for callback in callbacks.iter().copied() {
-            self.event_loop.enqueue_microtask(RuntimeEvent::EmitterDelivery {
-                event,
-                callback,
-                payload,
-            });
-        }
-        Ok(callbacks.len())
-    }
-
-    fn close_event_state(&mut self, endpoint: Value) -> Result<bool, RuntimeError> {
-        let state = self.native_event_state(endpoint)?;
-        let state_mut = unsafe { state.get_mut() };
-        if state_mut.closed {
-            return Ok(false);
-        }
-        state_mut.closed = true;
-        state_mut.listeners.clear();
-        Ok(true)
-    }
-
-    fn close_channel_state(&mut self, endpoint: Value) -> Result<bool, RuntimeError> {
-        let state = self.native_channel_state(endpoint)?;
-        let pending = {
-            let state_mut = unsafe { state.get_mut() };
-            if state_mut.closed {
-                return Ok(false);
-            }
-            state_mut.closed = true;
-            state_mut.waiters.drain(..).collect::<SmallVec<[Value; 8]>>()
-        };
-
-        // Closing preserves buffered messages. Pending receives observe end-of-stream
-        // immediately as null; later receive() calls drain the queue, then return null.
-        // Root the whole detached waiter batch before settling the first Promise: a
-        // future settlement path is allowed to allocate/collect without losing later
-        // waiters that no longer live in the channel sidecar.
-        let roots: SmallVec<[u32; 8]> = pending
-            .iter()
-            .copied()
-            .map(|promise| self.add_root(promise))
-            .collect();
-        for promise in pending {
-            let _ = self.settle_promise_outcome(
-                promise,
-                PromiseOutcome::Fulfilled(Value::NULL),
-            );
-        }
-        for root in roots {
-            self.release_root(root);
-        }
-        Ok(true)
-    }
-
-    fn channel_send(&mut self, channel: Value, payload: Value) -> Result<bool, RuntimeError> {
-        let state = self.native_channel_state(channel)?;
-        if unsafe { state.get() }.closed {
-            return Ok(false);
-        }
-        self.validate_channel_payload(&state, payload)?;
-        let receiver = self.channel_receiver_view(channel)?;
-
-        enum SendAction {
-            Closed,
-            Full,
-            Queued,
-            Deliver(Value),
-        }
-
-        let action = {
-            let state_mut = unsafe { state.get_mut() };
-            if state_mut.closed {
-                SendAction::Closed
-            } else if let Some(promise) = state_mut.waiters.pop_front() {
-                SendAction::Deliver(promise)
-            } else if state_mut.capacity.is_some_and(|capacity| state_mut.queue.len() >= capacity) {
-                SendAction::Full
-            } else {
-                state_mut.queue.push_back(payload);
-                SendAction::Queued
-            }
-        };
-
-        match action {
-            SendAction::Closed | SendAction::Full => Ok(false),
-            SendAction::Queued => {
-                self.heap.remember_owner(receiver);
-                let bytes = external_bytes_for(
-                    self.heap.get(receiver).expect("Channel receiver disappeared"),
-                );
-                self.heap.set_external_bytes(receiver, bytes);
-                Ok(true)
-            }
-            SendAction::Deliver(promise) => {
-                let promise_root = self.add_root(promise);
-                let payload_root = self.add_root(payload);
-                let result = self.settle_promise_outcome(
-                    promise,
-                    PromiseOutcome::Fulfilled(payload),
-                );
-                self.release_root(payload_root);
-                self.release_root(promise_root);
-                result?;
-                Ok(true)
-            }
-        }
-    }
-
-    fn receiver_receive(&mut self, receiver: Value) -> Result<Value, RuntimeError> {
-        let state = self.native_channel_state(receiver)?;
-        let immediate = {
-            let state_mut = unsafe { state.get_mut() };
-            if let Some(value) = state_mut.queue.pop_front() {
-                Some(value)
-            } else if state_mut.closed {
-                Some(Value::NULL)
-            } else {
-                None
-            }
-        };
-
-        if let Some(value) = immediate {
-            let value_root = self.add_root(value);
-            let promise = self.allocate_promise(PromiseState::Fulfilled(value));
-            self.release_root(value_root);
-            return Ok(promise);
-        }
-
-        let promise = self.allocate_pending_promise();
-        let promise_root = self.add_root(promise);
-        {
-            let state_mut = unsafe { state.get_mut() };
-            // No user code/GC runs between the earlier state check and this push.
-            // Still re-check close to keep the helper correct if reused later.
-            if state_mut.closed {
-                let _ = self.settle_promise_outcome(
-                    promise,
-                    PromiseOutcome::Fulfilled(Value::NULL),
-                );
-                self.release_root(promise_root);
-                return Ok(promise);
-            }
-            state_mut.waiters.push_back(promise);
-        }
-        self.heap.remember_owner(receiver);
-        let bytes = external_bytes_for(
-            self.heap.get(receiver).expect("Receiver disappeared"),
-        );
-        self.heap.set_external_bytes(receiver, bytes);
-        self.release_root(promise_root);
-        Ok(promise)
-    }
-
-    fn receiver_try_receive(&mut self, receiver: Value) -> Result<Value, RuntimeError> {
-        let state = self.native_channel_state(receiver)?;
-        Ok(unsafe { state.get_mut() }.queue.pop_front().unwrap_or(Value::NULL))
-    }
-
     fn timer_callback_function(&self, callback: Value) -> Result<u32, RuntimeError> {
         let function = match self.heap.get(callback) {
             Some(HeapObject::Closure { function_index, .. }) => *function_index,
@@ -14877,28 +14341,15 @@ impl<'p> Interpreter<'p> {
             RuntimeEvent::ReactiveFlush => {
                 self.reactive_flush_watchers();
             }
-            RuntimeEvent::EmitterDelivery { event, callback, payload } => {
-                // pop_microtask() removes the RuntimeEvent from the event-loop root
-                // set before we enter here. Task setup and structural payload
-                // validation may allocate, so root every managed value explicitly.
-                let event_root = self.add_root(event);
+            RuntimeEvent::ReceiverDelivery { receiver, callback, event } => {
+                let receiver_root = self.add_root(receiver);
                 let callback_root = self.add_root(callback);
-                let payload_root = self.add_root(payload);
-
-                // Re-check the current shared payload contract at delivery time.
-                // An untyped Emitter may have acquired Event<T>/Emitter<T> after
-                // emit() queued this microtask but before the listener runs.
-                let delivered = self
-                    .native_event_state(event)
-                    .and_then(|state| self.validate_event_payload(&state, payload))
-                    .and_then(|()| self.spawn_event_listener(callback, payload));
-
-                self.release_root(payload_root);
-                self.release_root(callback_root);
+                let event_root = self.add_root(event);
+                let delivered = self.deliver_receiver_callback(receiver, callback, event);
                 self.release_root(event_root);
-                if let Err(error) = delivered {
-                    self.fail(error);
-                }
+                self.release_root(callback_root);
+                self.release_root(receiver_root);
+                if let Err(error) = delivered { self.fail(error); }
             }
             RuntimeEvent::TimerFire { promise, callback, interval } => {
                 let still_pending = self.promise_cell(promise).ok().is_some_and(|cell| {
@@ -16837,188 +16288,33 @@ impl Interpreter<'_> {
                 };
                 unsafe { self.set_reg(op.a, Value::from_bool(matches).word()); self.advance(op); }
             }
-            NativeBuiltin::EmitterNew => {
-                self.mark_gc_point(op);
-                self.maybe_collect();
-                let emitter = self.allocate_emitter();
-                unsafe { self.set_reg(op.a, emitter.word()); self.advance(op); }
+            NativeBuiltin::EmitterNew
+            | NativeBuiltin::EmitterEvent
+            | NativeBuiltin::EmitterEmit
+            | NativeBuiltin::EmitterListenerCount
+            | NativeBuiltin::EmitterClear
+            | NativeBuiltin::EmitterClose
+            | NativeBuiltin::EmitterClosed
+            | NativeBuiltin::EventOn
+            | NativeBuiltin::EventOnce
+            | NativeBuiltin::EventOff
+            | NativeBuiltin::EventListenerCount
+            | NativeBuiltin::EventClosed
+            | NativeBuiltin::ChannelNew
+            | NativeBuiltin::ChannelReceiver
+            | NativeBuiltin::ChannelSend
+            | NativeBuiltin::ChannelClose
+            | NativeBuiltin::ChannelClosed
+            | NativeBuiltin::ChannelLength
+            | NativeBuiltin::ChannelCapacity
+            | NativeBuiltin::ReceiverReceive
+            | NativeBuiltin::ReceiverTryReceive
+            | NativeBuiltin::ReceiverClose
+            | NativeBuiltin::ReceiverClosed
+            | NativeBuiltin::ReceiverLength => {
+                self.fail_at(op, "obsolete Event/Emitter/Channel/Receiver API; rebuild this .burning artifact");
             }
-            NativeBuiltin::EmitterEvent => {
-                let emitter = Value::from_word(receiver);
-                match self.emitter_event_view(emitter) {
-                    Ok(event) => unsafe { self.set_reg(op.a, event.word()); self.advance(op); },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::EmitterEmit => {
-                let emitter = Value::from_word(receiver);
-                match self.event_emit(emitter, arg(0)) {
-                    Ok(count) => unsafe {
-                        self.set_reg(op.a, Value::from_num(count as f64).word());
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::EmitterListenerCount | NativeBuiltin::EventListenerCount => {
-                let endpoint = Value::from_word(receiver);
-                match self.native_event_state(endpoint) {
-                    Ok(state) => unsafe {
-                        self.set_reg(
-                            op.a,
-                            Value::from_num(state.get().listeners.len() as f64).word(),
-                        );
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::EmitterClear => {
-                let emitter = Value::from_word(receiver);
-                match self.native_event_state(emitter) {
-                    Ok(state) => {
-                        let count = unsafe { state.get() }.listeners.len();
-                        unsafe { state.get_mut() }.listeners.clear();
-                        unsafe {
-                            self.set_reg(op.a, Value::from_num(count as f64).word());
-                            self.advance(op);
-                        }
-                    }
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::EmitterClose => {
-                let emitter = Value::from_word(receiver);
-                match self.close_event_state(emitter) {
-                    Ok(changed) => unsafe {
-                        self.set_reg(op.a, Value::from_bool(changed).word());
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::EmitterClosed | NativeBuiltin::EventClosed => {
-                let endpoint = Value::from_word(receiver);
-                match self.native_event_state(endpoint) {
-                    Ok(state) => unsafe {
-                        self.set_reg(op.a, Value::from_bool(state.get().closed).word());
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::EventOn | NativeBuiltin::EventOnce => {
-                let event = Value::from_word(receiver);
-                let once = matches!(native, NativeBuiltin::EventOnce);
-                match self.event_register_listener(event, arg(0), once) {
-                    Ok(token) => unsafe {
-                        self.set_reg(op.a, Value::from_num(token as f64).word());
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::EventOff => {
-                let event = Value::from_word(receiver);
-                match self.event_remove_listener(event, arg(0)) {
-                    Ok(removed) => unsafe {
-                        self.set_reg(op.a, Value::from_bool(removed).word());
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-
-            NativeBuiltin::ChannelNew => {
-                let capacity = if args.is_empty() {
-                    None
-                } else {
-                    match self.parse_channel_capacity(arg(0)) {
-                        Ok(capacity) => Some(capacity),
-                        Err(error) => { self.fail_at(op, error.message); return; }
-                    }
-                };
-                self.mark_gc_point(op);
-                self.maybe_collect();
-                let channel = self.allocate_channel(capacity);
-                unsafe { self.set_reg(op.a, channel.word()); self.advance(op); }
-            }
-            NativeBuiltin::ChannelReceiver => {
-                let channel = Value::from_word(receiver);
-                match self.channel_receiver_view(channel) {
-                    Ok(receiver) => unsafe { self.set_reg(op.a, receiver.word()); self.advance(op); },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::ChannelSend => {
-                let channel = Value::from_word(receiver);
-                match self.channel_send(channel, arg(0)) {
-                    Ok(sent) => unsafe {
-                        self.set_reg(op.a, Value::from_bool(sent).word());
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::ChannelClose | NativeBuiltin::ReceiverClose => {
-                let endpoint = Value::from_word(receiver);
-                match self.close_channel_state(endpoint) {
-                    Ok(changed) => unsafe {
-                        self.set_reg(op.a, Value::from_bool(changed).word());
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::ChannelClosed | NativeBuiltin::ReceiverClosed => {
-                let endpoint = Value::from_word(receiver);
-                match self.native_channel_state(endpoint) {
-                    Ok(state) => unsafe {
-                        self.set_reg(op.a, Value::from_bool(state.get().closed).word());
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::ChannelLength | NativeBuiltin::ReceiverLength => {
-                let endpoint = Value::from_word(receiver);
-                match self.native_channel_state(endpoint) {
-                    Ok(state) => unsafe {
-                        self.set_reg(op.a, Value::from_num(state.get().queue.len() as f64).word());
-                        self.advance(op);
-                    },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::ChannelCapacity => {
-                let channel = Value::from_word(receiver);
-                match self.native_channel_state(channel) {
-                    Ok(state) => {
-                        let capacity = unsafe { state.get() }.capacity.map_or(f64::INFINITY, |value| value as f64);
-                        unsafe {
-                            self.set_reg(op.a, Value::from_num(capacity).word());
-                            self.advance(op);
-                        }
-                    }
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::ReceiverReceive => {
-                let receiver = Value::from_word(receiver);
-                self.mark_gc_point(op);
-                self.maybe_collect();
-                match self.receiver_receive(receiver) {
-                    Ok(promise) => unsafe { self.set_reg(op.a, promise.word()); self.advance(op); },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
-            NativeBuiltin::ReceiverTryReceive => {
-                let receiver = Value::from_word(receiver);
-                match self.receiver_try_receive(receiver) {
-                    Ok(value) => unsafe { self.set_reg(op.a, value.word()); self.advance(op); },
-                    Err(error) => self.fail_at(op, error.message),
-                }
-            }
+            NativeBuiltin::PubSub(native) => self.execute_pubsub_native(op, native, receiver, args),
             NativeBuiltin::TimerDelay => {
                 let delay = match Self::timer_duration(arg(0), false) {
                     Ok(delay) => delay,
@@ -20942,18 +20238,10 @@ impl Interpreter<'_> {
                 PromiseState::Rejected(_) => "<promise:rejected>".into(),
                 PromiseState::Cancelled(_) => "<promise:cancelled>".into(),
             },
-            Some(HeapObject::Event { state }) => {
-                format!("<Event listeners={}>", unsafe { state.get() }.listeners.len())
-            }
-            Some(HeapObject::Emitter { state, .. }) => {
-                format!("<Emitter listeners={}>", unsafe { state.get() }.listeners.len())
-            }
-            Some(HeapObject::Channel { state, .. }) => {
-                format!("<Channel queued={}>", unsafe { state.get() }.queue.len())
-            }
-            Some(HeapObject::Receiver { state }) => {
-                format!("<Receiver queued={}>", unsafe { state.get() }.queue.len())
-            }
+            Some(HeapObject::Event { .. }) => "<Event>".into(),
+            Some(HeapObject::Emitter { .. }) => "<Emitter>".into(),
+            Some(HeapObject::Channel { .. }) => "<Channel>".into(),
+            Some(HeapObject::Receiver { .. }) => "<Receiver>".into(),
             Some(HeapObject::Response(response)) => format!("<Response {}>", response.status),
             Some(HeapObject::Headers(_)) => "<Headers>".into(),
             Some(HeapObject::AsyncTaskObject { task, .. }) => format!("<async-task#{task}>"),
@@ -24144,6 +23432,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_jit_binding_tests.rs");
     include!("tests/napalm_collections_tests.rs");
     include!("tests/napalm_contract_tests.rs");
+    include!("tests/napalm_pubsub_tests.rs");
     include!("tests/napalm_string_tests.rs");
     include!("tests/napalm_llvm_region_tests.rs");
     include!("tests/napalm_cranelift_region_tests.rs");
@@ -27048,146 +26337,6 @@ Timer.microtask(function () {
             vm.run_module(entry).unwrap_or_else(|error| panic!("jit={jit_enabled}: {error:?}"));
             assert_eq!(source_result(&vm), 42.0, "jit={jit_enabled}");
         }
-    }
-
-
-    #[test]
-    fn native_emitter_event_supports_fifo_delivery_once_and_off() {
-        let source = r#"
-let emitter = new Emitter<Number>();
-let event: Event<Number> = emitter.event;
-// `result` must be the last module variable: the test reads it as such.
-let persistent: any = null;
-let result: Number = 0;
-
-persistent = event.on(function(value) {
-    result = result * 10 + value;
-});
-
-event.once(function(value) {
-    result = result * 10 + 9;
-});
-
-emitter.emit(1);
-emitter.emit(2);
-event.off(persistent);
-emitter.emit(3);
-"#;
-        let (program, entry, manifest) = compile_typescript_module(source);
-        for jit_enabled in [false, true] {
-            let mut vm = source_vm(&program, &manifest);
-            if !jit_enabled {
-                vm.set_jit_options(None);
-            }
-            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
-                panic!("expected Event microtasks to drain before the VM returns");
-            };
-            // FIFO delivery is persistent(1), once(9), persistent(2).
-            assert_eq!(source_result(&vm), 192.0, "jit={jit_enabled}");
-        }
-    }
-
-    #[test]
-    fn native_channel_is_fifo_bounded_and_drains_before_closed_null() {
-        let source = r#"
-class ChannelTest {
-    static async run() {
-        let channel = new Channel<Number>(2);
-        let receiver: Receiver<Number> = channel.receiver;
-
-        let firstSent = channel.send(10);
-        let secondSent = channel.send(20);
-        let fullRejected = !channel.send(30);
-
-        let first = await receiver.receive();
-        let refillSent = channel.send(30);
-        let second = receiver.tryReceive();
-
-        let closed = channel.close();
-        let third = await receiver.receive();
-        let end = await receiver.receive();
-
-        let flags = firstSent && secondSent && fullRejected && refillSent && closed && end == null;
-        return (flags ? 1000 : 0) + first * 100 + second * 10 + third;
-    }
-}
-
-let result = await ChannelTest.run();
-"#;
-        let (program, entry, manifest) = compile_typescript_module(source);
-        for jit_enabled in [false, true] {
-            let mut vm = source_vm(&program, &manifest);
-            if !jit_enabled {
-                vm.set_jit_options(None);
-            }
-            let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
-                panic!("expected ChannelTest.run() to settle");
-            };
-            assert_eq!(source_result(&vm), 2230.0, "jit={jit_enabled}");
-        }
-    }
-
-    #[test]
-    fn native_channel_send_resolves_oldest_pending_receive() {
-        let source = r#"
-class ChannelTest {
-    static async run() {
-        let channel = new Channel<Number>(0);
-        let receiver = channel.receiver;
-        let pending = receiver.receive();
-        let sent = channel.send(42);
-        let value = await pending;
-        return sent ? value : -1;
-    }
-}
-
-let result = await ChannelTest.run();
-"#;
-        let (program, entry, manifest) = compile_typescript_module(source);
-        let mut vm = source_vm(&program, &manifest);
-        let ExecutionResult::Returned(_) = vm.run_module(entry).unwrap() else {
-            panic!("expected rendezvous channel receive to settle");
-        };
-        assert_eq!(source_result(&vm), 42.0);
-    }
-
-
-    #[test]
-    fn typed_emitter_contract_survives_any_alias() {
-        let source = r#"
-let emitter = new Emitter<Number>();
-let dynamicEmitter: any = emitter;
-dynamicEmitter.emit("not a number");
-let result = 1;
-"#;
-        let (program, entry, manifest) = compile_typescript_module(source);
-        let mut vm = source_vm(&program, &manifest);
-        let error = vm
-            .run_module(entry)
-            .expect_err("typed Emitter payload contract must survive an any alias");
-        assert!(
-            error.message.contains("must satisfy Num") || error.message.contains("Emitter"),
-            "unexpected runtime type error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn typed_channel_contract_survives_any_alias() {
-        let source = r#"
-let channel = new Channel<Number>();
-let dynamicChannel: any = channel;
-dynamicChannel.send("not a number");
-let result = 1;
-"#;
-        let (program, entry, manifest) = compile_typescript_module(source);
-        let mut vm = source_vm(&program, &manifest);
-        let error = vm
-            .run_module(entry)
-            .expect_err("typed Channel payload contract must survive an any alias");
-        assert!(
-            error.message.contains("must satisfy Num") || error.message.contains("Channel"),
-            "unexpected runtime type error: {error:?}"
-        );
     }
 
 

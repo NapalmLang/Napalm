@@ -1,25 +1,28 @@
-# Windows Explorer icons
+# Windows Explorer file icons
 
-File icons in Explorer are independent of VS Code file icon themes. These
-scripts register **per-user** `DefaultIcon` keys for `.napalm`, `.fire`, and
-`.burning`, without replacing any selected default editor or application.
+These scripts are **optional** and configure file type icons in the Windows
+Explorer, separately from the icon contributions in VS Code.
 
-Prepare your own three `.ico` files, then run (from this directory):
+The package includes `../icons/napalm-file.ico`, containing the original icon
+images in 16, 32, 48, 64 and 256 px. Run PowerShell from this folder:
 
 ```powershell
-.\Register-NapalmFileIcons.ps1 -NapalmIcon 'C:\art\napalm.ico' `
-    -FireIcon 'C:\art\fire.ico' -BurningIcon 'C:\art\burning.ico'
+.\Register-NapalmFileIcons.ps1
 ```
 
-The script creates a backup at `%LOCALAPPDATA%\Napalm\file-icons-backup.json`.
-To restore the previous settings:
+The script registers `.napalm`, `.burning`, `.fire` and `.orange` in the current
+user's registry only. It makes a backup at
+`%LOCALAPPDATA%\Napalm\file-icons-backup.json` and does **not** change the
+default app used to open any extension. You can override individual assets with
+`-NapalmIcon`, `-BurningIcon`, `-FireIcon` or `-OrangeIcon` paths.
+
+To restore the previous per-extension icon mappings:
 
 ```powershell
 .\Restore-NapalmFileIcons.ps1
 ```
 
-Windows may prefer the icon supplied by the current default application for
-some extensions. In that case a proper application ProgID / installer
-registration may be required. These scripts do not forcibly change the
-user's default application and make no claim that an arbitrary icon will
-override every shell association. Explorer can cache icons until refreshed.
+**Important:** Windows may prioritize the current application's ProgID icon
+over a per-extension `DefaultIcon` value. These scripts cannot guarantee the
+result in every Explorer association configuration; Windows also caches icons.
+Running this script is not required for VS Code's own icons.

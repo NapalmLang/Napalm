@@ -11,10 +11,11 @@ const grammar = load('syntaxes/napalm.tmLanguage.json');
 const configuration = load('language-configuration.json');
 
 test('source and artifact extensions have separate language IDs', () => {
-  const [source, burning, fire] = manifest.contributes.languages;
+  const [source, burning, fire, orange] = manifest.contributes.languages;
   assert.deepEqual(source.extensions, ['.napalm']);
   assert.deepEqual(burning.extensions, ['.burning']);
   assert.deepEqual(fire.extensions, ['.fire']);
+  assert.deepEqual(orange.extensions, ['.orange']);
   assert.equal(manifest.contributes.grammars.length, 1);
   assert.equal(manifest.contributes.grammars[0].language, source.id);
   assert.equal(manifest.contributes.grammars[0].scopeName, 'source.napalm');
@@ -55,9 +56,19 @@ test('grammar recognizes key Napalm syntax', () => {
   assert.ok(patterns('operators').some((pattern) => new RegExp(pattern).test('|>')));
   assert.ok(patterns('keywords').some((pattern) => new RegExp(pattern).test('concurrent')));
   assert.ok(patterns('keywords').some((pattern) => new RegExp(pattern).test('computed')));
-  assert.ok(patterns('keywords').some((pattern) => new RegExp(pattern).test('unless')));
-  assert.ok(patterns('keywords').some((pattern) => new RegExp(pattern).test('until')));
   assert.ok(patterns('numbers').some((pattern) => new RegExp(pattern).test('0xDEAD_BEEF')));
   assert.ok(patterns('numbers').some((pattern) => new RegExp(pattern).test('1_000_000')));
   assert.ok(patterns('constants').some((pattern) => new RegExp(pattern).test('null')));
+});
+
+
+test('extension activates the self-hosted LSP client and offers a configurable executable path', () => {
+  assert.equal(manifest.main, './extension.js');
+  assert.ok(manifest.activationEvents.includes('onLanguage:napalm'));
+  assert.ok(manifest.dependencies['vscode-languageclient']);
+  assert.ok(manifest.contributes.configuration.properties['napalm.languageServerPath']);
+  const bootstrap = readFileSync(join(root, 'extension.js'), 'utf8');
+  assert.match(bootstrap, /new LanguageClient/);
+  assert.match(bootstrap, /lsp/);
+  assert.match(bootstrap, /createFileSystemWatcher/);
 });

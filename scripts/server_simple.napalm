@@ -1,7 +1,7 @@
 // cargo run -- scripts/server_simple.napalm
 
 print("===== HTTP =====");
-listen "0.0.0.0:3000" {
+const server = listen "0.0.0.0:3000" {
   route "GET" ["/"] (req) => {
     return { status: 200, body: "Hello!" };
   };
@@ -12,5 +12,11 @@ async function demo() {
   print(r1.status); print(r1.body);
 }
 
-setTimeout(() => { demo(); }, 500);
+setTimeout(async () => {
+  await demo();
+
+  await Timer.delay(1000);
+
+  http.close(server); // Stop accepting connections when you are done.
+}, 500);
 // The listener keeps Napalm running. Stop with Ctrl+C.

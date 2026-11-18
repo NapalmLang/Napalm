@@ -4913,7 +4913,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
         if let Some(builtin) = BuiltinId::ALL
             .into_iter()
-            .find(|builtin| builtin.is_native_decorator() && builtin.name() == name.value)
+            .find(|builtin| builtin.binding_name() != builtin.name() && builtin.name() == name.value)
         {
             if let Some(slot) = self.context.module_layout.get(builtin.binding_name()) {
                 return self.builder.emit1(

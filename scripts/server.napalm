@@ -43,7 +43,10 @@ async function demo() {
 
   let stream = await get("http://127.0.0.1:3000/sse");
   print(stream.body);
-  // http.close(server); // Stop accepting connections when you are done.
+
+  await Timer.delay(1000);
+
+  http.close(server); // Stop accepting connections when you are done.
 }
 
 demo();

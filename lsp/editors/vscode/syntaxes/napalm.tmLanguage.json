@@ -234,7 +234,7 @@
         },
         {
           "name": "support.type.builtin.napalm",
-          "match": "(?<![.\\w$])\\b(?:Number|String|Boolean|Null|Array|List|Map|Set|Range|Bytes|ByteBuffer|Date|File|FileInfo|FileWatcher|InputStream|OutputStream|Package|Promise|Event|Emitter|Channel|Receiver|Generator|Fiber)\\b"
+          "match": "(?<![.\\w$])\\b(?:Number|String|Boolean|Null|Array|List|Map|Set|Range|Bytes|ByteBuffer|Date|File|FileInfo|FileWatcher|InputStream|OutputStream|Promise|Event|Emitter|Channel|Receiver|Generator|Fiber)\\b"
         }
       ]
     },
@@ -242,7 +242,7 @@
       "patterns": [
         {
           "name": "keyword.control.flow.napalm",
-          "match": "(?<![.\\w$])\\b(?:if|unless|else|switch|case|default|for|while|until|do|break|continue|return|throw|try|catch|finally|yield|await|in|of)\\b"
+          "match": "(?<![.\\w$])\\b(?:if|else|switch|case|default|for|while|do|break|continue|return|throw|try|catch|finally|yield|await|in|of)\\b"
         },
         {
           "name": "keyword.control.import.napalm",

@@ -1698,10 +1698,13 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         (BuiltinId::HttpGet, NativeBuiltin::HttpGet, &[1, 2][..]),
         (BuiltinId::HttpGetJson, NativeBuiltin::HttpGetJson, &[1, 2][..]),
         (BuiltinId::HttpPostJson, NativeBuiltin::HttpPostJson, &[2, 3][..]),
-        (BuiltinId::SetTimeout, NativeBuiltin::SetTimeout, &[2][..]),
     ] {
-        for &arity in arities { manifest.register_native(program, static_(id), "call", MethodKind::Method, arity, native); }
+        for &arity in arities {
+            manifest.register_native(program, static_(id), "call", MethodKind::Method, arity, native);
+            manifest.register_native(program, static_(BuiltinId::Http), id.name(), MethodKind::Method, arity, native);
+        }
     }
+    manifest.register_native(program, static_(BuiltinId::SetTimeout), "call", MethodKind::Method, 2, NativeBuiltin::SetTimeout);
     manifest.register(program, static_(BuiltinId::Print), "call", MethodKind::Method, 1, BuiltinPrimitive::SystemPrint);
 
     manifest

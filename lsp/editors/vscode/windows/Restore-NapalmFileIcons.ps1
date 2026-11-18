@@ -13,7 +13,7 @@ $backup = Get-Content -LiteralPath $backupPath -Raw | ConvertFrom-Json
 if ($PSCmdlet.ShouldProcess('HKCU\Software\Classes', 'Restore Napalm file-type icons')) {
     foreach ($property in $backup.PSObject.Properties) {
         $extension = $property.Name
-        if ($extension -notin @('.napalm', '.fire', '.burning')) {
+        if ($extension -notin @('.napalm', '.fire', '.burning', '.orange')) {
             throw "Unexpected extension in backup: $extension"
         }
         $regPath = "Registry::HKEY_CURRENT_USER\Software\Classes\$extension\DefaultIcon"

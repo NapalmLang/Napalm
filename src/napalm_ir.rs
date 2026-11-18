@@ -667,8 +667,9 @@ impl BuiltinId {
             Self::RegexCaptures => "RegexCaptures",
         }
     }
-    /// Module-layout key reserving this builtin. Native decorators use a hidden
-    /// key; `lower_name` falls back to it only when no user binding exists.
+    /// Module-layout key reserving this builtin. Native decorators and HTTP
+    /// client helpers use hidden keys; `lower_name` falls back to them only
+    /// when no user binding exists.
     #[inline] pub const fn binding_name(self) -> &'static str {
         match self {
             Self::Memoize => "<native:memoize>",
@@ -677,6 +678,9 @@ impl BuiltinId {
             Self::Delay => "<native:delay>",
             Self::Debounce => "<native:debounce>",
             Self::Throttle => "<native:throttle>",
+            Self::HttpGet => "<native:get>",
+            Self::HttpGetJson => "<native:getJSON>",
+            Self::HttpPostJson => "<native:postJSON>",
             _ => self.name(),
         }
     }

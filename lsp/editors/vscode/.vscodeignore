@@ -4,4 +4,7 @@ tests/**
 scripts/**
 windows/**
 samples/**
+*.vsix
 **/*.test.mjs
+
+# The native LSP is packaged intentionally; do not exclude server/.

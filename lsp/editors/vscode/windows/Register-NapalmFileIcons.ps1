@@ -1,18 +1,21 @@
 # Registers only per-user file-type icons, without changing default applications.
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
-    [Parameter(Mandatory = $true)][string] $NapalmIcon,
-    [Parameter(Mandatory = $true)][string] $FireIcon,
-    [Parameter(Mandatory = $true)][string] $BurningIcon
+    [string] $NapalmIcon = '',
+    [string] $FireIcon = '',
+    [string] $BurningIcon = '',
+    [string] $OrangeIcon = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$bundledIcon = Join-Path (Join-Path $PSScriptRoot '..\icons') 'napalm-file.ico'
 $requestedIcons = [ordered]@{
-    '.napalm' = $NapalmIcon
-    '.fire' = $FireIcon
-    '.burning' = $BurningIcon
+    '.napalm' = $(if ($NapalmIcon) { $NapalmIcon } else { $bundledIcon })
+    '.fire' = $(if ($FireIcon) { $FireIcon } else { $bundledIcon })
+    '.burning' = $(if ($BurningIcon) { $BurningIcon } else { $bundledIcon })
+    '.orange' = $(if ($OrangeIcon) { $OrangeIcon } else { $bundledIcon })
 }
 
 $installed = @{}

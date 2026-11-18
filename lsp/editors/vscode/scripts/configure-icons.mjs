@@ -11,11 +11,12 @@ const keys = new Set([
   'napalm', 'napalm-light', 'napalm-dark',
   'fire', 'fire-light', 'fire-dark',
   'burning', 'burning-light', 'burning-dark',
+  'orange', 'orange-light', 'orange-dark',
 ]);
 
 function usage() {
   return [
-    'Usage: node scripts/configure-icons.mjs --napalm PATH [--fire PATH] [--burning PATH]',
+    'Usage: node scripts/configure-icons.mjs --napalm PATH [--fire PATH] [--burning PATH] [--orange PATH]',
     'Optional per-theme assets: --napalm-light PATH --napalm-dark PATH, etc.',
     'Only .svg or .png files are supported for VS Code language icons.',
   ].join('\n');
@@ -56,7 +57,7 @@ function validatedPath(input) {
 function main() {
   const options = parseOptions(process.argv.slice(2));
   const prepared = [];
-  for (const id of ['napalm', 'fire', 'burning']) {
+  for (const id of ['napalm', 'fire', 'burning', 'orange']) {
     const fallback = options.get(id);
     const lightInput = options.get(`${id}-light`) ?? fallback ?? options.get(`${id}-dark`);
     const darkInput = options.get(`${id}-dark`) ?? fallback ?? options.get(`${id}-light`);
@@ -84,6 +85,25 @@ function main() {
     target.icon = { light: `./icons/${lightName}`, dark: `./icons/${darkName}` };
     process.stdout.write(`Configured ${entry.id}: ${lightName}, ${darkName}\n`);
   }
+  const themePath = join(root, 'themes', 'napalm-file-icon-theme.json');
+  const theme = JSON.parse(readFileSync(themePath, 'utf8'));
+  for (const entry of prepared) {
+    const darkName = `${entry.id}-dark${entry.dark.extension}`;
+    const lightName = `${entry.id}-light${entry.light.extension}`;
+    const darkId = `_napalm_${entry.id}_dark`;
+    const lightId = `_napalm_${entry.id}_light`;
+    const langId = entry.id === 'napalm' ? 'napalm' : `napalm-${entry.id}`;
+    theme.iconDefinitions[darkId] = {iconPath: `../icons/${darkName}`};
+    theme.iconDefinitions[lightId] = {iconPath: `../icons/${lightName}`};
+    theme.fileExtensions[entry.id] = darkId;
+    theme.languageIds[langId] = darkId;
+    theme.light ??= {};
+    theme.light.fileExtensions ??= {};
+    theme.light.languageIds ??= {};
+    theme.light.fileExtensions[entry.id] = lightId;
+    theme.light.languageIds[langId] = lightId;
+  }
+  writeFileSync(themePath, `${JSON.stringify(theme, null, 2)}\n`, 'utf8');
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 }
 

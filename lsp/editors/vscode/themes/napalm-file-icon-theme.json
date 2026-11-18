@@ -1,0 +1,32 @@
+{
+  "showLanguageModeIcons": true,
+  "iconDefinitions": {
+    "_napalm_flame": {
+      "iconPath": "../icons/flame-32.png"
+    },
+    "_generic_file": {
+      "iconPath": "./generic-file.svg"
+    },
+    "_generic_folder": {
+      "iconPath": "./generic-folder.svg"
+    },
+    "_generic_folder_open": {
+      "iconPath": "./generic-folder-open.svg"
+    }
+  },
+  "file": "_generic_file",
+  "folder": "_generic_folder",
+  "folderExpanded": "_generic_folder_open",
+  "fileExtensions": {
+    "napalm": "_napalm_flame",
+    "burning": "_napalm_flame",
+    "fire": "_napalm_flame",
+    "orange": "_napalm_flame"
+  },
+  "languageIds": {
+    "napalm": "_napalm_flame",
+    "napalm-burning": "_napalm_flame",
+    "napalm-fire": "_napalm_flame",
+    "napalm-orange": "_napalm_flame"
+  }
+}

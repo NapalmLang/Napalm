@@ -18,7 +18,7 @@ function firstDocument() {
     );
 }
 
-function executableFor(document) {
+function executableFor(document, extensionPath) {
     const folder = document && vscode.workspace.getWorkspaceFolder(document.uri);
     const root = folder?.uri.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ??
         (document ? path.dirname(document.uri.fsPath) : undefined);
@@ -28,6 +28,12 @@ function executableFor(document) {
         const resolved = path.isAbsolute(specified) ? specified : path.resolve(root ?? process.cwd(), specified);
         return {command: resolved, cwd: root ?? path.dirname(resolved)};
     }
+    const bundledName = process.platform === 'win32' ? 'napalm-lsp.exe' : 'napalm-lsp';
+    const bundled = path.join(extensionPath, 'server', bundledName);
+    if (fs.existsSync(bundled) && fs.statSync(bundled).isFile()) {
+        return {command: bundled, cwd: root ?? path.dirname(document?.uri.fsPath ?? bundled)};
+    }
+    // Support source checkouts for local extension development.
     if (!root) return null;
     const binary = process.platform === 'win32' ? 'main.exe' : 'main';
     const standalone = process.platform === 'win32' ? 'napalm-lsp.exe' : 'napalm-lsp';
@@ -46,15 +52,20 @@ function executableFor(document) {
 async function activate(context) {
     output = vscode.window.createOutputChannel('Napalm Language Server');
     context.subscriptions.push(output);
+    output.appendLine('Napalm extension activated.');
     const document = firstDocument();
-    const server = executableFor(document);
+    output.appendLine(`Active Napalm document: ${document?.uri.fsPath ?? '(none)'}`);
+    output.appendLine(`Workspace: ${vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '(none)'}`);
+    const server = executableFor(document, context.extensionPath);
     if (!server || !fs.existsSync(server.command)) {
         const message = server ? `The configured Napalm LSP executable was not found: ${server.command}` :
-            'Napalm LSP not found. Build with "napalm --compile lsp/main.napalm" or set napalm.languageServerPath.';
+            'Napalm LSP executable is missing. Install a platform-specific VSIX with the bundled server or set napalm.languageServerPath.';
         output.appendLine(message);
         vscode.window.showWarningMessage(message);
         return;
     }
+    output.appendLine(`Launching LSP: ${server.command}`);
+    output.appendLine(`Working directory: ${server.cwd}`);
     const watcher = vscode.workspace.createFileSystemWatcher('**/*.napalm');
     context.subscriptions.push(watcher);
     const options = {
@@ -71,7 +82,7 @@ async function activate(context) {
         await client.start();
         output.appendLine(`Napalm language server started: ${server.command}`);
     } catch (error) {
-        output.appendLine(`Failed to start Napalm LSP: ${String(error)}`);
+        output.appendLine(`Failed to start Napalm LSP: ${error?.stack ?? String(error)}`);
         vscode.window.showErrorMessage('Could not start the Napalm language server. See the Napalm Language Server output.');
     }
 }

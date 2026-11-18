@@ -96,6 +96,14 @@ Upgrade are managed by the server and cannot be supplied by handlers.
 
 ## Clients and timers
 
+HTTP client helpers are available as `http.get`, `http.getJSON`, and
+`http.postJSON`, both inside and outside `listen`. The global shorthand names
+`get`, `getJSON`, and `postJSON` remain available for compatibility, but user
+declarations take precedence in their lexical scope. For example, you can declare
+`function get() { return 42; }` and still use `http.get(url)` for HTTP requests.
+Route handlers follow the same lexical scoping rules; `listen` does not inject
+client helper bindings into its body.
+
 ```typescript
 async function demo() {
   const r = await get("http://127.0.0.1:3000/");

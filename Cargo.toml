@@ -30,7 +30,7 @@ parking_lot = "0.13.0" # Concurrency primitives
 #triomphe = "0.1.17" # Faster Arc
 rclite = "0.4.2" # Optimized Rc for memory usage
 chrono = "0.4.45" # Date and time library for Rust
-mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually faster
+mimalloc = { version = "0.1.52", features = ["extended"] } # Faster general purpose memory allocator
 tar = "0.4.46" # Archive manipulation library for Rust
 # vfs = "0.13.0" # Virtual file system abstraction for Rust
 zstd = { version = "0.14.4", features = ["zstdmt"] } # .burning compression

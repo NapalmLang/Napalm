@@ -1,4 +1,80 @@
 #[test]
+fn napalm_collections_join_separators_values_and_empty_slots() {
+    run_napalm(r#"
+        const numbers: number[] = [1, 2, 3];
+        const words = ['a', 'é', '😀'];
+        const holes = new Array(3);
+        holes[1] = 'middle';
+        const checks = [numbers.join() === '1,2,3', numbers.join('-') === '1-2-3',
+            words.join('') === 'aé😀', words.join('🌟') === 'a🌟é🌟😀',
+            [].join() === '', [].join('--') === '', ['one'].join('--') === 'one',
+            [null].join() === '', [null, null].join() === ',',
+            [1, null, true, false, ''].join('|') === '1||true|false|',
+            holes.join('/') === '/middle/', new Array(3).join('-') === '--',
+            numbers.join(0) === '10203', numbers.join(null) === '1null2null3',
+            ['a', 'b'].join('\0') === 'a\0b',
+            [[1, 2], [3]].join(';') === '[1, 2];[3]',
+            words.length === 3 && words[1] === 'é' && numbers[2] === 3];
+        const result = checks.reduce((ok, check) => ok && check, true);
+    "#, "true");
+}
+
+#[test]
+fn napalm_collections_join_virtual_conversion_mutation_and_gc() {
+    run_napalm(r#"
+        let log = '';
+        class Text {
+            constructor(text) { this.text = text; }
+            toString() { log += this.text; System.gc(); return this.text; }
+        }
+        const joined = [new Text('a'), null, new Text('b')].join(new Text('-'));
+        const source: any = [null, 'old', 'tail'];
+        class Change {
+            toString() { source[1] = 'new'; source.push('extra'); return 'first'; }
+        }
+        source[0] = new Change();
+        const changed = source.join('|');
+        class Shrink {
+            toString() { source.clear(); System.gc(); return 'only'; }
+        }
+        source[0] = new Shrink();
+        const shrunk = source.join('|');
+        const cycle: any = [];
+        cycle.push(cycle);
+        const result = [joined, log, changed, shrunk, cycle.join()];
+    "#, "[a--b, -ab, first|new|tail, only|||, [[...]]]");
+}
+
+#[test]
+fn napalm_collections_join_conversion_errors_are_catchable() {
+    run_napalm(r#"
+        class Bad { toString() { return 42; } }
+        class Throwing { toString() { throw 'conversion failed'; } }
+        let errors = 0;
+        try { [new Bad()].join(); } catch (e) { errors++; }
+        try { [].join(new Bad()); } catch (e) { errors++; }
+        try { [new Throwing()].join(); } catch (e) { errors++; }
+        try { [].join(new Throwing()); } catch (e) { errors++; }
+        const result = [errors, ['still', 'works'].join(' ')];
+    "#, "[4, still works]");
+}
+
+#[test]
+fn napalm_collections_join_hot_dispatch_and_gc() {
+    run_napalm_checked(r#"
+        const values = ['é', '😀', 'x'];
+        let total = 0;
+        let last = '';
+        for (let i = 0; i < 100; i++) {
+            last = values.join(i % 2 === 0 ? '' : '-');
+            total += last.length;
+            if (i % 20 === 0) System.gc();
+        }
+        const result = [total, last, new Array(1000).fill('a').join('').length];
+    "#, "[400, é-😀-x, 1000]", true);
+}
+
+#[test]
 fn napalm_collections_instance_protocol_inheritance_overrides_and_gc() {
     run_napalm(r#"
         class Base { name = 'base'; }

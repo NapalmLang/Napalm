@@ -327,6 +327,8 @@ enum BuiltinPrimitive {
     DateSet(DateSetField, bool),
     DateToString(DateStringFormat),
     DateToJson,
+
+    ListJoinStrings,
 }
 
 /// Reserves all method symbols and primitive IDs required by the core runtime.
@@ -895,6 +897,64 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let null = b.const_null();
     b.ret(null);
     manifest.list_remove = Some((remove, b.finish()));
+
+    // Convert elements through the normal virtual protocol, then join all parts
+    // in one native allocation instead of repeatedly copying a growing String.
+    manifest.register(program, instance(BuiltinClass::List), "__joinStrings",
+        MethodKind::Method, 1, BuiltinPrimitive::ListJoinStrings);
+    let join_primitive = manifest.bindings.last().unwrap().primitive;
+    let subscript = program.intern_method("[]", MethodKind::SubscriptGetter, 1);
+    for arity in [0, 1] {
+        let method = program.intern_method("join", MethodKind::Method, arity);
+        let params = if arity == 0 { vec![Type::List(None)] }
+            else { vec![Type::List(None), Type::Top] };
+        let mut b = Builder::new(program, module, "List.join", FunctionKind::Method,
+            params, Type::String);
+        let source = b.param(0);
+        let len = b.emit1(Inst::ListLen { list: source }, Type::Int32);
+        let separator = if arity == 0 {
+            b.const_string(",")
+        } else {
+            let separator = b.param(1);
+            b.invoke_typed(separator, to_string_method, Vec::new(), Type::String)
+        };
+        let parts = b.emit1(Inst::AllocList { capacity: Some(len) }, Type::List(None));
+        let empty = b.const_string("");
+        let null = b.const_null();
+        let header = b.new_block(&[]);
+        let index = b.add_block_param(header, Type::Int32);
+        let body = b.new_block(&[]);
+        let convert = b.new_block(&[]);
+        let append = b.new_block(&[]);
+        let text = b.add_block_param(append, Type::String);
+        let done = b.new_block(&[]);
+        let zero = b.const_i32(0);
+        b.jump(header, vec![zero]);
+        b.position_at(header);
+        let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+        b.branch(more, body, vec![], done, vec![]);
+        b.position_at(body);
+        // Subscript dispatch returns null if a toString() callback shortened
+        // the source. The initial length still determines the separator count.
+        let boxed_index = b.emit1(Inst::Int32ToNum { value: index }, Type::Num);
+        let item = b.invoke(source, subscript, vec![boxed_index]);
+        let missing = b.emit1(Inst::RefEq { left: item, right: null }, Type::Bool);
+        b.branch(missing, append, vec![empty], convert, vec![]);
+        b.position_at(convert);
+        let converted = b.invoke_typed(item, to_string_method, Vec::new(), Type::String);
+        b.jump(append, vec![converted]);
+        b.position_at(append);
+        b.emit0(Inst::ListAppend { list: parts, value: text });
+        let one = b.const_i32(1);
+        let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+        b.jump(header, vec![next]);
+        b.position_at(done);
+        let result = b.emit1(Inst::CallPrimitive {
+            primitive: join_primitive, args: vec![parts, separator],
+        }, Type::String);
+        b.ret(result);
+        manifest.list_functions.push((method, b.finish()));
+    }
 
     // Higher-order List operations stay in WIR instead of Host primitives. This
     // gives callbacks ordinary Napalm call semantics, lets GC maps remain precise,
@@ -3105,6 +3165,26 @@ fn execute_primitive(
         }
 
         ListCount => Ok(Value::from_num(context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))? as f64)),
+        ListJoinStrings => {
+            let len = context.list_len(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            let separator = context.string_utf8(argument(args, 0)?)
+                .ok_or_else(|| RuntimeError::new("join separator toString() must return a valid UTF-8 String"))?;
+            let mut byte_len = separator.len().checked_mul(len.saturating_sub(1));
+            for index in 0..len {
+                let item = context.list_get(this, index).unwrap();
+                let text = context.string_utf8(item)
+                    .ok_or_else(|| RuntimeError::new("join element toString() must return a valid UTF-8 String"))?;
+                byte_len = byte_len.and_then(|size| size.checked_add(text.len()));
+            }
+            let mut output = string_buffer(byte_len)?;
+            for index in 0..len {
+                if index != 0 { output.push_str(separator); }
+                let item = context.list_get(this, index).unwrap();
+                output.push_str(context.string_utf8(item).unwrap());
+            }
+            Ok(context.allocate_string(output))
+        }
         ListConcat => {
             let rhs = argument(args, 0)?;
             let left_len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;

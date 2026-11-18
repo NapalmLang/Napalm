@@ -307,7 +307,7 @@ export function handleMessage(state, request) {
             if (hasId) respond(id, null);
         } catch (error) {
             if (hasId) respondError(id, -32602, "Invalid document notification params");
-            else logError("Rejected malformed document notification: " + method);
+            else logError("Failed to process " + method + ": " + `${error}`);
         }
         return false;
     }

@@ -1385,6 +1385,7 @@ that operation introduces null; `length` is read-only. Use
 | `map(callback)` | New list; calls `callback(element)` once per element. |
 | `filter(callback)` | New list with elements whose condition is truthy. |
 | `reduce(callback, initial)` | Accumulates through `callback(accumulator, element)`. |
+| `join(separator = ",")` | String containing each element's text separated by `separator`; does not modify the list. |
 | `+ otherList` | New shallow concatenation. |
 | `[range]` | New list with the selected segment. |
 | `iterate(cursor)`, `iteratorValue(cursor)` | Iteration protocol. |
@@ -1399,8 +1400,20 @@ const source = [1, 2, 3, 4];
 System.print(source.map(x => x * 2));       // [2, 4, 6, 8]
 System.print(source.filter(x => x > 2));    // [3, 4]
 System.print(source.reduce((a, x) => a + x, 0)); // 10
+System.print(source.join());               // 1,2,3,4
+System.print(source.join(" - "));          // 1 - 2 - 3 - 4
 System.print(source);                      // [1, 2, 3, 4]
 ```
+
+`join()` returns `""` for an empty list. An empty separator concatenates the
+elements directly. Null elements (including unfilled array slots) contribute
+empty text. Other elements and an explicitly supplied separator use their
+`toString()` method, including user overrides; conversion errors propagate.
+An explicit null separator therefore becomes `"null"`. Nested lists retain
+Napalm's bracketed representation: `[[1, 2], [3]].join(";")` is `"[1, 2];[3]"`.
+The initial length is captured before conversion; elements are then read in
+order, so changes made by a `toString()` method to later elements are visible,
+and newly appended elements are ignored.
 
 `forEach`, `find`, `findIndex`, `sort`, `splice`, and the complete JS Array
 catalog are not installed. Use a loop or compose the available operations.

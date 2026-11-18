@@ -3,10 +3,13 @@ import {readFrame, logError} from "./src/transport";
 import {createServerState, handleMessage, reportParseError} from "./src/server";
 
 const state = createServerState();
+const traceProtocol = Process.getenv("NAPALM_LSP_TRACE") === "1";
+if (traceProtocol) logError("LSP started; waiting for JSON-RPC frames");
 try {
     while (true) {
         const frame = readFrame();
         if (frame === null) break;
+        if (traceProtocol && frame["parsed"]) logError("JSON-RPC frame received");
         if (!frame["parsed"]) {
             reportParseError();
             continue;
@@ -16,7 +19,7 @@ try {
         }
     }
 } catch (error) {
-    logError("Protocol transport failed");
+    logError("Unhandled LSP failure: " + `${error}`);
     Process.exit(1);
 }
 Process.exit(state["shutdown"] ? 0 : 1);

@@ -29,7 +29,7 @@ const GLOBAL_TYPES = stringSet(
     "ConcurrentSet Range Proxy"
 );
 
-function get(node, field) {
+function nodeField(node, field) {
     if (node === null) return null;
     if (node[field] === null) return null;
     return node[field];
@@ -71,7 +71,7 @@ function declarationOutline(node) {
     const kind = node.kind;
     if (kind === "ExportDeclaration" || kind === "DeclareStatement" ||
         kind === "DecoratedDeclaration" || kind === "ExportDefaultDeclaration") {
-        return declarationOutline(get(node, "declaration"));
+        return declarationOutline(nodeField(node, "declaration"));
     }
     if (kind === "VariableDeclaration") {
         const entries = [];
@@ -82,7 +82,7 @@ function declarationOutline(node) {
         }
         return entries;
     }
-    const id = namedNode(get(node, "id"));
+    const id = namedNode(nodeField(node, "id"));
     if (id === null) return [];
     let category = null;
     if (kind === "FunctionDeclaration") category = "function";
@@ -254,7 +254,7 @@ class SemanticAnalyzer {
         const kind = node.kind;
         if (kind === "ExportDeclaration" || kind === "DeclareStatement" ||
             kind === "DecoratedDeclaration" || kind === "ExportDefaultDeclaration") {
-            this.predeclare(get(node, "declaration"), targetScope);
+            this.predeclare(nodeField(node, "declaration"), targetScope);
         } else if (kind === "VariableDeclaration") {
             const category = node.declarationKind === "const" ? "constant" : "variable";
             for (const item of node.declarations) {
@@ -299,8 +299,8 @@ class SemanticAnalyzer {
     typeParameters(params, targetScope) {
         for (const param of params) this.bind(targetScope, param.name, "type", "type");
         for (const param of params) {
-            this.visitType(get(param, "constraint"), targetScope);
-            this.visitType(get(param, "defaultType"), targetScope);
+            this.visitType(nodeField(param, "constraint"), targetScope);
+            this.visitType(nodeField(param, "defaultType"), targetScope);
         }
     }
 
@@ -309,8 +309,8 @@ class SemanticAnalyzer {
             this.declarePattern(param.name, targetScope, "parameter");
             this.patternOwner(param.name, param);
             this.patternUses(param.name, targetScope);
-            this.visitType(get(param, "annotation"), targetScope);
-            this.visit(get(param, "defaultValue"), targetScope);
+            this.visitType(nodeField(param, "annotation"), targetScope);
+            this.visit(nodeField(param, "defaultValue"), targetScope);
         }
     }
 
@@ -318,22 +318,22 @@ class SemanticAnalyzer {
         const fn = scope(parent, "function");
         this.rememberScope(fn, node);
         if (node.kind === "FunctionExpression") {
-            this.bind(fn, get(node, "id"), "function", "value");
-            this.ownerOf(get(node, "id"), node);
+            this.bind(fn, nodeField(node, "id"), "function", "value");
+            this.ownerOf(nodeField(node, "id"), node);
         }
-        if (get(node, "typeParameters") !== null) this.typeParameters(node.typeParameters, fn);
+        if (nodeField(node, "typeParameters") !== null) this.typeParameters(node.typeParameters, fn);
         this.parameters(node.params, fn);
-        this.visitType(get(node, "returnType"), fn);
-        this.visit(get(node, "body"), fn);
+        this.visitType(nodeField(node, "returnType"), fn);
+        this.visit(nodeField(node, "body"), fn);
     }
 
     classBody(node, parent) {
         const cls = scope(parent, "class");
         this.rememberScope(cls, node);
         cls.classScope = cls;
-        if (node.kind === "ClassExpression") this.bindBoth(cls, get(node, "id"), "class");
+        if (node.kind === "ClassExpression") this.bindBoth(cls, nodeField(node, "id"), "class");
         this.typeParameters(node.typeParameters, cls);
-        this.visit(get(node, "superClass"), cls);
+        this.visit(nodeField(node, "superClass"), cls);
         for (const type of node["implements"]) this.visitType(type, cls);
         // All members are known before their bodies, so this.method can navigate forward.
         // A getter and setter may legally share a property name.
@@ -342,7 +342,7 @@ class SemanticAnalyzer {
             if (member.kind !== "MethodDefinition" && member.kind !== "FieldDefinition") continue;
             if (member.name.kind !== "Identifier") continue;
             const name = member.name.name;
-            const side = get(member, "memberKind");
+            const side = nodeField(member, "memberKind");
             if (side === "get" || side === "set") {
                 const previous = accessorSides.get(name);
                 if (previous !== null) {
@@ -366,8 +366,8 @@ class SemanticAnalyzer {
                 for (const decorator of member.decorators) this.visit(decorator, cls);
                 this.propertyNameUses(member.name, cls);
                 if (member.kind === "FieldDefinition") {
-                    this.visitType(get(member, "annotation"), cls);
-                    this.visit(get(member, "initializer"), cls);
+                    this.visitType(nodeField(member, "annotation"), cls);
+                    this.visit(nodeField(member, "initializer"), cls);
                 } else this.functionBody(member, cls);
             }
         }
@@ -394,8 +394,8 @@ class SemanticAnalyzer {
         else if (kind === "OptionalType" || kind === "RestType") this.visitType(node.base, targetScope);
         else if (kind === "TypeOperator") this.visitType(node.argument, targetScope);
         else if (kind === "ParenthesizedType") {
-            this.visitType(get(node, "inner"), targetScope);
-            if (get(node, "params") !== null) for (const param of node.params) this.visitType(param, targetScope);
+            this.visitType(nodeField(node, "inner"), targetScope);
+            if (nodeField(node, "params") !== null) for (const param of node.params) this.visitType(param, targetScope);
         } else if (kind === "TupleType") for (const item of node.elements) this.visitType(item, targetScope);
         else if (kind === "ObjectType") {
             for (const member of node.members) {
@@ -405,7 +405,7 @@ class SemanticAnalyzer {
         } else if (kind === "MethodType" || kind === "FunctionType") {
             const child = scope(targetScope, "function");
             this.parameters(node.params, child);
-            this.visitType(get(node, "returnType"), child);
+            this.visitType(nodeField(node, "returnType"), child);
         }
     }
 
@@ -433,8 +433,8 @@ class SemanticAnalyzer {
         if (kind === "VariableDeclaration") {
             for (const item of node.declarations) {
                 this.patternUses(item.id, targetScope);
-                this.visitType(get(item, "annotation"), targetScope);
-                this.visit(get(item, "init"), targetScope);
+                this.visitType(nodeField(item, "annotation"), targetScope);
+                this.visit(nodeField(item, "init"), targetScope);
             }
             return;
         }
@@ -461,18 +461,18 @@ class SemanticAnalyzer {
                 this.bind(members, member.name, "enumMember", "value");
                 this.ownerOf(member.name, member);
             }
-            for (const member of node.members) this.visit(get(member, "initializer"), members);
+            for (const member of node.members) this.visit(nodeField(member, "initializer"), members);
             return;
         }
         if (kind === "ImportDeclaration") return;
         if (kind === "ExportDeclaration" || kind === "ExportDefaultDeclaration" ||
             kind === "DeclareStatement" || kind === "DecoratedDeclaration") {
-            if (get(node, "decorators") !== null) for (const item of node.decorators) this.visit(item, targetScope);
-            this.visit(get(node, "declaration"), targetScope);
+            if (nodeField(node, "decorators") !== null) for (const item of node.decorators) this.visit(item, targetScope);
+            this.visit(nodeField(node, "declaration"), targetScope);
             return;
         }
         if (kind === "ExportNamedDeclaration") {
-            if (get(node, "source") === null) for (const item of node.specifiers) {
+            if (nodeField(node, "source") === null) for (const item of node.specifiers) {
                 this.reference(item.local, targetScope, node.typeOnly ? "type" : "value", true);
             }
             return;
@@ -483,8 +483,8 @@ class SemanticAnalyzer {
             kind === "AwaitExpression" || kind === "YieldExpression" ||
             kind === "UnaryExpression" || kind === "UpdateExpression" ||
             kind === "Decorator" || kind === "ParenthesizedExpression") {
-            this.visit(get(node, "expression"), targetScope);
-            this.visit(get(node, "argument"), targetScope);
+            this.visit(nodeField(node, "expression"), targetScope);
+            this.visit(nodeField(node, "argument"), targetScope);
             return;
         }
         if (kind === "MemberExpression") {
@@ -498,7 +498,7 @@ class SemanticAnalyzer {
         if (kind === "CallExpression" || kind === "NewExpression") {
             this.visit(node.callee, targetScope);
             for (const item of node.arguments) this.visit(item, targetScope);
-            if (get(node, "typeArguments") !== null) for (const type of node.typeArguments) this.visitType(type, targetScope);
+            if (nodeField(node, "typeArguments") !== null) for (const type of node.typeArguments) this.visitType(type, targetScope);
             return;
         }
         if (kind === "AssignmentPattern") {
@@ -562,14 +562,14 @@ class SemanticAnalyzer {
             const child = scope(targetScope, "block");
             this.rememberScope(child, node);
             if (kind === "ForStatement") {
-                this.predeclare(get(node, "init"), child);
-                this.visit(get(node, "init"), child);
-                this.visit(get(node, "test"), child);
-                this.visit(get(node, "update"), child);
+                this.predeclare(nodeField(node, "init"), child);
+                this.visit(nodeField(node, "init"), child);
+                this.visit(nodeField(node, "test"), child);
+                this.visit(nodeField(node, "update"), child);
             } else {
-                this.predeclare(get(node, "left"), child);
-                this.visit(get(node, "right"), child);
-                this.visit(get(node, "left"), child);
+                this.predeclare(nodeField(node, "left"), child);
+                this.visit(nodeField(node, "right"), child);
+                this.visit(nodeField(node, "left"), child);
             }
             this.visit(node.body, child);
             return;
@@ -578,7 +578,7 @@ class SemanticAnalyzer {
             this.visit(node.discriminant, targetScope);
             const child = scope(targetScope, "block");
             for (const item of node.cases) {
-                this.visit(get(item, "test"), child);
+                this.visit(nodeField(item, "test"), child);
                 for (const stmt of item.consequent) this.predeclare(stmt, child);
             }
             for (const item of node.cases) for (const stmt of item.consequent) this.visit(stmt, child);
@@ -586,15 +586,15 @@ class SemanticAnalyzer {
         }
         if (kind === "TryStatement") {
             this.visit(node.block, targetScope);
-            this.visit(get(node, "handler"), targetScope);
-            this.visit(get(node, "finalizer"), targetScope);
+            this.visit(nodeField(node, "handler"), targetScope);
+            this.visit(nodeField(node, "finalizer"), targetScope);
             return;
         }
         if (kind === "CatchClause") {
             const child = scope(targetScope, "block");
             this.rememberScope(child, node);
-            this.declarePattern(get(node, "param"), child, "parameter");
-            this.patternOwner(get(node, "param"), node);
+            this.declarePattern(nodeField(node, "param"), child, "parameter");
+            this.patternOwner(nodeField(node, "param"), node);
             this.visit(node.body, child);
             return;
         }

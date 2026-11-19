@@ -1,7 +1,0 @@
-.vscode/**
-.vscodeignore
-tests/**
-scripts/**
-windows/**
-samples/**
-**/*.test.mjs

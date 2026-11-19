@@ -8,7 +8,7 @@
  */
 import {spawnSync} from 'node:child_process';
 import {
-    chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync,
+    chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync,
     readFileSync, readSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import {createHash} from 'node:crypto';
@@ -26,6 +26,7 @@ export type Options = {
     binary: string | null;
     out: string;
     skipCompile: boolean;
+    checkAssets: boolean;
     skipNpm: boolean;
     skipTests: boolean;
     install: boolean;
@@ -48,6 +49,7 @@ export function parseOptions(argv: string[], host = detectTarget()): Options {
         binary: null,
         out: path.join('dist', 'vscode'),
         skipCompile: false,
+        checkAssets: false,
         skipNpm: false,
         skipTests: false,
         install: false,
@@ -79,6 +81,9 @@ export function parseOptions(argv: string[], host = detectTarget()): Options {
             case '--skip-compile':
                 options.skipCompile = true;
                 break;
+            case '--check-assets':
+                options.checkAssets = true;
+                break;
             case '--skip-npm':
                 options.skipNpm = true;
                 break;
@@ -95,7 +100,7 @@ export function parseOptions(argv: string[], host = detectTarget()): Options {
                 throw new Error(`Unknown option: ${name}. Use --help for usage.`);
         }
     }
-    if (options.help) return options;
+    if (options.help || options.checkAssets) return options;
     const supported = ['win32-x64', 'win32-arm64', 'linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64'];
     if (!supported.includes(options.target)) throw new Error(`Unsupported target: ${options.target}`);
     if (!options.skipCompile && options.binary !== null) {
@@ -143,19 +148,55 @@ function readManifest(): {name: string; version: string; publisher?: string; lic
     return JSON.parse(readFileSync(manifestPath, 'utf8'));
 }
 
-export function pngSize(data: Buffer): {width: number; height: number} {
-    if (data.length < 33 || !data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
-        throw new Error('Not a valid PNG image');
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] as const;
+
+function firstBytesHex(data: Uint8Array, count = 16): string {
+    return Buffer.from(data.subarray(0, count)).toString('hex') || '(empty file)';
+}
+
+function detectedFormat(data: Uint8Array): string {
+    if (data.length === 0) return 'empty file';
+    if (data.length >= 4 && data[0] === 0x00 && data[1] === 0x00 && data[2] === 0x01 && data[3] === 0x00) return 'Windows ICO';
+    if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return 'JPEG';
+    if (data.length >= 6 && String.fromCharCode(...data.subarray(0, 6)).startsWith('GIF8')) return 'GIF';
+    if (data.length >= 12 && String.fromCharCode(...data.subarray(0, 4)) === 'RIFF' &&
+        String.fromCharCode(...data.subarray(8, 12)) === 'WEBP') return 'WebP';
+    const prefix = Buffer.from(data.subarray(0, 128)).toString('utf8').replace(/^\uFEFF/, '').trimStart();
+    if (prefix.startsWith('<svg') || prefix.startsWith('<?xml')) return 'XML/SVG';
+    if (prefix.startsWith('<!DOCTYPE html') || prefix.startsWith('<html')) return 'HTML (possibly a download error page)';
+    return 'unknown format';
+}
+
+/** Read the dimensions of a PNG, including its source path in failures. */
+export function pngSize(data: Uint8Array, source = 'PNG data'): {width: number; height: number} {
+    const validSignature = data.length >= PNG_SIGNATURE.length &&
+        PNG_SIGNATURE.every((byte, index) => data[index] === byte);
+    if (!validSignature) {
+        throw new Error(`Not a valid PNG image: ${source} (${data.length} bytes; detected ${detectedFormat(data)}; ` +
+            `first bytes: ${firstBytesHex(data)}). Expected PNG signature 89504e470d0a1a0a.`);
     }
-    if (data.readUInt32BE(8) !== 13 || data.toString('ascii', 12, 16) !== 'IHDR') {
-        throw new Error('PNG image has no valid IHDR header');
+    if (data.length < 33 || data[8] !== 0x00 || data[9] !== 0x00 || data[10] !== 0x00 || data[11] !== 0x0d ||
+        data[12] !== 0x49 || data[13] !== 0x48 || data[14] !== 0x44 || data[15] !== 0x52) {
+        throw new Error(`Invalid PNG IHDR chunk: ${source} (${data.length} bytes)`);
     }
-    const width = data.readUInt32BE(16);
-    const height = data.readUInt32BE(20);
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const width = view.getUint32(16, false);
+    const height = view.getUint32(20, false);
     if (!width || !height || width > 8192 || height > 8192) {
-        throw new Error(`Unexpected PNG dimensions: ${width}x${height}`);
+        throw new Error(`Unexpected PNG dimensions at ${source}: ${width}x${height}`);
     }
     return {width, height};
+}
+
+function readPng(file: string): Buffer {
+    let data: Buffer;
+    try {
+        data = readFileSync(file);
+    } catch (error) {
+        throw new Error(`Cannot read image ${file}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    pngSize(data, file);
+    return data;
 }
 
 /** A Windows ICO supports storing a complete PNG in each icon directory entry. */
@@ -187,33 +228,44 @@ function writeIfDifferent(destination: string, data: Buffer): void {
     writeFileSync(destination, data);
 }
 
-/** Copies the user's flame artwork and extension logo, and regenerates the ICO. */
+/** Validate all assets before copying, so a corrupt source cannot leave partial output. */
 export function prepareBranding(extensionRoot = EXTENSION_ROOT): void {
     const source = path.join(extensionRoot, 'branding');
     const dest = path.join(extensionRoot, 'icons');
     const images: Array<{size: number; data: Buffer}> = [];
     for (const size of BRAND_SIZES) {
         const input = path.join(source, `flame-${size}.png`);
-        const data = readFileSync(input);
-        const dimensions = pngSize(data);
+        const data = readPng(input);
+        const dimensions = pngSize(data, input);
         if (dimensions.width !== size || dimensions.height !== size) {
-            throw new Error(`Expected ${size}x${size} image at ${input}, got ${dimensions.width}x${dimensions.height}`);
+            throw new Error(`Expected ${size}x${size} PNG at ${input}, got ${dimensions.width}x${dimensions.height}`);
         }
-        writeIfDifferent(path.join(dest, `flame-${size}.png`), data);
         images.push({size, data});
     }
-    const logo = readFileSync(path.join(source, 'extension-logo-256.png'));
-    const logoSize = pngSize(logo);
-    if (logoSize.width !== 256 || logoSize.height !== 256) throw new Error('Extension Marketplace logo must be 256x256 PNG');
+    const logoPath = path.join(source, 'extension-logo-256.png');
+    const logo = readPng(logoPath);
+    const logoSize = pngSize(logo, logoPath);
+    if (logoSize.width !== 256 || logoSize.height !== 256) {
+        throw new Error(`Marketplace logo must be 256x256 PNG: ${logoPath}; got ${logoSize.width}x${logoSize.height}`);
+    }
+
+    for (const name of ['generic-file.png', 'generic-folder.png', 'generic-folder-open.png']) {
+        const file = path.join(extensionRoot, 'themes', name);
+        const size = pngSize(readPng(file), file);
+        if (size.width !== 48 || size.height !== 48) {
+            throw new Error(`Expected 48x48 theme PNG: ${file}; got ${size.width}x${size.height}`);
+        }
+    }
+
+    // All inputs have passed validation. Staging is now safe to begin.
+    for (const {size, data} of images) {
+        writeIfDifferent(path.join(dest, `flame-${size}.png`), data);
+    }
     writeIfDifferent(path.join(dest, 'extension-logo-256.png'), logo);
     writeIfDifferent(path.join(dest, 'napalm-file.ico'), icoFromPngs(images));
 
-    for (const name of ['generic-file.svg', 'generic-folder.svg', 'generic-folder-open.svg']) {
-        const file = path.join(extensionRoot, 'themes', name);
-        const size = pngSize(readFileSync(file));
-        if (size.width !== 48 || size.height !== 48) throw new Error(`Expected 48x48 theme asset: ${file}`);
-    }
-    console.log('[napalm-vscode] Branding prepared: 5 flame sizes, extension logo, ICO and theme PNGs.');
+    console.log('[napalm-vscode] Branding validated: five flame PNGs, Marketplace logo and three theme PNGs.');
+    console.log('[napalm-vscode] Branding staged: flame icons, extension logo and Windows ICO.');
 }
 
 function validateManifest(): ReturnType<typeof readManifest> {
@@ -290,16 +342,48 @@ function installedVsce(): string {
     return cli;
 }
 
-function installVsix(file: string): void {
-    if (process.platform === 'win32') {
-        // Windows extension CLI is normally code.cmd. Quote the path so spaces
-        // and shell metacharacters within the VSIX pathname are not evaluated.
-        const safe = file.replaceAll('%', '%%').replaceAll('"', '');
-        const command = `code --install-extension "${safe}" --force`;
-        run(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', command], REPOSITORY_ROOT);
-    } else {
-        run('code', ['--install-extension', file, '--force'], REPOSITORY_ROOT);
+/**
+ * Build a VS Code CLI invocation without nested cmd.exe quoting on Windows.
+ *
+ * code.cmd is typically a shell wrapper. Passing an absolute, quoted VSIX
+ * path through Bun -> cmd.exe -> code.cmd can preserve the quote characters
+ * literally. Running from the artifact directory with a validated basename
+ * eliminates both the quoting ambiguity and shell metacharacter injection.
+ */
+export function vsixInstallInvocation(file: string, platform = process.platform): {
+    command: string;
+    args: string[];
+    cwd: string;
+    shell: boolean;
+} {
+    const absolute = path.resolve(file);
+    const directory = path.dirname(absolute);
+    if (platform === 'win32') {
+        const filename = path.basename(absolute);
+        if (!/^[A-Za-z0-9][A-Za-z0-9._@-]*\.vsix$/i.test(filename)) {
+            throw new Error(`Unsafe VSIX filename for Windows cmd.exe: ${filename}`);
+        }
+        return {
+            command: process.env.ComSpec || 'cmd.exe',
+            args: ['/d', '/s', '/c', `code --install-extension ${filename} --force`],
+            cwd: directory,
+            shell: false,
+        };
     }
+    return {
+        command: 'code',
+        args: ['--install-extension', absolute, '--force'],
+        cwd: directory,
+        shell: false,
+    };
+}
+
+function installVsix(file: string): void {
+    if (!existsSync(file)) {
+        throw new Error(`Cannot install missing VSIX: ${file}`);
+    }
+    const invocation = vsixInstallInvocation(file);
+    run(invocation.command, invocation.args, invocation.cwd, invocation.shell);
 }
 
 function verifyPackage(vsix: string, binary: {name: string; size: number}): void {
@@ -335,6 +419,7 @@ export function printHelp(): void {
         `  --napalm PATH     Override the Napalm compiler executable\n` +
         `  --out DIR         VSIX output directory (default: dist/vscode)\n` +
         `  --skip-compile    Use an existing compiled LSP binary\n` +
+        `  --check-assets    Validate icons and logo without compiling or packaging\n` +
         `  --binary PATH     With --skip-compile, use a specific native LSP binary\n` +
         `  --skip-npm        Skip NPM install/ci (dependencies must exist)\n` +
         `  --skip-tests      Skip extension tests\n` +
@@ -346,6 +431,11 @@ export function printHelp(): void {
 export function build(options: Options): string {
     console.log(`[napalm-vscode] Building for ${options.target} from ${REPOSITORY_ROOT}`);
     const manifest = validateManifest();
+    if (options.checkAssets) {
+        prepareBranding();
+        console.log('[napalm-vscode] PASS: all branding assets are valid PNG images.');
+        return "";
+    }
     if (options.publish) {
         if (!manifest.publisher || manifest.publisher === 'napalm-local') {
             throw new Error('Configure your real Marketplace publisher ID in package.json before using --publish');
@@ -354,17 +444,42 @@ export function build(options: Options): string {
             throw new Error('Set VSCE_PAT in the environment; do not put Marketplace credentials in source control');
         }
     }
-    const compiled = compileNapalm(options);
+    // Check artwork before compiling the potentially large Napalm executable.
     prepareBranding();
+    const compiled = compileNapalm(options);
     if (!options.skipNpm) {
         const lockfile = existsSync(path.join(EXTENSION_ROOT, 'package-lock.json'));
-        runNpm([lockfile ? 'ci' : 'install', '--no-audit', '--no-fund']);
+        runNpm([lockfile ? 'ci' : 'install', '--include=dev', '--no-audit', '--no-fund']);
     }
     if (!options.skipTests) {
-        runNpm(['run', 'typecheck']);
-        runNpm(['test']);
-        // The build script lives outside the VS Code extension and has separate tests.
-        run(process.execPath, ['--experimental-strip-types', '--test', path.join('lsp', 'tests', 'build-vscode.test.mjs')], REPOSITORY_ROOT);
+        // Use the installed tools directly. An older local package.json may not
+        // declare "typecheck" or "test" scripts, even when the tools are installed.
+        // Node.js is required for npm and @vscode/vsce, independently of Bun.
+        const node = process.platform === 'win32' ? 'node.exe' : 'node';
+        const tsc = path.join(EXTENSION_ROOT, 'node_modules', 'typescript', 'bin', 'tsc');
+        if (!existsSync(tsc)) {
+            throw new Error('TypeScript compiler not installed: ' + tsc +
+                '. Run the builder without --skip-npm, or npm install in lsp/editors/vscode.');
+        }
+        const nodeTypes = path.join(EXTENSION_ROOT, 'node_modules', '@types', 'node', 'package.json');
+        if (!existsSync(nodeTypes)) {
+            throw new Error('Node.js type declarations are missing: ' + nodeTypes +
+                '. Run npm install --include=dev in lsp/editors/vscode, or run the builder without --skip-npm.');
+        }
+        run(node, [tsc, '--project', path.join('lsp', 'tsconfig.build-vscode.json')], REPOSITORY_ROOT);
+
+        const testDirectory = path.join(EXTENSION_ROOT, 'tests');
+        const extensionTests = readdirSync(testDirectory)
+            .filter((name) => name.endsWith('.test.mjs'))
+            .sort()
+            .map((name) => path.join(testDirectory, name));
+        if (extensionTests.length === 0) {
+            throw new Error('No VS Code extension tests found in ' + testDirectory);
+        }
+        run(node, ['--test', ...extensionTests], EXTENSION_ROOT);
+
+        // The build script lives outside the VS Code extension and has its own tests.
+        run(node, ['--test', path.join(REPOSITORY_ROOT, 'lsp', 'tests', 'build-vscode.test.mjs')], REPOSITORY_ROOT);
     }
     const binary = stageServer(compiled, options.target);
     const outputFolder = asAbsolute(options.out);

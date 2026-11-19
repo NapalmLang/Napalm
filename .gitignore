@@ -15,4 +15,7 @@ run_log.txt
 pnpm-lock.yaml
 node_modules
 *.burning
+*.exe
+package-lock.json
+dist
 scripts/__napalm_package_example__/

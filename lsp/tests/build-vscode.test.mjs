@@ -89,3 +89,45 @@ test('help is available without a compiler, npm installation or Napalm runtime',
     assert.match(output, /--skip-compile/);
     assert.match(output, /--publish/);
 });
+
+test('invalid PNG reports its full path, detected format and initial bytes', () => withTemp((root) => {
+    const branding = path.join(root, 'branding');
+    const themes = path.join(root, 'themes');
+    mkdirSync(branding, {recursive: true});
+    mkdirSync(themes, {recursive: true});
+    for (const size of BRAND_SIZES) writeFileSync(path.join(branding, `flame-${size}.png`), flame(size));
+    writeFileSync(path.join(branding, 'extension-logo-256.png'),
+        readFileSync(path.join(EXTENSION_ROOT, 'branding', 'extension-logo-256.png')));
+    for (const file of ['generic-file.png', 'generic-folder.png', 'generic-folder-open.png']) {
+        writeFileSync(path.join(themes, file), readFileSync(path.join(EXTENSION_ROOT, 'themes', file)));
+    }
+    const damaged = path.join(branding, 'flame-64.png');
+    writeFileSync(damaged, '<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+    assert.throws(() => prepareBranding(root), (error) =>
+        error.message.includes(damaged) && error.message.includes('XML/SVG') &&
+        error.message.includes('first bytes:'));
+    assert.equal(readFileSync(damaged, 'utf8').startsWith('<svg'), true);
+    assert.equal(readFileSync(path.join(branding, 'flame-16.png')).equals(flame(16)), true);
+}));
+
+test('read PNG dimensions correctly from a Uint8Array slice with a nonzero byteOffset', () => {
+    const img = flame(32);
+    const backed = Buffer.concat([Buffer.alloc(17), img, Buffer.alloc(19)]);
+    const part = new Uint8Array(backed.buffer, backed.byteOffset + 17, img.length);
+    assert.deepEqual(pngSize(part), {width: 32, height: 32});
+});
+
+test('check-assets mode does not require a compiler or binary', () => {
+    const opts = parseOptions(['--check-assets'], 'win32-x64');
+    assert.equal(opts.checkAssets, true);
+    assert.equal(opts.skipCompile, false);
+});
+
+// Regression: packaging must not depend on script names from a stale manifest.
+test('builder invokes TypeScript and extension tests directly', () => {
+    const builder = readFileSync(new URL('../build-vscode.ts', import.meta.url), 'utf8');
+    assert.ok(builder.includes("node_modules', 'typescript', 'bin', 'tsc"));
+    assert.ok(builder.includes("run(node, ['--test', ...extensionTests]"));
+    assert.ok(!builder.includes("runNpm(['run', 'typecheck'])"));
+    assert.ok(!builder.includes("runNpm(['test'])"));
+});

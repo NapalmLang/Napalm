@@ -1,0 +1,218 @@
+THE SOCIALIST ANTI-LICENSE (TSAL-1.0)
+Version 1.0 — 19 November 2026
+
+Copyright (c) 2026 Andrés Brugarolas
+License contact: brugarolas.92@gmail.com
+
+Despite its name, this is a conditional copyright license. It is not a
+waiver of copyright, a dedication to the public domain, or an OSI-approved
+open-source license. Its enforceability depends on applicable law.
+
+PREAMBLE — CODE FOR THOSE WHO BUILD, NOT THOSE WHO OPPRESS
+
+Software is produced by human labor, collective knowledge, shared infrastructure,
+and generations of people who freely passed ideas to one another. This work is
+published in the conviction that technology should increase ordinary people's
+freedom, dignity, solidarity, and capacity to act together. Its author takes a
+communist position: the fruits of collective labor should serve social needs,
+not become unpaid fuel for institutions whose business is domination, coercion,
+surveillance, incarceration, or organized violence. No worker should have to
+surrender the moral meaning of their labor merely because a machine can execute it.
+
+This license therefore makes a deliberate distinction. Individuals may learn,
+create, experiment, and share. Organizations that contribute real work to the
+commons earn the same freedom. Other companies must ask, but silence is not a
+veto: after fifteen days without an express decision, permission is automatic.
+Institutions of repression and organized reaction do not receive a license.
+The source code is offered in solidarity, not in political neutrality. This is
+both a copyright notice and a declaration that our labor is not theirs to command.
+
+1. DEFINITIONS
+
+1.1. “Software” means the original source code, documentation, and other
+copyrightable material expressly distributed by a rights holder under TSAL-1.0,
+including covered modifications. It does not include separately licensed
+third-party material merely bundled with, linked to, or referenced by the Software.
+
+1.2. “Licensor” means each copyright holder who releases their contribution
+under TSAL-1.0, or a person authorized to license that contribution.
+
+1.3. “Individual” means a natural person acting in a personal capacity and not
+for, on behalf of, or for the benefit of an organization in connection with the
+Software. An employee acting for an employer is not an Individual for that use.
+
+1.4. “Organization” means any corporation, company, association, foundation,
+nonprofit, public agency, political party, collective, or other legal or factual
+body, whether incorporated or not. “Company” means an Organization that carries
+on an economic or professional business activity, regardless of profit motive.
+
+1.5. “Excluded Party” means a person or Organization within Section 3. “Covered
+Use” includes running, accessing, hosting, integrating, modifying, reproducing,
+distributing, or otherwise exploiting the Software, whether directly or through
+a contractor, employee, agent, proxy, subsidiary, or controlled entity.
+
+1.6. “Qualifying Pull Request” means a distinct, good-faith GitHub pull request
+proposing a substantive improvement to the Software or its documentation or
+tests; submitted to the Software's official upstream repository; and accepted
+and merged by its maintainers. Duplicate, spam, purely cosmetic, automatically
+generated without meaningful review, or reverted-for-abuse submissions do not
+qualify. A contribution by a natural person counts for an Organization only if
+that person's contribution was expressly identified in the pull request as
+being made on the Organization's behalf. The two pull requests must be separate.
+
+2. CONDITIONAL GRANT OF RIGHTS
+
+2.1. Subject to Sections 3–8, each Licensor grants each eligible recipient a
+non-exclusive, worldwide, royalty-free copyright license to use, execute,
+reproduce, study, modify, prepare derivative works from, publicly display,
+make available, and distribute the Software in source or executable form.
+No trademark or patent license is granted except as required by applicable law.
+
+2.2. Individuals who are not Excluded Parties may exercise these rights without
+requesting consent, including for learning, research, artistic creation,
+hobby projects, and their own independent work. An Individual may not use this
+provision as a nominal stand-in for an Organization's Covered Use.
+
+2.3. An Organization that is not an Excluded Party may exercise these rights
+without requesting consent if at least two Qualifying Pull Requests have been
+accepted and merged on its behalf before its Covered Use begins. Once earned,
+this qualification applies to the Organization's continuing use of the Software,
+provided it remains eligible and complies with this License.
+
+2.4. An Organization that does not qualify under Section 2.3 must obtain the
+permission described in Section 4 before undertaking Covered Use. Such
+permission is royalty-free under this License unless the parties separately
+agree otherwise in writing.
+
+2.5. Neither contribution, silence, payment, a contractual arrangement, nor
+purported permission from an intermediary can override Section 3. Only a
+separate, express license executed by all relevant rights holders could confer
+rights otherwise unavailable under this License.
+
+3. ABSOLUTE EXCLUSIONS
+
+No license is granted to the following parties, or to any person or entity
+knowingly undertaking Covered Use on their behalf or for their operational
+benefit:
+
+(a) Armed forces, militaries, military commands, and military intelligence units.
+(b) Paramilitary formations, militias organized for coercive violence, and
+    private military organizations.
+(c) Police departments, law-enforcement agencies, and organizations carrying
+    out policing powers.
+(d) Prison and detention operators, prison-management and incarceration
+    businesses, and prison or detention officials in connection with their
+    official work or an institutional deployment.
+(e) Manufacturers, developers, and suppliers of weapons, ammunition, or
+    dedicated weapons systems when acting in that business.
+(f) Intelligence, espionage, covert-operations, and secret-service agencies.
+(g) Religious-extremist organizations that organize, advocate, or carry out
+    violence, persecution, or coercive denial of fundamental rights in the name
+    of religion; religious belief or affiliation alone is not an exclusion.
+(h) Far-right or extreme-right political parties, groups, and organizations
+    that advocate fascism, neo-Nazism, ethnic supremacy, or systematic denial
+    of equal civil or political rights on grounds of identity. Mere conservative
+    views, individual beliefs, or political disagreement alone are insufficient.
+(i) Organizations whose substantial organized purpose is to prohibit,
+    criminalize, or obstruct access to voluntary abortion (“anti-abortion
+    organizations”); an individual's personal beliefs alone are not an exclusion.
+(j) Drug cartels and organizations materially engaged in organized illicit
+    drug trafficking.
+(k) Businesses that provide surveillance of people, including commercial
+    tracking, invasive monitoring, or surveillance services, whether physical
+    or digital.
+(l) Mercenary groups, companies, brokers, and organizations providing armed
+    mercenary services.
+(m) Businesses providing private security, guarding, or contracted physical
+    or digital security services for others.
+
+The classification depends on demonstrable conduct, declared objectives,
+operations, or services, rather than a Licensor's uncommunicated opinion.
+An otherwise eligible individual is not excluded solely because of employment,
+family connection, religion, or political opinion; however, Covered Use for an
+Excluded Party remains prohibited. Excluded Parties may not avoid this Section
+by using subsidiaries, contractors, intermediaries, personal accounts, or
+otherwise eligible Organizations.
+
+4. PERMISSION BY REQUEST OR FIFTEEN-DAY SILENCE
+
+4.1. An Organization needing permission under Section 2.4 may send a written
+request to the License contact prominently identified at the top of the
+repository's LICENSE file. The request must identify the Organization by its
+actual name, provide a reply address, identify the repository, and state that
+permission under TSAL-1.0 is requested. No description of business secrets,
+planned features, or proprietary use is required.
+
+4.2. The request is received when it reaches the published contact address
+without a delivery-failure notice. The applicant should preserve a dated copy
+and reasonable delivery evidence. If no functioning License contact is
+published, automatic permission by silence is unavailable until the Licensor
+publishes such a contact; the alternative contribution route in Section 2.3
+remains available.
+
+4.3. The Licensor may grant or deny the request in an express written response
+received by the applicant during the following fifteen consecutive calendar
+days (360 hours). An acknowledgement or request for information that neither
+grants nor denies permission does not stop this period. Permission takes effect
+automatically upon expiry of that period if no express grant or denial has
+reached the applicant. Silence is itself an advance, conditional grant under
+this public License, not a presumed private contract or a waiver of Section 3.
+
+4.4. An express denial received within that period bars permission by silence
+for the same Organization and Software; repeated substantially identical
+requests do not erase the denial. A later express written grant may supersede
+it. Permission obtained by an express grant or by silence continues without
+renewal while the Organization remains eligible and compliant. A purported
+denial arriving after automatic permission has vested does not retroactively
+revoke compliant use.
+
+5. DISTRIBUTION AND RECIPIENT RIGHTS
+
+5.1. Every source or executable copy distributed must retain this License,
+the copyright notices, and a notice identifying material modifications.
+When distributing a modified executable, the distributor must also make the
+corresponding modified source code available to recipients under TSAL-1.0 at
+no more than the reasonable cost of transfer.
+
+5.2. Modified versions incorporating Software-covered material must remain
+subject to TSAL-1.0 for that covered material. Original independent material
+and separately licensed third-party components retain their own applicable
+rights; this License does not purport to relicense material the Licensor does
+not own.
+
+5.3. Distribution does not automatically qualify a recipient. Each recipient
+must independently satisfy the eligibility requirements in Sections 2–4 and
+must comply with Section 3 before exercising rights under this License.
+Distributors may not imply that the Software is available under an unrestricted
+open-source license.
+
+6. CONTRIBUTIONS
+
+A contribution intentionally submitted for inclusion in the official repository
+and expressly accepted under TSAL-1.0 is licensed by its contributor under
+TSAL-1.0. Contribution does not transfer copyright ownership. A maintainer
+cannot grant rights to third-party contributions under terms broader than those
+authorized by their respective copyright holders.
+
+7. TERMINATION AND REINSTATEMENT
+
+Rights under this License automatically terminate for a recipient that becomes
+an Excluded Party or materially violates its terms. For a curable breach other
+than a Section 3 exclusion, rights are reinstated prospectively if the breach
+is cured within thirty days after written notice from a relevant Licensor.
+Termination does not retroactively invalidate compliant copies or grants
+previously received by independent eligible recipients.
+
+8. NO WARRANTY; LIMITATION OF LIABILITY; SEVERABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE SOFTWARE IS PROVIDED
+“AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, NO LICENSOR OR CONTRIBUTOR
+SHALL BE LIABLE FOR DAMAGES ARISING OUT OF THE SOFTWARE OR ITS USE.
+
+If a provision is held unenforceable, the remainder remains effective to the
+extent permitted by law. Nothing in this License restricts rights that
+applicable law grants independently of copyright permission.
+
+END OF THE SOCIALIST ANTI-LICENSE (TSAL-1.0)

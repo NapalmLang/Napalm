@@ -1091,6 +1091,51 @@ impl NapalmString {
     fn probe(&self) -> StrProbe<'_> {
         StrProbe { bytes: self.bytes.as_ref(), hash: key_hash(self.hash), name: self.name() }
     }
+
+    /// `left + right` with one copy into the final shared buffer. The previous
+    /// path built a Vec, copied it again into an `Arc<[u8]>`, then rescanned the
+    /// result for its code-point count: three extra O(n) passes per
+    /// concatenation, which dominated `s = s + x` loops. The code-point count is
+    /// additive unless a code point at the end of `left` could decode into
+    /// `right` (an incomplete multi-byte tail); only then is the result recounted.
+    fn concat(left: &NapalmString, right: &NapalmString) -> NapalmString {
+        if right.bytes.is_empty() {
+            return NapalmString { name: None, ..left.clone() };
+        }
+        if left.bytes.is_empty() {
+            return NapalmString { name: None, ..right.clone() };
+        }
+        let (a, b): (&[u8], &[u8]) = (left.bytes.as_ref(), right.bytes.as_ref());
+        let mut buffer = Arc::<[u8]>::new_uninit_slice(a.len() + b.len());
+        {
+            let slots = Arc::get_mut(&mut buffer).expect("a fresh Arc is unique");
+            let base = slots.as_mut_ptr().cast::<u8>();
+            // SAFETY: `slots` holds exactly a.len() + b.len() bytes and the
+            // sources are distinct live allocations.
+            unsafe {
+                std::ptr::copy_nonoverlapping(a.as_ptr(), base, a.len());
+                std::ptr::copy_nonoverlapping(b.as_ptr(), base.add(a.len()), b.len());
+            }
+        }
+        // SAFETY: every byte was initialized above.
+        let bytes: Arc<[u8]> = unsafe { buffer.assume_init() };
+        let tail_complete = (a.len().saturating_sub(3)..a.len()).all(|index| {
+            let needed = match a[index] {
+                0xC2..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF4 => 4,
+                _ => 1,
+            };
+            index + needed <= a.len()
+        });
+        let code_points = if tail_complete {
+            left.code_points + right.code_points
+        } else {
+            napalm_code_point_count(bytes.as_ref())
+        };
+        let hash = fast_hash_bytes(bytes.as_ref());
+        NapalmString { bytes, hash, code_points, name: None }
+    }
 }
 
 /// Map/shape keys keep the low 32 bits of the content hash, so that hash plus
@@ -19997,7 +20042,7 @@ fn normalize_byte_index(index: i32, len: usize, allow_end: bool) -> Option<usize
 }
 
 unsafe fn h_string_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));match vm.heap.get(string){Some(HeapObject::String(s))=>{vm.set_reg(op.a,i32_word(s.code_points as i32));vm.advance(op)},_=>vm.fail_at(op,"StringLen operand is not string")}}
-unsafe fn h_string_concat(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let left=Value::from_word(vm.reg(op.b));let right=Value::from_word(vm.reg(op.c));let (a,b)=match(vm.heap.get(left),vm.heap.get(right)){(Some(HeapObject::String(a)),Some(HeapObject::String(b)))=>(a.clone(),b.clone()),_=>{vm.fail_at(op,"StringConcat operands must be strings");return;}};vm.mark_gc_point(op);vm.maybe_collect();let mut out=Vec::with_capacity(a.len()+b.len());out.extend_from_slice(a.as_ref());out.extend_from_slice(b.as_ref());let value=vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(out))));vm.set_reg(op.a,value.word());vm.advance(op)}
+unsafe fn h_string_concat(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let left=Value::from_word(vm.reg(op.b));let right=Value::from_word(vm.reg(op.c));let (a,b)=match(vm.heap.get(left),vm.heap.get(right)){(Some(HeapObject::String(a)),Some(HeapObject::String(b)))=>(a.clone(),b.clone()),_=>{vm.fail_at(op,"StringConcat operands must be strings");return;}};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::String(NapalmString::concat(&a,&b)));vm.set_reg(op.a,value.word());vm.advance(op)}
 unsafe fn h_string_slice(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));let start=word_i32(vm.reg(op.c));let count=word_i32(vm.reg(op.x as u8));if count<0{vm.fail_at(op,"negative string slice length");return;}let source=match vm.heap.get(string){Some(HeapObject::String(s))=>s.clone(),_=>{vm.fail_at(op,"StringSlice operand is not string");return;}};let Some(begin)=normalize_byte_index(start,source.len(),true)else{vm.fail_at(op,"string byte offset out of bounds");return;};let Some(end)=begin.checked_add(count as usize).filter(|end|*end<=source.len())else{vm.fail_at(op,"string slice out of bounds");return;};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(&source[begin..end]))));vm.set_reg(op.a,value.word());vm.advance(op)}
 unsafe fn h_string_code_point_at(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let code=match vm.heap.get(string){Some(HeapObject::String(bytes))=>normalize_byte_index(index,bytes.len(),false).map(|i|decode_napalm_code_point(bytes.as_ref(),i).0 as i32),_=>None};match code{Some(c)=>{vm.set_reg(op.a,i32_word(c));vm.advance(op)},None=>vm.fail_at(op,"string byte offset out of bounds")}}
 unsafe fn h_make_range(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let from=Value::from_word(vm.reg(op.b)).as_num();let to=Value::from_word(vm.reg(op.c)).as_num();let(Some(from),Some(to))=(from,to)else{vm.fail_at(op,"range endpoints must be numbers");return;};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::Range{from,to,inclusive:op.x!=0});vm.set_reg(op.a,value.word());vm.advance(op)}

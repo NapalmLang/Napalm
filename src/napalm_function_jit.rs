@@ -484,6 +484,7 @@ impl WholeFunctionJit {
             let entry = b.create_block();
             b.append_block_params_for_function_params(entry);
             let abort = b.create_block();
+            b.set_cold_block(abort);
             let mut blocks = Vec::with_capacity(function.ops.len());
             for _ in &function.ops {
                 let block = b.create_block();
@@ -546,7 +547,9 @@ impl WholeFunctionJit {
                     let resume = b.create_block();
                     b.append_block_param(resume, types::I64);
                     inline_calls[index] = Some((child_blocks[0], resume));
-                    regions.push((child_blocks, b.create_block(), Some(resume)));
+                    let child_abort = b.create_block();
+                    b.set_cold_block(child_abort);
+                    regions.push((child_blocks, child_abort, Some(resume)));
                     self.stats.inlined_recursive_sites += 1;
                 }
             }
@@ -946,8 +949,15 @@ impl WholeFunctionJit {
             b.finalize(target_config);
         }
 
+        let disasm = std::env::var_os("NAPALM_CRANELIFT_DISASM").is_some();
+        self.context.set_disasm(disasm);
         self.module.define_function(func_id, &mut self.context)
             .map_err(|e| format!("cannot define whole function {:?}: {e}", function.id))?;
+        if disasm {
+            if let Some(vcode) = self.context.compiled_code().and_then(|code| code.vcode.as_ref()) {
+                eprintln!("[napalm-wfjit] disassembly {:?}:\n{vcode}", function.id);
+            }
+        }
         self.module.finalize_definitions()
             .map_err(|e| format!("cannot finalize whole function {:?}: {e}", function.id))?;
         let code = self.module.get_finalized_function(func_id);
@@ -1009,6 +1019,7 @@ fn emit_identity_fast_path(
     let resolve = b.create_block();
     let calculate = b.create_block();
     let fallback = b.create_block();
+    b.set_cold_block(fallback);
     let done = b.create_block();
     b.append_block_param(done, types::I64);
     let epoch = b.ins().load(types::I64, MemFlagsData::trusted(), vm,
@@ -1110,6 +1121,7 @@ fn emit_numeric_quick_fast_path(
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
     let fallback = b.create_block();
+    b.set_cold_block(fallback);
     let receiver_ok = b.create_block();
     let calculate = b.create_block();
     let done = b.create_block();
@@ -1238,6 +1250,8 @@ fn emit_map_property_fast_path(
     debug_assert!(!pic.entries.is_empty());
 
     let fallback = b.create_block();
+
+    b.set_cold_block(fallback);
     let tag_ok = b.create_block();
     let live_ok = b.create_block();
     let kind_ok = b.create_block();
@@ -1370,6 +1384,7 @@ fn emit_native_shape_property_store(
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
     let fallback = b.create_block();
+    b.set_cold_block(fallback);
     let map_tag_ok = b.create_block();
     let live_ok = b.create_block();
     let map_kind_ok = b.create_block();
@@ -1492,6 +1507,7 @@ fn emit_native_class_field_store(
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
     let fallback = b.create_block();
+    b.set_cold_block(fallback);
     let tag_ok = b.create_block();
     let live_ok = b.create_block();
     let kind_ok = b.create_block();
@@ -1593,6 +1609,7 @@ fn emit_native_direct_method_call(
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
     let fallback = b.create_block();
+    b.set_cold_block(fallback);
     let tag_ok = b.create_block();
     let live_ok = b.create_block();
     let class_ok = b.create_block();
@@ -1665,6 +1682,7 @@ fn emit_native_class_field_load(
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
     let fallback = b.create_block();
+    b.set_cold_block(fallback);
     let tag_ok = b.create_block();
     let live_ok = b.create_block();
     let kind_ok = b.create_block();
@@ -1952,13 +1970,58 @@ fn eligible_opcode(opcode: Opcode) -> bool {
     )
 }
 
+/// Per-call native counters (`native_entries`, `native_recursive_calls`) are
+/// emitted into recursive call paths only when someone can read them: unit
+/// tests and `NAPALM_JIT_STATS` runs.
+fn wfjit_call_counters_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| cfg!(test) || std::env::var_os("NAPALM_JIT_STATS").is_some())
+}
+
+/// Alias region user id for `WholeFunctionJit` state (`active_depth`, stats);
+/// GPR regions use ids 0..=255.
+const WFJIT_STATE_REGION: u32 = 0x1_0000;
+
+/// Memory flags for the `WholeFunctionJit` fields generated code maintains
+/// around native self calls. Only `emit_native_self_call` touches them, always
+/// with these flags; Rust accesses happen inside calls (fences).
+#[inline]
+fn jit_state_flags(b: &mut FunctionBuilder<'_>) -> MemFlagsData {
+    let region = b.func.dfg.alias_regions.insert(cranelift::codegen::ir::AliasRegionData {
+        user_id: WFJIT_STATE_REGION,
+        description: std::borrow::Cow::Borrowed("napalm wfjit state"),
+    });
+    MemFlagsData::trusted().with_alias_region(Some(region))
+}
+
+/// Memory flags for frame GPR `reg`. Every GPR gets its own Cranelift alias
+/// region, so the egraph alias analysis can forward a register store to later
+/// loads and drop redundant reloads across stores to *other* registers and
+/// across untagged VM-field loads (an untagged store is still a full fence).
+///
+/// Soundness: generated code touches frame-register memory only through
+/// `load_reg`/`store_reg`, so a given address is always accessed with its
+/// register's region. Register banks of different frames (the caller's base,
+/// inlined/native child stack slots) share a region per index, which is merely
+/// conservative. Runtime helpers access registers only inside calls, and calls
+/// are fences that clear all alias state.
+#[inline]
+fn reg_flags(b: &mut FunctionBuilder<'_>, reg: u8) -> MemFlagsData {
+    let region = b.func.dfg.alias_regions.insert(cranelift::codegen::ir::AliasRegionData {
+        user_id: reg as u32,
+        description: std::borrow::Cow::Borrowed("napalm gpr"),
+    });
+    MemFlagsData::trusted().with_alias_region(Some(region))
+}
 #[inline]
 fn load_reg(b: &mut FunctionBuilder<'_>, regs: cranelift::prelude::Value, reg: u8) -> cranelift::prelude::Value {
-    b.ins().load(types::I64, MemFlagsData::trusted(), regs, reg as i32 * 8)
+    let flags = reg_flags(b, reg);
+    b.ins().load(types::I64, flags, regs, reg as i32 * 8)
 }
 #[inline]
 fn store_reg(b: &mut FunctionBuilder<'_>, regs: cranelift::prelude::Value, reg: u8, value: cranelift::prelude::Value) {
-    b.ins().store(MemFlagsData::trusted(), value, regs, reg as i32 * 8);
+    let flags = reg_flags(b, reg);
+    b.ins().store(flags, value, regs, reg as i32 * 8);
 }
 #[inline]
 fn store_imm(b: &mut FunctionBuilder<'_>, regs: cranelift::prelude::Value, reg: u8, value: u64) {
@@ -2043,7 +2106,11 @@ fn call_runtime_helper_with(
         offset_of!(Interpreter<'static>, hot_registers) as i32,
     );
     let is_top_frame = b.ins().icmp(IntCC::Equal, current_regs, hot_regs);
+    // A helper reached from a cold speculation fallback is part of that cold
+    // path: keep its blocks out of the hot layout as well.
+    let cold = b.current_block().is_some_and(|block| b.func.layout.is_cold(block));
     let runtime = b.create_block();
+    if cold { b.set_cold_block(runtime); }
     b.ins().brif(is_top_frame, runtime, &[], abort, &[]);
     b.switch_to_block(runtime);
     b.seal_block(runtime);
@@ -2059,6 +2126,7 @@ fn call_runtime_helper_with(
     let regs = b.inst_results(call)[0];
     let failed = b.ins().icmp_imm(IntCC::Equal, regs, 0);
     let ok = b.create_block();
+    if cold { b.set_cold_block(ok); }
     b.append_block_param(ok, b.func.dfg.value_type(regs));
     b.ins().brif(failed, abort, &[], ok, &[BlockArg::Value(regs)]);
     b.seal_block(ok);
@@ -2084,7 +2152,11 @@ fn emit_native_self_call(
     let op = function.ops[index];
     let map = function.gc_map_by_op[index];
     let flags = MemFlagsData::trusted();
-    let call_abort = if needs_roots { abort } else { b.create_block() };
+    let call_abort = if needs_roots { abort } else {
+        let block = b.create_block();
+        b.set_cold_block(block);
+        block
+    };
     if needs_roots {
         emit_native_root_map_update(b, vm, regs, map, index as u32);
     }
@@ -2093,7 +2165,12 @@ fn emit_native_self_call(
     // a live JIT; its box and compiled code cannot be replaced while active.
     let jit = b.ins().load(types::I64, flags, vm,
         offset_of!(Interpreter<'static>, whole_function_jit) as i32);
-    let depth = b.ins().load(types::I32, flags, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
+    // `active_depth` and the statistics live in the WholeFunctionJit box, which
+    // generated code touches only here. A dedicated alias region keeps these
+    // stores from acting as fences that would discard the register values the
+    // argument copies just stored (and the inlined child would reload).
+    let jit_flags = jit_state_flags(b);
+    let depth = b.ins().load(types::I32, jit_flags, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
     let allowed = b.ins().icmp_imm(IntCC::UnsignedLessThan, depth, MAX_NATIVE_CALL_DEPTH as i64);
     let call_block = b.create_block();
     b.ins().brif(allowed, call_block, &[], call_abort, &[]);
@@ -2137,13 +2214,20 @@ fn emit_native_self_call(
         None
     };
     let child_depth = b.ins().iadd_imm(depth, 1);
-    b.ins().store(flags, child_depth, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
-    for counter in [offset_of!(WholeFunctionJitStats, native_entries),
-        offset_of!(WholeFunctionJitStats, native_recursive_calls)] {
+    b.ins().store(jit_flags, child_depth, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
+    // Two memory read-modify-writes per recursive call are measurable on tiny
+    // recursive bodies; count them only when the statistics can be observed.
+    let counters: &[usize] = if wfjit_call_counters_enabled() {
+        &[offset_of!(WholeFunctionJitStats, native_entries),
+          offset_of!(WholeFunctionJitStats, native_recursive_calls)]
+    } else {
+        &[]
+    };
+    for &counter in counters {
         let offset = (offset_of!(WholeFunctionJit, stats) + counter) as i32;
-        let old = b.ins().load(types::I64, flags, jit, offset);
+        let old = b.ins().load(types::I64, jit_flags, jit, offset);
         let next = b.ins().iadd_imm(old, 1);
-        b.ins().store(flags, next, jit, offset);
+        b.ins().store(jit_flags, next, jit, offset);
     }
 
     let value = if let Some((entry, resume)) = inline_region {
@@ -2157,7 +2241,17 @@ fn emit_native_self_call(
     if let Some(previous) = previous {
         b.ins().store(flags, previous, vm, offset_of!(Interpreter<'static>, native_shadow_top) as i32);
     }
-    b.ins().store(flags, depth, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
+    // Every native call site restores `active_depth` before it returns or
+    // branches to its bailout, so here it again holds `child_depth`. Re-deriving
+    // the restored depth (rather than keeping `jit` and `depth` alive across the
+    // call) frees two callee-saved registers, which every recursive invocation
+    // otherwise pays for in its prologue and epilogue.
+    let jit = b.ins().load(types::I64, flags, vm,
+        offset_of!(Interpreter<'static>, whole_function_jit) as i32);
+    let returned_depth = b.ins().load(types::I32, jit_flags, jit,
+        offset_of!(WholeFunctionJit, active_depth) as i32);
+    let depth = b.ins().iadd_imm(returned_depth, -1);
+    b.ins().store(jit_flags, depth, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
     let failed = b.ins().icmp_imm(IntCC::Equal, value, WFJIT_BAILOUT as i64);
     let done = b.create_block();
     b.ins().brif(failed, call_abort, &[], done, &[]);

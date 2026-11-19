@@ -649,6 +649,11 @@ pub enum TraceListMethod {
     /// `list.push(value)` through the native helper (`HeapListPush`); shared
     /// Lists and contract violations replay the original Invoke.
     Push,
+    /// `list.add(value)`: the same native push, evaluating to `value` itself.
+    Add,
+    /// `list.iterate(i)` for an integral `i` with `i + 1` in bounds: `i + 1`.
+    /// (`iteratorValue(i)` maps to `Subscript`: identical for in-range `i`.)
+    Iterate,
 }
 
 /// Stock Map subscript methods whose existing-key fast path a trace replays
@@ -2700,7 +2705,8 @@ impl<'a> TraceRecorder<'a> {
         };
         let arity = match method {
             TraceListMethod::Length => 0,
-            TraceListMethod::Subscript | TraceListMethod::Push => 1,
+            TraceListMethod::Subscript | TraceListMethod::Push | TraceListMethod::Add
+            | TraceListMethod::Iterate => 1,
             TraceListMethod::SubscriptSet => 2,
         };
         if op.c as usize != arity || op.args.len() != arity {
@@ -2739,6 +2745,21 @@ impl<'a> TraceRecorder<'a> {
                 return Ok(false);
             };
             if !(index.fract() == 0.0 && index >= 0.0 && index < length as f64 && index <= i32::MAX as f64) {
+                return Ok(false);
+            }
+        }
+        if method == TraceListMethod::Iterate {
+            // Only the steady state of `for (x of list)`: an integral iterator
+            // whose successor is still in bounds. The first step (null) and the
+            // final one (false) keep the Invoke.
+            let iterator_word = runtime
+                .trace_read_slot(FrameSlot::General(op.args[0]))
+                .map_err(|_| RecordingAbort::UnsupportedCall)?;
+            let Some(iterator) = word_num(iterator_word) else {
+                return Ok(false);
+            };
+            let next = iterator + 1.0;
+            if !(iterator.fract() == 0.0 && next >= 0.0 && next < length as f64 && next <= i32::MAX as f64) {
                 return Ok(false);
             }
         }
@@ -2833,6 +2854,37 @@ impl<'a> TraceRecorder<'a> {
                     TraceRep::Int32,
                 );
                 builder.emit1(TraceInst::BoxInt32 { value: length }, TraceType::Num, TraceRep::Tagged)
+            }
+            TraceListMethod::Add => {
+                // Wren-style `add` returns the added element: no length read.
+                let value = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+                builder.emit0(TraceInst::HeapListPush { list, value, exit });
+                value
+            }
+            TraceListMethod::Iterate => {
+                // `iterate(i)` = i + 1 while in bounds. Non-integral or
+                // out-of-range iterators (including the final step, which
+                // answers false) fail a guard and replay the Invoke. A wrapped
+                // i32::MAX + 1 is negative and fails the bounds guard too.
+                let iterator = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
+                let iterator = builder.emit1(
+                    TraceInst::GuardInt32 { value: iterator, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                let one = builder.constant(TraceConstant::Int32(1));
+                let next = builder.emit1(
+                    TraceInst::IntBinary { op: IntBinOp::Add, lhs: iterator, rhs: one },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                let length = builder.emit1(
+                    TraceInst::HeapListLen { list, exit },
+                    TraceType::Int32,
+                    TraceRep::Int32,
+                );
+                builder.emit0(TraceInst::GuardBounds { index: next, length, exit });
+                builder.emit1(TraceInst::BoxInt32 { value: next }, TraceType::Num, TraceRep::Tagged)
             }
         };
         self.write_gpr(builder, op.a, result);
@@ -6212,6 +6264,18 @@ impl<'a> TraceRecorder<'a> {
                     let list = self.read_gpr(builder, op.a, TraceType::Any, TraceRep::Tagged)?;
                     let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
                     let _ = self.guard_heap_object(builder, list, TraceHeapObjectKind::List, exit);
+                    if op.opcode == ListAppend && !runtime.trace_reactive_tracking_active() {
+                        // ListAppend (list literals, comprehensions) has exactly
+                        // the `list.push` semantics: contract check, barrier,
+                        // Vec push and external-byte accounting, none of which
+                        // can collect. The native push helper keeps the append
+                        // inside the trace instead of a full GC-leaf runtime
+                        // boundary; a declined push (shared list, contract
+                        // violation) exits before any effect and replays here.
+                        let value = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+                        builder.emit0(TraceInst::HeapListPush { list, value, exit });
+                        return Ok(ExpectedStep::Exact(next));
+                    }
                     let mode = if op.opcode == ListAppend {
                         TRACE_RUNTIME_MODE_LIST_APPEND
                     } else {

@@ -1921,6 +1921,11 @@ impl Host for BuiltinHost {
             (Some(ListSubscript), "[]", 1) => Some(TraceListMethod::Subscript),
             (Some(ListSubscriptSet), "[]=", 2) => Some(TraceListMethod::SubscriptSet),
             (Some(ListPush), "push", 1) => Some(TraceListMethod::Push),
+            (Some(ListAdd), "add", 1) => Some(TraceListMethod::Add),
+            (Some(ListIterate), "iterate", 1) => Some(TraceListMethod::Iterate),
+            // For an in-range integral iterator this is exactly `list[i]`; any
+            // other iterator fails the Subscript guards and replays the Invoke.
+            (Some(ListIteratorValue), "iteratorValue", 1) => Some(TraceListMethod::Subscript),
             _ => None,
         }
     }

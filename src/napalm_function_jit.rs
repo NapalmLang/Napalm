@@ -9,6 +9,11 @@
 
 use super::*;
 use cranelift::codegen::ir::{BlockArg, StackSlotData, StackSlotKind, UserFuncName};
+
+#[path = "napalm_wfjit_ir.rs"]
+mod wf_ir;
+#[path = "napalm_wfjit_lower.rs"]
+mod wf_lower;
 use cranelift::codegen::settings::{self, Configurable};
 use cranelift::frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift::jit::{JITBuilder, JITModule};
@@ -47,6 +52,8 @@ pub(crate) struct WholeFunctionJitStats {
     pub bailouts: u64,
     /// Compiled functions dropped because they kept bailing out.
     pub deoptimized_functions: u64,
+    /// Functions compiled by the typed-SSA v2 tier (the rest use v1).
+    pub v2_compiled_functions: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,6 +476,35 @@ impl WholeFunctionJit {
                 // GC polling without adding a second stack-map scheme.
                 self.reject(function_index);
                 return Ok(());
+            }
+        }
+
+        // Prefer the typed-SSA v2 tier; functions it does not cover yet (or whose
+        // speculation failed too often) keep the v1 code generator below.
+        if wfjit_v2_enabled() && !self.slots[function_index as usize].speculation_disabled {
+            let source = wf_ir::WfSource {
+                function_index, function, bytecode, constants,
+                reachable: &reachable, identity_sites, expected_method_epoch,
+                plain_store_classes: native_plain_store_classes,
+            };
+            let events = std::env::var_os("NAPALM_JIT_EVENTS").is_some();
+            match wf_ir::build(&source).and_then(|ir| self.compile_v2(&ir, function)) {
+                Ok(entry) => {
+                    let slot = &mut self.slots[function_index as usize];
+                    slot.state = FunctionState::Compiled;
+                    slot.entry = Some(entry);
+                    slot.speculative = true;
+                    slot.native_entries = 0;
+                    slot.bailouts = 0;
+                    slot.speculation_failures = 0;
+                    self.stats.compiled_functions = self.stats.compiled_functions.saturating_add(1);
+                    self.stats.v2_compiled_functions = self.stats.v2_compiled_functions.saturating_add(1);
+                    if events { eprintln!("[napalm-wfjit] v2 compiled {:?}", function.id); }
+                    return Ok(());
+                }
+                Err(reason) => {
+                    if events { eprintln!("[napalm-wfjit] v2 declined {:?}: {reason}", function.id); }
+                }
             }
         }
 
@@ -1138,6 +1174,140 @@ impl WholeFunctionJit {
         slot.speculation_failures = 0;
         self.stats.compiled_functions = self.stats.compiled_functions.saturating_add(1);
         Ok(())
+    }
+
+    /// Compile a v2 IR function: the typed-SSA body (tail convention, see
+    /// `napalm_wfjit_lower.rs`) plus the host-ABI entry trampoline.
+    fn compile_v2(&mut self, ir: &wf_ir::WfFunction, function: &PreparedFunction) -> Result<WholeFunctionEntry, String> {
+        let pointer = self.module.target_config().pointer_type();
+        let mut entry_signature = self.module.make_signature();
+        entry_signature.params.push(AbiParam::new(pointer));
+        entry_signature.params.push(AbiParam::new(pointer));
+        entry_signature.returns.push(AbiParam::new(types::I64));
+        let mut body_signature = entry_signature.clone();
+        body_signature.call_conv = cranelift::codegen::isa::CallConv::Tail;
+        body_signature.params.push(AbiParam::new(types::I32));
+        for ty in &ir.param_types {
+            body_signature.params.push(AbiParam::new(if *ty == wf_ir::WfTy::F64 { types::F64 } else { types::I64 }));
+        }
+        if ir.has_this { body_signature.params.push(AbiParam::new(types::I64)); }
+        let body_id = self.module.declare_anonymous_function(&body_signature)
+            .map_err(|e| format!("cannot declare v2 body: {e}"))?;
+
+        self.context.clear();
+        self.context.func.signature = body_signature;
+        self.context.func.name = UserFuncName::user(2, body_id.as_u32());
+        self.function_context = FunctionBuilderContext::new();
+        {
+            let target_config = self.module.target_config();
+            let self_ref = self.module.declare_func_in_func(body_id, &mut self.context.func);
+            let speculation_ref = self.module.declare_func_in_func(self.speculation_failed, &mut self.context.func);
+            let runtime_ref = self.module.declare_func_in_func(self.runtime_op, &mut self.context.func);
+            let direct_ref = self.module.declare_func_in_func(self.direct_call, &mut self.context.func);
+            let mut b = FunctionBuilder::new(&mut self.context.func, &mut self.function_context);
+            wf_lower::lower_body(&mut b, ir, function, self_ref, speculation_ref, runtime_ref, direct_ref);
+            b.finalize(target_config);
+        }
+        let disasm = std::env::var_os("NAPALM_CRANELIFT_DISASM").is_some();
+        self.context.set_disasm(disasm);
+        self.module.define_function(body_id, &mut self.context)
+            .map_err(|e| format!("cannot define v2 body {:?}: {e:?}", function.id))?;
+        if disasm {
+            if let Some(vcode) = self.context.compiled_code().and_then(|code| code.vcode.as_ref()) {
+                eprintln!("[napalm-wfjit] v2 disassembly {:?}:\n{vcode}", function.id);
+            }
+        }
+
+        // Host-ABI trampoline: the interpreter-built frame holds the arguments
+        // at their entry registers; the chain depth starts at active_depth.
+        let entry_id = self.module.declare_anonymous_function(&entry_signature)
+            .map_err(|e| format!("cannot declare v2 entry: {e}"))?;
+        self.context.clear();
+        self.context.func.signature = entry_signature;
+        self.context.func.name = UserFuncName::user(2, entry_id.as_u32());
+        self.function_context = FunctionBuilderContext::new();
+        {
+            let target_config = self.module.target_config();
+            let body_ref = self.module.declare_func_in_func(body_id, &mut self.context.func);
+            let mut b = FunctionBuilder::new(&mut self.context.func, &mut self.function_context);
+            let block = b.create_block();
+            b.append_block_params_for_function_params(block);
+            b.switch_to_block(block);
+            let (vm, regs) = (b.block_params(block)[0], b.block_params(block)[1]);
+            let flags = MemFlagsData::trusted();
+            let jit = b.ins().load(types::I64, flags, vm,
+                offset_of!(Interpreter<'static>, whole_function_jit) as i32);
+            let depth = b.ins().load(types::I32, flags, jit,
+                offset_of!(WholeFunctionJit, active_depth) as i32);
+            // Entry guards (method epoch, unboxed parameters) fail before any
+            // effect: resume the interpreter at op 0 with the frame untouched.
+            let deopt = b.create_block();
+            b.set_cold_block(deopt);
+            let mut arguments = vec![vm, regs, depth];
+            if let Some((expected, _)) = ir.entry_epoch_guard {
+                let epoch = b.ins().load(types::I64, flags, vm,
+                    offset_of!(Interpreter<'static>, method_epoch) as i32);
+                let valid = b.ins().icmp_imm(IntCC::Equal, epoch, expected as i64);
+                let next = b.create_block();
+                b.ins().brif(valid, next, &[], deopt, &[]);
+                b.switch_to_block(next);
+            }
+            for argument in 0..ir.arity {
+                let destination = function.entry_arg_dsts[argument];
+                let word = if destination == u16::MAX {
+                    b.ins().iconst(types::I64, TAG_NULL as i64)
+                } else {
+                    b.ins().load(types::I64, flags, regs, destination as i32 * 8)
+                };
+                if ir.param_types[argument] == wf_ir::WfTy::F64 {
+                    let tag = b.ins().band_imm(word, TAG_MASK as i64);
+                    let is_number = b.ins().icmp_imm(IntCC::NotEqual, tag, TAG_BASE as i64);
+                    let next = b.create_block();
+                    b.ins().brif(is_number, next, &[], deopt, &[]);
+                    b.switch_to_block(next);
+                    arguments.push(b.ins().bitcast(types::F64, MemFlagsData::new(), word));
+                } else {
+                    arguments.push(word);
+                }
+            }
+            if ir.has_this {
+                arguments.push(b.ins().load(types::I64, flags, regs, function.entry_this_dst as i32 * 8));
+            }
+            let call = b.ins().call(body_ref, &arguments);
+            let mut result = b.inst_results(call)[0];
+            if ir.returns_number {
+                // Raw f64 bits from the body: canonicalize NaN for the
+                // interpreter, but pass the bailout sentinel through.
+                let bits = b.ins().bitcast(types::F64, MemFlagsData::new(), result);
+                let is_nan = b.ins().fcmp(FloatCC::Unordered, bits, bits);
+                let bailout = b.ins().icmp_imm(IntCC::Equal, result, WFJIT_BAILOUT as i64);
+                let not_bailout = b.ins().bxor_imm(bailout, 1);
+                let canonicalize = b.ins().band(is_nan, not_bailout);
+                let canonical = b.ins().iconst(types::I64, CANONICAL_NAN as i64);
+                result = b.ins().select(canonicalize, canonical, result);
+            }
+            b.ins().return_(&[result]);
+            b.switch_to_block(deopt);
+            let speculation_ref = self.module.declare_func_in_func(self.speculation_failed, b.func);
+            let function_arg = b.ins().iconst(types::I32, ir.function_index as i64);
+            b.ins().call(speculation_ref, &[vm, function_arg]);
+            let hot_frame = b.ins().load(types::I64, flags, vm, offset_of!(Interpreter<'static>, hot_frame) as i32);
+            let root_map = b.ins().iconst(types::I32, function.gc_map_by_op[0] as i64);
+            b.ins().store(flags, root_map, hot_frame, offset_of!(Frame, root_map) as i32);
+            let pc = b.ins().iconst(types::I32, 0);
+            b.ins().store(flags, pc, vm, offset_of!(Interpreter<'static>, hot_pc) as i32);
+            let sentinel = b.ins().iconst(types::I64, WFJIT_BAILOUT as i64);
+            b.ins().return_(&[sentinel]);
+            b.seal_all_blocks();
+            b.finalize(target_config);
+        }
+        self.context.set_disasm(false);
+        self.module.define_function(entry_id, &mut self.context)
+            .map_err(|e| format!("cannot define v2 entry {:?}: {e:?}", function.id))?;
+        self.module.finalize_definitions()
+            .map_err(|e| format!("cannot finalize v2 function {:?}: {e}", function.id))?;
+        let code = self.module.get_finalized_function(entry_id);
+        Ok(unsafe { std::mem::transmute::<*const u8, WholeFunctionEntry>(code) })
     }
 }
 
@@ -2388,6 +2558,12 @@ fn eligible_opcode(opcode: Opcode) -> bool {
 /// Per-call native counters (`native_entries`, `native_recursive_calls`) are
 /// emitted into recursive call paths only when someone can read them: unit
 /// tests and `NAPALM_JIT_STATS` runs.
+/// The typed-SSA v2 tier is on unless `NAPALM_WFJIT_V2=0`.
+fn wfjit_v2_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NAPALM_WFJIT_V2").ok().as_deref() != Some("0"))
+}
+
 fn wfjit_call_counters_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| cfg!(test) || std::env::var_os("NAPALM_JIT_STATS").is_some())

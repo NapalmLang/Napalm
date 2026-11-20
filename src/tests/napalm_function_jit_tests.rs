@@ -148,6 +148,39 @@ fn napalm_whole_function_speculation_bails_out_and_deoptimizes() {
 }
 
 #[test]
+fn napalm_whole_function_v2_specializes_parameters_and_guards_entry() {
+    // `down` is compiled by the typed-SSA tier: `n` becomes an unboxed F64
+    // parameter (every self-call passes `n - one`), the result is a raw Number.
+    // Non-Number arguments from the interpreter fail the entry guard and run in
+    // baseline, which reports the same errors.
+    let (program, entry, manifest) = whole_function_program(r#"
+        let one = 0;
+        one = 1;
+        function down(n) {
+            if (n < one) return 0;
+            return down(n - one) + one;
+        }
+        let total = 0;
+        for (let i = 0; i < 300; i++) total += down(40);
+        const fractional = down(2.5);
+        const errors = [];
+        for (const v of ['7', null, true, {a: 1}, [3]]) {
+            try { errors.add(down(v)); } catch (e) { errors.add('err'); }
+        }
+        for (let i = 0; i < 300; i++) total += down(30);
+        const result = [total, fractional, errors, down(-1), down(700)];
+    "#);
+    let mut vm = source_vm(&program, &manifest);
+    vm.run_module(entry).unwrap();
+    let value = last_source_variable(&vm);
+    assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value),
+        "[21000, 2, [err, err, err, err, err], 0, 700]");
+    let stats = vm.whole_function_jit_stats().unwrap();
+    assert!(stats.v2_compiled_functions >= 1, "{stats:?}");
+    assert!(vm.native_shadow_top.is_null());
+}
+
+#[test]
 fn napalm_whole_function_recursion_replays_guards_and_depth_limit() {
     let (program, entry, manifest) = whole_function_program(r#"
         function chain(depth, value) {
@@ -225,7 +258,10 @@ fn napalm_whole_function_read_only_recursion_replays_deep_and_changed_shapes() {
         if native {
             assert!(vm.whole_function_jit_stats().unwrap().compiled_functions >= 2);
             assert!(vm.whole_function_jit_stats().unwrap().native_recursive_calls > 1000);
-            assert!(vm.whole_function_jit_stats().unwrap().inlined_recursive_sites >= 2);
+            // Each recursive function takes a native-recursion path: v1 inlines
+            // one recursion level, v2 (typed SSA) compiles it without a bank.
+            let stats = vm.whole_function_jit_stats().unwrap();
+            assert!(stats.inlined_recursive_sites + stats.v2_compiled_functions >= 2, "{stats:?}");
         }
     }
 }

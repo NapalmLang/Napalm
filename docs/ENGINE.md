@@ -314,6 +314,36 @@ before eligible recursive functions switch to whole-function native code.
 Rejected functions and functions awaiting sufficient runtime profiles retain
 their normal tracing entry and loop paths.
 
+### Whole-function tier v2: typed SSA
+
+Functions whose operations it fully understands are compiled by the typed-SSA
+generation of the whole-function tier. Everything else keeps the v1 code
+generator. `NAPALM_WFJIT_V2=0` disables v2. `NAPALM_JIT_EVENTS=1` reports, for
+each function, whether v2 compiled it or why it declined.
+
+- **IR** (`src/napalm_wfjit_ir.rs`). A backend-neutral IR with blocks, typed block
+  parameters (`Tagged`, `F64`, `Bool`), one value per instruction and explicit
+  deoptimization states. It is built in one pass over the acyclic bytecode graph,
+  with backward liveness. Cranelift lowers it in `src/napalm_wfjit_lower.rs`; the
+  IR is designed so that an LLVM lowering can consume it as well.
+- **No register bank.** Napalm GPRs are SSA values. Numbers stay unboxed `f64`.
+  NaN is canonicalized only when a value becomes a tagged word again.
+- **When registers reach memory.** The live GPRs are stored only when the
+  interpreter or the GC can observe them: a deoptimization, or a host helper call
+  (`RuntimeOp`, top frame only).
+- **Deoptimization.** A failed guard (type, shape, class, epoch) materializes the
+  live GPRs into the interpreter-owned top frame and resumes at the guarded op.
+  Nested native frames have no bank: they unwind, and the top frame replays its
+  outermost self-call. That requires a replay-safe body, so functions mixing
+  self-calls with stores or helper calls are left to v1.
+- **Native self-call ABI.** The body uses Cranelift's `tail` convention,
+  `(vm, frame, depth, args...)`. A parameter becomes an unboxed `F64` when every
+  self-call passes a Number. A function whose returns are all Numbers returns raw
+  `f64` bits. The host-ABI entry trampoline checks the method epoch, unboxes the
+  specialized parameters (with guards) and canonicalizes the result.
+- **Deopt policy.** Repeated speculative failures, but not depth-limit bailouts,
+  drop the function back to the non-speculative v1 tier.
+
 ### Bounded language-call inlining
 
 The recorder can inline bounded Wren calls when it can prove the call target and safely reproduce the call/return path. Method-table epoch guards protect inlined dynamic dispatch assumptions.

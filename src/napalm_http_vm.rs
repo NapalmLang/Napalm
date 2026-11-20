@@ -56,7 +56,7 @@ fn match_path(pattern: &str, path: &str) -> Option<Vec<(String, String)>> {
 impl Interpreter<'_> {
     pub(super) fn http_string(&mut self, text: &str) -> Value {
         self.heap
-            .alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+            .alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                 text.as_bytes(),
             ))))
     }

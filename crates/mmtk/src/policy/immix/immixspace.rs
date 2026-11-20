@@ -454,11 +454,14 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         let vm_map = args.vm_map;
         let scheduler = args.scheduler.clone();
         let rc_enabled = args.constraints.rc_enabled;
-        let common = CommonSpace::new(args.into_policy_args(
+        let mut common = CommonSpace::new(args.into_policy_args(
             true,
             false,
             Self::side_metadata_specs(rc_enabled),
         ));
+        // A VM that fully initializes its objects can skip zeroing (see the
+        // `immix_zero_memory` option); the allocator checks the same flag.
+        common.zeroed &= *common.options.immix_zero_memory;
         let space_index = common.descriptor.get_index();
         ImmixSpace {
             pr: if common.vmrequest.is_discontiguous() {

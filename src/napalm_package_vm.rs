@@ -302,7 +302,7 @@ impl Interpreter<'_> {
     }
 
     fn package_string(&mut self, text: String) -> Value {
-        self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(text.into_bytes()))))
+        self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(text.into_bytes()))))
     }
 
     fn package_string_list(&mut self, items: Vec<String>) -> Value {

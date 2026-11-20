@@ -925,6 +925,11 @@ options! {
         = NurserySize::ProportionalBounded { min: DEFAULT_PROPORTIONAL_MIN_NURSERY, max: DEFAULT_PROPORTIONAL_MAX_NURSERY },
     /// Should a major GC be performed when a system GC is required?
     full_heap_system_gc:    bool                    [always_valid] = false,
+    /// Zero Immix memory before handing it to the allocator: freshly acquired
+    /// pages and recycled line holes. A VM that fully initializes every object
+    /// it allocates (header and payload) can turn this off and avoid a memset of
+    /// all allocated memory (fresh OS pages are already zero on every platform).
+    immix_zero_memory:      bool                    [always_valid] = true,
     /// Should finalization be disabled?
     no_finalizer:           bool                    [always_valid] = false,
     /// Should reference type processing be disabled?

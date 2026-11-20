@@ -181,7 +181,7 @@ impl Interpreter<'_> {
             for (key, field) in fields {
                 let item = match field {
                     FsField::Text(text) => self.heap.alloc(HeapObject::String(
-                        NapalmString::new(Arc::<[u8]>::from(text.into_bytes())),
+                        NapalmString::new(StrBytes::from(text.into_bytes())),
                     )),
                     FsField::Bool(boolean) => Value::from_bool(boolean),
                 };
@@ -386,7 +386,7 @@ impl Interpreter<'_> {
                 Some(HeapObject::File(file)) => if native == FileNative::Path { &file.path } else { &file.name },
                 _ => return Err(RuntimeError::new("expected File or FileInfo")),
             }.clone();
-            return Ok(self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(text.into_bytes())))));
+            return Ok(self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(text.into_bytes())))));
         }
         if matches!(native, FileNative::Size | FileNative::IsFile | FileNative::IsDirectory | FileNative::IsSymlink | FileNative::ModifiedAt | FileNative::CreatedAt) {
             let metadata = match self.heap.get_mut(receiver) {

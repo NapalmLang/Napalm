@@ -87,7 +87,7 @@ function primitiveMembers(t) {
         for (const name of "startsWith endsWith contains includes".split(" ")) {
             property(t, name, method("Boolean", []), 2);
         }
-        for (const name of "indexOf lastIndexOf codePointAt".split(" ")) {
+        for (const name of "indexOf lastIndexOf codePointAt hashCode".split(" ")) {
             property(t, name, method("Number", []), 2);
         }
         property(t, "split", method("Array<String>", []), 2);

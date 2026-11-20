@@ -242,6 +242,7 @@ enum BuiltinPrimitive {
     StringIterate,
     StringIteratorValue,
     StringFromCodePoint,
+    StringHashCode,
 
     ListCount,
     ListConcat,
@@ -479,6 +480,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("trimEnd", MethodKind::Method, 0, BuiltinPrimitive::StringTrimEnd),
         ("toUpperCase", MethodKind::Method, 0, BuiltinPrimitive::StringToUpperCase),
         ("toLowerCase", MethodKind::Method, 0, BuiltinPrimitive::StringToLowerCase),
+        ("hashCode", MethodKind::Method, 0, BuiltinPrimitive::StringHashCode),
         ("toString", MethodKind::Getter, 0, BuiltinPrimitive::StringToString),
         ("iterate", MethodKind::Method, 1, BuiltinPrimitive::StringIterate),
         ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::StringIteratorValue),
@@ -3133,6 +3135,17 @@ fn execute_primitive(
                 .to_owned()
             };
             Ok(context.allocate_string(output))
+        }
+        StringHashCode => {
+            // Java-compatible and deterministic across runs (the internal content
+            // hash is process-seeded): h = 31*h + c over UTF-16 code units,
+            // wrapping as a signed 32-bit integer. Invalid UTF-8 hashes as its
+            // lossy (U+FFFD) decoding.
+            let bytes = context.string_bytes(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not String"))?;
+            let hash = String::from_utf8_lossy(bytes).encode_utf16()
+                .fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(unit as i32));
+            Ok(Value::from_num(hash as f64))
         }
         StringToUpperCase | StringToLowerCase => {
             let output = {

@@ -148,7 +148,7 @@ fn boolean(value: Value) -> Result<bool, String> {
 }
 
 fn string_object(text: &str) -> HeapObject {
-    HeapObject::String(NapalmString::new(Arc::<[u8]>::from(text.as_bytes())))
+    HeapObject::String(NapalmString::new(StrBytes::from(text.as_bytes())))
 }
 
 fn default_regex_builder(pattern: &str) -> regexr::RegexBuilder {

@@ -691,6 +691,12 @@ pub trait TraceRuntime {
     /// under the current method tables, if any.
     fn trace_standard_list_method(&self, _function: FuncId, _cache: u32) -> Option<TraceListMethod> { None }
 
+    /// Receiver classes (the observed one first, plus PIC classes resolving to
+    /// the same target) for which an ordinary Invoke site resolves to a stock
+    /// host primitive. Primitives run against the heap only: they never execute
+    /// bytecode or change frames, so the site can be a same-frame runtime leaf.
+    fn trace_primitive_invoke_classes(&self, _function: FuncId, _cache: u32, _receiver: RegisterWord) -> Option<Vec<u64>> { None }
+
     /// Which stock Map subscript method an Invoke site resolves to for Map
     /// receivers under the current method tables, if any.
     fn trace_standard_map_method(&self, _function: FuncId, _cache: u32) -> Option<TraceMapMethod> { None }
@@ -3378,12 +3384,26 @@ impl<'a> TraceRecorder<'a> {
                             | RecordingAbort::UnsupportedConstant
                             | RecordingAbort::RepresentationConflict,
                         ) => {
-                            *builder = checkpoint;
+                            *builder = checkpoint.clone();
                         }
                         Err(error) => return Err(error),
                     }
                 } else {
-                    *builder = checkpoint;
+                    *builder = checkpoint.clone();
+                }
+                if op.opcode == Opcode::Invoke {
+                    match self.primitive_leaf_invoke(runtime, program, op, builder) {
+                        Ok(step) => return Ok(step),
+                        Err(
+                            RecordingAbort::UnsupportedCall
+                            | RecordingAbort::UnsupportedOpcode(_)
+                            | RecordingAbort::UnsupportedConstant
+                            | RecordingAbort::RepresentationConflict,
+                        ) => {
+                            *builder = checkpoint;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 // Plain call-to-return. Only NewClassInstance uses the factory
                 // mode; probing here would add an indirect helper call to every
@@ -3401,6 +3421,57 @@ impl<'a> TraceRecorder<'a> {
     /// the observed receiver-class set before entering the prepared bytecode target.
     /// Arguments remain dynamic SSA values and are copied to TraceActivation scratch
     /// on every execution.
+    /// An Invoke whose observed target is a stock host primitive (Map/String/
+    /// List builtins without a native lowering, `map.keys` iteration...).
+    /// Primitives only touch the heap and write the destination register, so
+    /// instead of a full call-to-return boundary (which commits and forgets
+    /// every register) the site becomes a same-frame GC leaf that keeps the
+    /// trace's SSA values. Epoch + receiver-class guards keep the target fixed;
+    /// a failing guard replays the Invoke before any effect.
+    fn primitive_leaf_invoke<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<ExpectedStep, RecordingAbort> {
+        if op.opcode != Opcode::Invoke
+            || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0
+            || op.c as usize != op.args.len()
+            || runtime.trace_reactive_tracking_active()
+        {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+        let descriptor = program
+            .function(op.location.function)
+            .and_then(|function| function.chunk.inline_caches.get(op.x as usize))
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        if descriptor.home_class.is_some() {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+        let receiver_word = runtime
+            .trace_read_slot(FrameSlot::General(Reg(op.b)))
+            .map_err(|_| RecordingAbort::UnsupportedCall)?;
+        let classes = runtime
+            .trace_primitive_invoke_classes(op.location.function, op.x, receiver_word)
+            .ok_or(RecordingAbort::UnsupportedCall)?;
+        if classes.is_empty() {
+            return Err(RecordingAbort::UnsupportedCall);
+        }
+        let exit = builder.add_side_exit(ExitReason::GuardValue, op.location.pc);
+        builder.emit0(TraceInst::GuardMethodEpoch {
+            expected: runtime.trace_method_epoch(),
+            exit,
+        });
+        let receiver = self.read_gpr(builder, op.b, TraceType::Any, TraceRep::Tagged)?;
+        builder.emit1(
+            TraceInst::GuardClass { value: receiver, classes, exit },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        self.runtime_gc_leaf(op, builder, &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)])
+    }
+
     fn direct_dynamic_invoke_call<R: TraceRuntime>(
         &self,
         runtime: &R,

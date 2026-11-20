@@ -435,11 +435,17 @@ impl WholeFunctionJit {
         signature.params.push(AbiParam::new(pointer));
         signature.params.push(AbiParam::new(pointer));
         signature.returns.push(AbiParam::new(types::I64));
+        // The body uses Cranelift's `tail` convention: SysV callee-saves only
+        // (no rsi/rdi/xmm6-15 as on Win64), which every native self-call pays
+        // for in its prologue/epilogue. Rust enters through a host-ABI
+        // trampoline (`entry_signature`) that forwards to the body.
+        let entry_signature = signature.clone();
+        signature.call_conv = cranelift::codegen::isa::CallConv::Tail;
         let func_id = self.module.declare_anonymous_function(&signature)
             .map_err(|e| format!("cannot declare whole function: {e}"))?;
 
         self.context.clear();
-        self.context.func.signature = signature;
+        self.context.func.signature = signature.clone();
         self.context.func.name = UserFuncName::user(1, func_id.as_u32());
         self.function_context = FunctionBuilderContext::new();
 
@@ -958,9 +964,36 @@ impl WholeFunctionJit {
                 eprintln!("[napalm-wfjit] disassembly {:?}:\n{vcode}", function.id);
             }
         }
+
+        // Host-ABI trampoline: `extern "C" fn(vm, regs) -> u64` forwarding to
+        // the tail-convention body.
+        let entry_id = self.module.declare_anonymous_function(&entry_signature)
+            .map_err(|e| format!("cannot declare whole function entry: {e}"))?;
+        self.context.clear();
+        self.context.func.signature = entry_signature;
+        self.context.func.name = UserFuncName::user(1, entry_id.as_u32());
+        self.function_context = FunctionBuilderContext::new();
+        {
+            let target_config = self.module.target_config();
+            let body_ref = self.module.declare_func_in_func(func_id, &mut self.context.func);
+            let mut b = FunctionBuilder::new(&mut self.context.func, &mut self.function_context);
+            let block = b.create_block();
+            b.append_block_params_for_function_params(block);
+            b.switch_to_block(block);
+            b.seal_block(block);
+            let params = b.block_params(block).to_vec();
+            let call = b.ins().call(body_ref, &params);
+            let result = b.inst_results(call)[0];
+            b.ins().return_(&[result]);
+            b.finalize(target_config);
+        }
+        self.context.set_disasm(false);
+        self.module.define_function(entry_id, &mut self.context)
+            .map_err(|e| format!("cannot define whole function entry {:?}: {e}", function.id))?;
+
         self.module.finalize_definitions()
             .map_err(|e| format!("cannot finalize whole function {:?}: {e}", function.id))?;
-        let code = self.module.get_finalized_function(func_id);
+        let code = self.module.get_finalized_function(entry_id);
         let entry: WholeFunctionEntry = unsafe { std::mem::transmute(code) };
         let slot = &mut self.slots[function_index as usize];
         slot.state = FunctionState::Compiled;

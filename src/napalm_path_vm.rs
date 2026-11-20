@@ -449,7 +449,7 @@ impl Interpreter<'_> {
     }
 
     fn new_path_string(&mut self, text: String) -> Value {
-        self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(text.into_bytes()))))
+        self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(text.into_bytes()))))
     }
 
     fn path_dispatch(&mut self, native: PathNative, args: &[RegisterWord]) -> Result<Value, RuntimeError> {

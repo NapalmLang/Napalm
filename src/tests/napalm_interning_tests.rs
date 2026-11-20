@@ -65,11 +65,11 @@ fn napalm_interning_instance_fields_resolve_by_name_id_or_bytes() {
     assert_eq!(slot_of(&mut vm, NapalmString::interned(Name::new("yy"))), Some(1));
     assert_eq!(slot_of(&mut vm, NapalmString::interned(Name::new("interning_instance_missing"))), None);
     // Runtime-built keys carry no name: content hash, then bytes.
-    let built = NapalmString::new(Arc::from(&b"yy"[..]));
+    let built = NapalmString::new(StrBytes::from(&b"yy"[..]));
     assert_eq!(built.name(), None);
     assert_eq!(slot_of(&mut vm, built), Some(1));
-    assert_eq!(slot_of(&mut vm, NapalmString::new(Arc::from(&b"y"[..]))), None);
-    assert_eq!(slot_of(&mut vm, NapalmString::new(Arc::from(&[0xff, 0x01][..]))), None);
+    assert_eq!(slot_of(&mut vm, NapalmString::new(StrBytes::from(&b"y"[..]))), None);
+    assert_eq!(slot_of(&mut vm, NapalmString::new(StrBytes::from(&[0xff, 0x01][..]))), None);
     // Non-String keys and non-instance receivers.
     assert_eq!(vm.instance_property_slot(instance, Value::from_num(1.0)), Some(None));
     assert_eq!(vm.instance_property_slot(Value::from_num(1.0), instance), None);
@@ -85,12 +85,12 @@ fn napalm_interning_policy_names_script_text_and_shape_keys_only() {
         let Some(HeapObject::String(string)) = vm.heap.get(value) else { panic!("program string is not a String") };
         assert_eq!(string.name(), Some(name));
         assert_eq!(string.as_ref(), name.as_bytes());
-        assert_eq!(string.hash, fast_hash_bytes(name.as_bytes()));
+        assert_eq!(string.hash(), fast_hash_bytes(name.as_bytes()));
     }
     assert!(Name::lookup("interning_policy_literal").is_some());
 
     // Runtime-built strings are not interned on creation...
-    let built = NapalmString::new(Arc::from(&b"interning_policy_runtime_value"[..]));
+    let built = NapalmString::new(StrBytes::from(&b"interning_policy_runtime_value"[..]));
     assert_eq!(built.name(), None);
     assert_eq!(Name::lookup("interning_policy_runtime_value"), None);
 

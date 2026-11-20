@@ -470,6 +470,11 @@ impl Collector {
         let mut builder = MMTKBuilder::new();
         assert!(builder.set_option("plan", "StickyImmix"));
         assert!(builder.set_option("full_heap_system_gc", "false"));
+        // Every allocation path writes the complete Header and the payload
+        // (ManagedObject / caller-initialized variable objects), so Immix need
+        // not memset fresh pages and recycled lines first. That memset was a
+        // third of allocation-heavy loops (it also took the first-touch faults).
+        assert!(builder.set_option("immix_zero_memory", "false"));
         assert!(builder.set_option("threads", &config.workers.to_string()));
         assert!(builder.set_option(
             "gc_trigger",

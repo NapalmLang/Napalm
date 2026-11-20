@@ -252,10 +252,12 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     end_line,
                     self.tls
                 );
-                crate::util::memory::zero(
-                    self.bump_pointer.cursor,
-                    self.bump_pointer.limit - self.bump_pointer.cursor,
-                );
+                if self.immix_space().common().zeroed {
+                    crate::util::memory::zero(
+                        self.bump_pointer.cursor,
+                        self.bump_pointer.limit - self.bump_pointer.cursor,
+                    );
+                }
                 debug_assert!(
                     align_allocation_no_fill::<VM>(self.bump_pointer.cursor, align, offset) + size
                         <= self.bump_pointer.limit

@@ -740,7 +740,7 @@ impl Interpreter<'_> {
                             SqlValue::Integer(v) => Value::from_num(v as f64),
                             SqlValue::Real(v) => Value::from_num(v),
                             SqlValue::Text(v) => self.heap.alloc(HeapObject::String(
-                                NapalmString::new(Arc::<[u8]>::from(v.into_bytes())),
+                                NapalmString::new(StrBytes::from(v.into_bytes())),
                             )),
                             SqlValue::Blob(v) => self.heap.alloc(HeapObject::Bytes(
                                 NapalmBytes::from_inner(bytes::Bytes::from(v)),

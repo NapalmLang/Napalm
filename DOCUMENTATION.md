@@ -3147,6 +3147,7 @@ Negative indices in `text[index]` count from the end.
 | `substring(start, end?)` | Clamps negatives to zero and swaps reversed endpoints. |
 | `trim()`, `trimStart()`, `trimEnd()` | Removes Unicode whitespace at the corresponding ends. |
 | `toUpperCase()`, `toLowerCase()` | Unicode uppercase/lowercase conversion. |
+| `hashCode()` | Deterministic 32-bit hash, compatible with Java's `String.hashCode()`: `h = 31 * h + unit` over UTF-16 code units, as a signed integer (`"".hashCode()` is `0`, `"abc".hashCode()` is `96354`). Stable across runs and machines. |
 | `toString`, `toString()` | The string itself. |
 | `iterate`, `iteratorValue` | Iteration by scalar value. |
 | `String.fromCodePoint(number)` | String from a valid Unicode code point. |

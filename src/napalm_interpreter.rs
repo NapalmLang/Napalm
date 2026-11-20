@@ -1020,7 +1020,7 @@ mod aes_hash_integration_tests {
         assert_eq!(local, remote);
         let string = NapalmString::new(local.bytes.clone());
         assert_eq!(local, MapStringKey::from_napalm(&string));
-        assert_eq!(string.hash, fast_hash_bytes(string.as_ref()));
+        assert_eq!(string.hash(), fast_hash_bytes(string.as_ref()));
     }
 
     #[test]
@@ -1047,29 +1047,203 @@ mod aes_hash_integration_tests {
     }
 }
 
-/// Immutable Napalm string payload with its content hash computed once. Strings are
-/// immutable, so dictionary lookups can reuse this hash instead of rescanning UTF-8
-/// bytes on every Map access.
+/// Shared, append-only byte storage behind every Napalm String.
+///
+/// One allocation holds a small header followed by `cap` bytes. A `StrBytes`
+/// handle is a view of the first `len` bytes. Views never change, so several
+/// Strings can share one buffer: `s + x` appends `x` in place when `s` ends
+/// exactly at the buffer's `tip` (the longest view handed out so far) and the
+/// buffer has room. The CAS on `tip` makes the claim exclusive, so the bytes
+/// written are beyond every existing view and nobody can observe them until the
+/// new view is published. This turns `s = s + x` loops from O(n^2) into
+/// amortized O(n) without ropes or any change to how Strings are read.
+#[repr(C)]
+struct StrHeader {
+    refs: AtomicUsize,
+    tip: AtomicUsize,
+    cap: usize,
+}
+
+pub(crate) struct StrBytes {
+    header: std::ptr::NonNull<StrHeader>,
+    len: usize,
+}
+
+// SAFETY: the shared bytes below `len` are immutable; appends only write past
+// the tip after an exclusive CAS claim; the reference count is atomic.
+unsafe impl Send for StrBytes {}
+unsafe impl Sync for StrBytes {}
+
+impl StrBytes {
+    #[inline]
+    fn layout(cap: usize) -> std::alloc::Layout {
+        std::alloc::Layout::new::<StrHeader>()
+            .extend(std::alloc::Layout::array::<u8>(cap).expect("string capacity overflow"))
+            .expect("string capacity overflow")
+            .0
+            .pad_to_align()
+    }
+
+    #[inline(always)]
+    fn data(header: std::ptr::NonNull<StrHeader>) -> *mut u8 {
+        unsafe { header.as_ptr().cast::<u8>().add(std::mem::size_of::<StrHeader>()) }
+    }
+
+    /// A fresh buffer of `cap >= sum(parts)` bytes holding the concatenated parts.
+    fn from_parts(parts: &[&[u8]], cap: usize) -> Self {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        let cap = cap.max(len);
+        let layout = Self::layout(cap);
+        // SAFETY: the layout is never zero-sized (it always contains the header).
+        let raw = unsafe { std::alloc::alloc(layout) }.cast::<StrHeader>();
+        let Some(header) = std::ptr::NonNull::new(raw) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        unsafe {
+            header.as_ptr().write(StrHeader {
+                refs: AtomicUsize::new(1),
+                tip: AtomicUsize::new(len),
+                cap,
+            });
+            let mut cursor = Self::data(header);
+            for part in parts {
+                std::ptr::copy_nonoverlapping(part.as_ptr(), cursor, part.len());
+                cursor = cursor.add(part.len());
+            }
+        }
+        Self { header, len }
+    }
+
+    #[inline]
+    fn copy_from(bytes: &[u8]) -> Self { Self::from_parts(&[bytes], bytes.len()) }
+
+    /// `self ++ extra` as a new view: in place when `self` owns the buffer's
+    /// tip and the capacity suffices, otherwise `None`.
+    fn try_append(&self, extra: &[u8]) -> Option<Self> {
+        let header = unsafe { self.header.as_ref() };
+        let end = self.len.checked_add(extra.len())?;
+        if end > header.cap {
+            return None;
+        }
+        header.tip.compare_exchange(self.len, end, Ordering::AcqRel, Ordering::Relaxed).ok()?;
+        // SAFETY: the successful CAS gives this thread exclusive ownership of
+        // `len..end`, which lies inside the allocation and past every view.
+        unsafe {
+            std::ptr::copy_nonoverlapping(extra.as_ptr(), Self::data(self.header).add(self.len), extra.len());
+        }
+        header.refs.fetch_add(1, Ordering::Relaxed);
+        Some(Self { header: self.header, len: end })
+    }
+}
+
+impl Clone for StrBytes {
+    #[inline]
+    fn clone(&self) -> Self {
+        let previous = unsafe { self.header.as_ref() }.refs.fetch_add(1, Ordering::Relaxed);
+        if previous > isize::MAX as usize {
+            std::process::abort();
+        }
+        Self { header: self.header, len: self.len }
+    }
+}
+
+impl Drop for StrBytes {
+    #[inline]
+    fn drop(&mut self) {
+        let header = unsafe { self.header.as_ref() };
+        if header.refs.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+        let layout = Self::layout(header.cap);
+        // SAFETY: last reference; allocated by `from_parts` with this layout.
+        unsafe { std::alloc::dealloc(self.header.as_ptr().cast::<u8>(), layout) };
+    }
+}
+
+impl std::ops::Deref for StrBytes {
+    type Target = [u8];
+    #[inline(always)]
+    fn deref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(Self::data(self.header), self.len) }
+    }
+}
+
+impl AsRef<[u8]> for StrBytes {
+    #[inline(always)]
+    fn as_ref(&self) -> &[u8] { self }
+}
+
+impl std::fmt::Debug for StrBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&String::from_utf8_lossy(self), f)
+    }
+}
+
+impl From<&[u8]> for StrBytes {
+    #[inline]
+    fn from(bytes: &[u8]) -> Self { Self::copy_from(bytes) }
+}
+impl From<Arc<[u8]>> for StrBytes {
+    #[inline]
+    fn from(bytes: Arc<[u8]>) -> Self { Self::copy_from(&bytes) }
+}
+impl From<Vec<u8>> for StrBytes {
+    #[inline]
+    fn from(bytes: Vec<u8>) -> Self { Self::copy_from(&bytes) }
+}
+impl From<&str> for StrBytes {
+    #[inline]
+    fn from(text: &str) -> Self { Self::copy_from(text.as_bytes()) }
+}
+impl From<String> for StrBytes {
+    #[inline]
+    fn from(text: String) -> Self { Self::copy_from(text.as_bytes()) }
+}
+impl From<&Vec<u8>> for StrBytes {
+    #[inline]
+    fn from(bytes: &Vec<u8>) -> Self { Self::copy_from(bytes) }
+}
+impl From<Box<[u8]>> for StrBytes {
+    #[inline]
+    fn from(bytes: Box<[u8]>) -> Self { Self::copy_from(&bytes) }
+}
+
+/// Immutable Napalm string payload. Its content hash is computed on first use
+/// and cached (0 means "not computed yet"), so building Strings never pays for
+/// a hash nobody asks for while dictionary lookups still hash only once.
 ///
 /// Strings that come from the script source (literals, property, class,
 /// method and variable names) and strings used as hidden-class object keys
 /// carry their interned [`Name`]. Runtime-built strings (concatenation, fetch,
 /// loops, temporaries) never do; if one is used as an object key, the shape
 /// stores an interned copy of the key instead.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct NapalmString {
-    bytes: Arc<[u8]>,
-    hash: u64,
+    bytes: StrBytes,
+    hash: AtomicU64,
     code_points: usize,
     name: Option<Name>,
 }
 
+impl Clone for NapalmString {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes.clone(),
+            hash: AtomicU64::new(self.hash.load(Ordering::Relaxed)),
+            code_points: self.code_points,
+            name: self.name,
+        }
+    }
+}
+
 impl NapalmString {
     #[inline]
-    fn new(bytes: Arc<[u8]>) -> Self {
-        let hash = fast_hash_bytes(bytes.as_ref());
+    fn new(bytes: impl Into<StrBytes>) -> Self {
+        let bytes = bytes.into();
         let code_points = napalm_code_point_count(bytes.as_ref());
-        Self { bytes, hash, code_points, name: None }
+        Self { bytes, hash: AtomicU64::new(0), code_points, name: None }
     }
 
     /// A String for script text: reuses the interned content hash.
@@ -1077,11 +1251,39 @@ impl NapalmString {
     fn interned(name: Name) -> Self {
         let bytes = name.as_bytes();
         Self {
-            bytes: Arc::from(bytes),
-            hash: name.content_hash(),
+            bytes: StrBytes::copy_from(bytes),
+            hash: AtomicU64::new(name.content_hash()),
             code_points: napalm_code_point_count(bytes),
             name: Some(name),
         }
+    }
+
+    /// A String value for a Map key: shares the key's bytes and interned name.
+    #[inline]
+    fn from_map_key(key: &MapStringKey) -> Self {
+        Self {
+            bytes: key.bytes.clone(),
+            hash: AtomicU64::new(key.name.map_or(0, |name| name.content_hash())),
+            code_points: napalm_code_point_count(key.bytes.as_ref()),
+            name: key.name,
+        }
+    }
+
+    /// The content hash (`fast_hash_bytes`), computed once on demand.
+    #[inline(always)]
+    fn hash(&self) -> u64 {
+        let cached = self.hash.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        self.compute_hash()
+    }
+
+    #[cold]
+    fn compute_hash(&self) -> u64 {
+        let hash = fast_hash_bytes(self.bytes.as_ref());
+        self.hash.store(hash, Ordering::Relaxed);
+        hash
     }
 
     #[inline(always)]
@@ -1089,15 +1291,15 @@ impl NapalmString {
 
     #[inline(always)]
     fn probe(&self) -> StrProbe<'_> {
-        StrProbe { bytes: self.bytes.as_ref(), hash: key_hash(self.hash), name: self.name() }
+        StrProbe { bytes: self.bytes.as_ref(), hash: key_hash(self.hash()), name: self.name() }
     }
 
-    /// `left + right` with one copy into the final shared buffer. The previous
-    /// path built a Vec, copied it again into an `Arc<[u8]>`, then rescanned the
-    /// result for its code-point count: three extra O(n) passes per
-    /// concatenation, which dominated `s = s + x` loops. The code-point count is
-    /// additive unless a code point at the end of `left` could decode into
-    /// `right` (an incomplete multi-byte tail); only then is the result recounted.
+    /// `left + right`. Appends in place into `left`'s buffer when `left` ends at
+    /// its tip (the common `s = s + x` loop), otherwise copies once into a new
+    /// buffer; results of 64+ bytes get 50% headroom so a loop that keeps
+    /// growing the newest String amortizes to O(1) per append. The code-point
+    /// count is additive unless a code point at the end of `left` could decode
+    /// into `right` (an incomplete multi-byte tail); only then is it recounted.
     fn concat(left: &NapalmString, right: &NapalmString) -> NapalmString {
         if right.bytes.is_empty() {
             return NapalmString { name: None, ..left.clone() };
@@ -1106,19 +1308,11 @@ impl NapalmString {
             return NapalmString { name: None, ..right.clone() };
         }
         let (a, b): (&[u8], &[u8]) = (left.bytes.as_ref(), right.bytes.as_ref());
-        let mut buffer = Arc::<[u8]>::new_uninit_slice(a.len() + b.len());
-        {
-            let slots = Arc::get_mut(&mut buffer).expect("a fresh Arc is unique");
-            let base = slots.as_mut_ptr().cast::<u8>();
-            // SAFETY: `slots` holds exactly a.len() + b.len() bytes and the
-            // sources are distinct live allocations.
-            unsafe {
-                std::ptr::copy_nonoverlapping(a.as_ptr(), base, a.len());
-                std::ptr::copy_nonoverlapping(b.as_ptr(), base.add(a.len()), b.len());
-            }
-        }
-        // SAFETY: every byte was initialized above.
-        let bytes: Arc<[u8]> = unsafe { buffer.assume_init() };
+        let bytes = left.bytes.try_append(b).unwrap_or_else(|| {
+            let total = a.len() + b.len();
+            let cap = if total >= 64 { total + total / 2 } else { total };
+            StrBytes::from_parts(&[a, b], cap)
+        });
         let tail_complete = (a.len().saturating_sub(3)..a.len()).all(|index| {
             let needed = match a[index] {
                 0xC2..=0xDF => 2,
@@ -1133,8 +1327,7 @@ impl NapalmString {
         } else {
             napalm_code_point_count(bytes.as_ref())
         };
-        let hash = fast_hash_bytes(bytes.as_ref());
-        NapalmString { bytes, hash, code_points, name: None }
+        NapalmString { bytes, hash: AtomicU64::new(0), code_points, name: None }
     }
 }
 
@@ -1193,7 +1386,7 @@ impl AsRef<[u8]> for NapalmString {
 
 #[derive(Clone, Debug)]
 struct MapStringKey {
-    bytes: Arc<[u8]>,
+    bytes: StrBytes,
     /// `key_hash` of the content hash.
     hash: u32,
     /// Interned name. Always present for UTF-8 hidden-class shape keys.
@@ -1202,20 +1395,21 @@ struct MapStringKey {
 
 impl MapStringKey {
     #[inline]
-    fn new(bytes: Arc<[u8]>) -> Self {
+    fn new(bytes: impl Into<StrBytes>) -> Self {
+        let bytes = bytes.into();
         let hash = key_hash(fast_hash_bytes(bytes.as_ref()));
         Self { bytes, hash, name: None }
     }
 
     #[inline]
     fn from_napalm(value: &NapalmString) -> Self {
-        Self { bytes: value.bytes.clone(), hash: key_hash(value.hash), name: value.name() }
+        Self { bytes: value.bytes.clone(), hash: key_hash(value.hash()), name: value.name() }
     }
 
     /// Key for a script-level name (property, field, method...).
     #[inline]
     fn interned(name: Name) -> Self {
-        Self { bytes: Arc::from(name.as_bytes()), hash: key_hash(name.content_hash()), name: Some(name) }
+        Self { bytes: StrBytes::copy_from(name.as_bytes()), hash: key_hash(name.content_hash()), name: Some(name) }
     }
 
     /// Intern before becoming a shape key. Shape keys are bounded (by size,
@@ -3279,6 +3473,16 @@ const HANDLE_RECYCLE_BATCH: usize = 32;
 
 type HandleEntry = TraceHeapEntry;
 
+/// Whether `entry` is all zero bits (the precondition of zeroed handle chunks).
+fn handle_entry_is_zero(entry: &HandleEntry) -> bool {
+    // SAFETY: TraceHeapEntry is plain atomics/integers with no padding reads
+    // that matter for this debug check beyond reading initialized bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts((entry as *const HandleEntry).cast::<u8>(), std::mem::size_of::<HandleEntry>())
+    };
+    bytes.iter().all(|&byte| byte == 0)
+}
+
 /// Native-visible summary of a List's element contracts (see
 /// `TRACE_LIST_ELEMENTS_NUMBER`). `contract_pointer` is the handle entry's
 /// staged/published contract vector (null when the List has none).
@@ -3343,24 +3547,32 @@ impl HandleTable {
         let _guard = self.install_lock.lock();
         let mut current = self.chunks[chunk_index].load(Ordering::Acquire);
         if current.is_null() {
-            let chunk = (0..HANDLE_CHUNK_SIZE)
-                .map(|_| HandleEntry::new(FREE_HANDLE_NONE))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let slice = Box::leak(chunk);
-            current = slice.as_mut_ptr();
+            // A fresh entry (`HandleEntry::new(FREE_HANDLE_NONE)`) is all zero
+            // bits, so a zeroed allocation is a fully initialized chunk. The
+            // allocator hands out fresh OS pages already zeroed instead of
+            // memsetting ~56 KiB per 1024 handles (13% of allocation loops).
+            debug_assert!(handle_entry_is_zero(&HandleEntry::new(FREE_HANDLE_NONE)));
+            current = Self::zeroed_chunk::<HandleEntry>();
             self.chunks[chunk_index].store(current, Ordering::Release);
         }
         let generation = self.generation_chunks[chunk_index].load(Ordering::Acquire);
         if generation.is_null() {
-            let chunk = (0..HANDLE_CHUNK_SIZE)
-                .map(|_| AtomicU64::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let slice = Box::leak(chunk);
-            self.generation_chunks[chunk_index].store(slice.as_mut_ptr(), Ordering::Release);
+            self.generation_chunks[chunk_index].store(Self::zeroed_chunk::<AtomicU64>(), Ordering::Release);
         }
         current
+    }
+
+    /// A leaked, zero-initialized chunk of `HANDLE_CHUNK_SIZE` values whose
+    /// all-zero bit pattern is a valid initial value.
+    fn zeroed_chunk<T>() -> *mut T {
+        let layout = std::alloc::Layout::array::<T>(HANDLE_CHUNK_SIZE).expect("handle chunk layout");
+        // SAFETY: non-zero-sized layout; callers only use types whose zero
+        // bit pattern is their initial value (atomics/integers).
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<T>();
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        raw
     }
 
     #[inline(always)]
@@ -5758,7 +5970,7 @@ impl HostContext<'_> {
         match (self.heap.get(left), self.heap.get(right)) {
             (Some(HeapObject::String(a)), Some(HeapObject::String(b))) => Some(match (a.name(), b.name()) {
                 (Some(x), Some(y)) => x == y,
-                _ => a.hash == b.hash && a.as_ref() == b.as_ref(),
+                _ => a.hash() == b.hash() && a.as_ref() == b.as_ref(),
             }),
             _ => None,
         }
@@ -5801,11 +6013,11 @@ impl HostContext<'_> {
     }
 
     pub fn allocate_string(&mut self, value: impl AsRef<str>) -> Value {
-        self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(value.as_ref().as_bytes()))))
+        self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(value.as_ref().as_bytes()))))
     }
 
     pub fn allocate_bytes(&mut self, value: impl AsRef<[u8]>) -> Value {
-        self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(value.as_ref()))))
+        self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(value.as_ref()))))
     }
 
     pub fn allocate_list(&mut self, values: Vec<Value>) -> Value {
@@ -6128,7 +6340,8 @@ impl HostContext<'_> {
             MapKey::Null => Value::NULL,
             MapKey::Bool(value) => Value::from_bool(value),
             MapKey::Num(bits) => Value::from_num(f64::from_bits(bits)),
-            MapKey::String(bytes) => self.allocate_bytes(bytes),
+            // Share the key's bytes (and interned name/hash) instead of copying.
+            MapKey::String(key) => self.heap.alloc(HeapObject::String(NapalmString::from_map_key(&key))),
             MapKey::Object(handle) => Value::from_heap(handle),
         })
     }
@@ -9050,7 +9263,7 @@ impl<'p> Interpreter<'p> {
         {
             let mut chars = Vec::with_capacity(128);
             for byte in 0u8..128 {
-                let value = heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(&[byte][..]))));
+                let value = heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(&[byte][..]))));
                 init_roots.push(value);
                 chars.push(value);
             }
@@ -9230,7 +9443,7 @@ impl<'p> Interpreter<'p> {
         unsafe { main.get_mut() }.object = main_object;
         heap.set_stack_owner(main_object);
 
-        let cancelled_error = heap.alloc(HeapObject::String(NapalmString::new(Arc::from(
+        let cancelled_error = heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
             &b"CancelledError: Promise cancelled"[..],
         ))));
         init_roots.push(cancelled_error);
@@ -11916,11 +12129,11 @@ impl<'p> Interpreter<'p> {
         let error = self.heap.alloc(HeapObject::Map(NapalmMap::default()));
         let error_root = self.add_root(error);
 
-        let name = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+        let name = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
             &b"AggregateError"[..],
         ))));
         let name_root = self.add_root(name);
-        let message = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+        let message = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
             &b"All promises were rejected"[..],
         ))));
         let message_root = self.add_root(message);
@@ -12472,7 +12685,7 @@ impl<'p> Interpreter<'p> {
 
     fn allocate_rejected_promise_message(&mut self, message: impl Into<String>) -> Value {
         let message = message.into();
-        let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+        let reason = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
             message.into_bytes(),
         ))));
         let reason_root = self.add_root(reason);
@@ -12543,7 +12756,7 @@ impl<'p> Interpreter<'p> {
                 }
             }
             Err(error) => {
-                let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                let reason = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                     format!("TypeError: {}", error.message).into_bytes(),
                 ))));
                 let _ = self.settle_promise_outcome(promise, PromiseOutcome::Rejected(reason));
@@ -12574,7 +12787,7 @@ impl<'p> Interpreter<'p> {
                 }
             }
             Err(error) => {
-                let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                let reason = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                     format!("TypeError: {}", error.message).into_bytes(),
                 ))));
                 PromiseOutcome::Rejected(reason)
@@ -12706,7 +12919,7 @@ impl<'p> Interpreter<'p> {
             ResponseDecodedKind::Json => self.parse_json_response_body(body)?,
             ResponseDecodedKind::Text => {
                 let text = String::from_utf8_lossy(&body);
-                self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                     text.as_bytes(),
                 ))))
             }
@@ -12756,7 +12969,7 @@ impl<'p> Interpreter<'p> {
                 let string = value
                     .as_str()
                     .ok_or_else(|| RuntimeError::new("invalid JSON String"))?;
-                Ok(self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                Ok(self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                     string.as_bytes(),
                 )))))
             }
@@ -12897,7 +13110,7 @@ impl<'p> Interpreter<'p> {
 
         let snapshot = match self.heap.get(value) {
             Some(HeapObject::String(string)) => {
-                ConcurrentValue::String(string.bytes.clone())
+                ConcurrentValue::String(Arc::from(string.bytes.as_ref()))
             }
             Some(HeapObject::List(values)) => {
                 let id = *next_id;
@@ -12929,7 +13142,7 @@ impl<'p> Interpreter<'p> {
                         MapKey::Null => ConcurrentKey::Null,
                         MapKey::Bool(value) => ConcurrentKey::Bool(value),
                         MapKey::Num(bits) => ConcurrentKey::Num(bits),
-                        MapKey::String(string) => ConcurrentKey::String(string.bytes.clone()),
+                        MapKey::String(string) => ConcurrentKey::String(Arc::from(string.bytes.as_ref())),
                         MapKey::Object(_) => {
                             return Err(RuntimeError::new(
                                 "Map object keys cannot cross a concurrent boundary",
@@ -13244,14 +13457,14 @@ impl<'p> Interpreter<'p> {
             Ok(snapshot) => match self.materialize_concurrent_value(&snapshot) {
                 Ok(value) => PromiseOutcome::Fulfilled(value),
                 Err(error) => {
-                    let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(
+                    let reason = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                         format!("ConcurrentError: {}", error.message).into_bytes(),
                     ))));
                     PromiseOutcome::Rejected(reason)
                 }
             },
             Err(message) => {
-                let reason = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(
+                let reason = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                     format!("ConcurrentError: {message}").into_bytes(),
                 ))));
                 PromiseOutcome::Rejected(reason)
@@ -15659,7 +15872,7 @@ impl Interpreter<'_> {
                 // The pointer is owned by native code. Copy before any managed
                 // allocation/safepoint; the Napalm String never aliases C memory.
                 let bytes = unsafe { Self::ffi_copy_cstring(pointer.cast::<u8>())? };
-                Ok(self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(bytes)))))
+                Ok(self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(bytes)))))
             }
             _ => Err(numeric_mismatch()),
         }
@@ -16452,7 +16665,7 @@ impl Interpreter<'_> {
                 };
                 self.mark_gc_point(op);
                 self.maybe_collect();
-                let value = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                let value = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                     text.as_bytes(),
                 ))));
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
@@ -16471,7 +16684,7 @@ impl Interpreter<'_> {
                 };
                 self.mark_gc_point(op);
                 self.maybe_collect();
-                let value = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                let value = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                     url.as_bytes(),
                 ))));
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
@@ -16534,7 +16747,7 @@ impl Interpreter<'_> {
                 let value = if let Some(result) = result {
                     self.mark_gc_point(op);
                     self.maybe_collect();
-                    self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(
+                    self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                         result.into_bytes(),
                     ))))
                 } else {
@@ -16585,7 +16798,7 @@ impl Interpreter<'_> {
                 let name = library.name().to_owned();
                 self.mark_gc_point(op);
                 self.maybe_collect();
-                let value = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(name.into_bytes()))));
+                let value = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(name.into_bytes()))));
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::FfiLibraryFunction => {
@@ -16621,7 +16834,7 @@ impl Interpreter<'_> {
                 let name = function.symbol().as_bytes().to_vec();
                 self.mark_gc_point(op);
                 self.maybe_collect();
-                let value = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(name))));
+                let value = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(name))));
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::FfiFunctionCall => {
@@ -16709,7 +16922,7 @@ impl Interpreter<'_> {
                 };
                 self.mark_gc_point(op);
                 self.maybe_collect();
-                let value = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(bytes))));
+                let value = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(bytes))));
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::FfiPointerToString => {
@@ -16720,7 +16933,7 @@ impl Interpreter<'_> {
                 let text = format!("0x{address:x}");
                 self.mark_gc_point(op);
                 self.maybe_collect();
-                let value = self.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(text.into_bytes()))));
+                let value = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(text.into_bytes()))));
                 unsafe { self.set_reg(op.a, value.word()); self.advance(op); }
             }
             NativeBuiltin::SystemOs => {
@@ -17323,7 +17536,7 @@ impl Interpreter<'_> {
                     Some(key_name) => fields.iter().position(|id| field_name(id) == Some(key_name)),
                     // Runtime-built key: cached content hash, then bytes.
                     None => fields.iter().position(|id| field_name(id).is_some_and(|field| {
-                        field.content_hash() == key.hash && field.as_bytes() == &*key.bytes
+                        field.content_hash() == key.hash() && field.as_bytes() == &*key.bytes
                     })),
                 }
                 .filter(|&slot| !self.is_hidden_reactive_field(fields[slot]))
@@ -20043,7 +20256,7 @@ fn normalize_byte_index(index: i32, len: usize, allow_end: bool) -> Option<usize
 
 unsafe fn h_string_len(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));match vm.heap.get(string){Some(HeapObject::String(s))=>{vm.set_reg(op.a,i32_word(s.code_points as i32));vm.advance(op)},_=>vm.fail_at(op,"StringLen operand is not string")}}
 unsafe fn h_string_concat(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let left=Value::from_word(vm.reg(op.b));let right=Value::from_word(vm.reg(op.c));let (a,b)=match(vm.heap.get(left),vm.heap.get(right)){(Some(HeapObject::String(a)),Some(HeapObject::String(b)))=>(a.clone(),b.clone()),_=>{vm.fail_at(op,"StringConcat operands must be strings");return;}};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::String(NapalmString::concat(&a,&b)));vm.set_reg(op.a,value.word());vm.advance(op)}
-unsafe fn h_string_slice(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));let start=word_i32(vm.reg(op.c));let count=word_i32(vm.reg(op.x as u8));if count<0{vm.fail_at(op,"negative string slice length");return;}let source=match vm.heap.get(string){Some(HeapObject::String(s))=>s.clone(),_=>{vm.fail_at(op,"StringSlice operand is not string");return;}};let Some(begin)=normalize_byte_index(start,source.len(),true)else{vm.fail_at(op,"string byte offset out of bounds");return;};let Some(end)=begin.checked_add(count as usize).filter(|end|*end<=source.len())else{vm.fail_at(op,"string slice out of bounds");return;};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::<[u8]>::from(&source[begin..end]))));vm.set_reg(op.a,value.word());vm.advance(op)}
+unsafe fn h_string_slice(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));let start=word_i32(vm.reg(op.c));let count=word_i32(vm.reg(op.x as u8));if count<0{vm.fail_at(op,"negative string slice length");return;}let source=match vm.heap.get(string){Some(HeapObject::String(s))=>s.clone(),_=>{vm.fail_at(op,"StringSlice operand is not string");return;}};let Some(begin)=normalize_byte_index(start,source.len(),true)else{vm.fail_at(op,"string byte offset out of bounds");return;};let Some(end)=begin.checked_add(count as usize).filter(|end|*end<=source.len())else{vm.fail_at(op,"string slice out of bounds");return;};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(&source[begin..end]))));vm.set_reg(op.a,value.word());vm.advance(op)}
 unsafe fn h_string_code_point_at(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let string=Value::from_word(vm.reg(op.b));let index=word_i32(vm.reg(op.c));let code=match vm.heap.get(string){Some(HeapObject::String(bytes))=>normalize_byte_index(index,bytes.len(),false).map(|i|decode_napalm_code_point(bytes.as_ref(),i).0 as i32),_=>None};match code{Some(c)=>{vm.set_reg(op.a,i32_word(c));vm.advance(op)},None=>vm.fail_at(op,"string byte offset out of bounds")}}
 unsafe fn h_make_range(vm:&mut Interpreter, ptr:*const PreparedOp){let op=&*ptr;let from=Value::from_word(vm.reg(op.b)).as_num();let to=Value::from_word(vm.reg(op.c)).as_num();let(Some(from),Some(to))=(from,to)else{vm.fail_at(op,"range endpoints must be numbers");return;};vm.mark_gc_point(op);vm.maybe_collect();let value=vm.heap.alloc(HeapObject::Range{from,to,inclusive:op.x!=0});vm.set_reg(op.a,value.word());vm.advance(op)}
 
@@ -20549,6 +20762,31 @@ impl TraceRuntime for Interpreter<'_> {
             }
         }
         Some((self.prepared.functions.get(index as usize)?.id, classes))
+    }
+
+    fn trace_primitive_invoke_classes(&self, function: FuncId, cache: u32, receiver: RegisterWord) -> Option<Vec<u64>> {
+        let class = self.heap.receiver_class(Value::from_word(receiver))?;
+        let descriptor = self.program.function(function)?.chunk.inline_caches.get(cache as usize)?;
+        if descriptor.home_class.is_some() {
+            return None;
+        }
+        let target = self.lookup_method(class, descriptor.method, None)?;
+        if !matches!(target, CallTarget::Primitive(_)) {
+            return None;
+        }
+        let mut classes = vec![class.0];
+        let function_index = *self.prepared.function_by_id.get(&function)? as usize;
+        let cache = self.inline_caches.get(function_index)?.get(cache as usize)?;
+        if !cache.megamorphic {
+            for entry in &cache.entries[..cache.len as usize] {
+                if classes.len() < 4 && !classes.contains(&entry.class.0)
+                    && entry.target == target
+                    && self.lookup_method(entry.class, descriptor.method, None) == Some(target) {
+                    classes.push(entry.class.0);
+                }
+            }
+        }
+        Some(classes)
     }
 
     fn trace_inline_method_target(
@@ -23488,15 +23726,15 @@ let result = r1 + r2 + r3 + r4 + r5;
         let root_a = vm.add_root(map_a);
         let map_b = vm.heap.alloc(HeapObject::Map(NapalmMap::default()));
         let root_b = vm.add_root(map_b);
-        let key_x = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"x".as_slice()))));
+        let key_x = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(b"x".as_slice()))));
         let root_x = vm.add_root(key_x);
-        let key_y = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"y".as_slice()))));
+        let key_y = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(b"y".as_slice()))));
         let root_y = vm.add_root(key_y);
         // Distinct String objects with equal bytes must still converge on the
         // same hidden-class transition and hit the same PIC entry by content.
-        let key_x_b = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"x".as_slice()))));
+        let key_x_b = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(b"x".as_slice()))));
         let root_x_b = vm.add_root(key_x_b);
-        let key_y_b = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"y".as_slice()))));
+        let key_y_b = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(b"y".as_slice()))));
         let root_y_b = vm.add_root(key_y_b);
 
         {
@@ -23565,9 +23803,9 @@ let result = r1 + r2 + r3 + r4 + r5;
         let mut vm = Interpreter::new(&program).unwrap();
         let map = vm.heap.alloc(HeapObject::Map(NapalmMap::default()));
         let root_map = vm.add_root(map);
-        let key = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"field".as_slice()))));
+        let key = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(b"field".as_slice()))));
         let root_key = vm.add_root(key);
-        let missing = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"missing".as_slice()))));
+        let missing = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(b"missing".as_slice()))));
         let root_missing = vm.add_root(missing);
 
         {
@@ -23629,11 +23867,11 @@ let result = r1 + r2 + r3 + r4 + r5;
         let program = simple_program(asm.finish().unwrap(), 1);
         let mut vm = Interpreter::new(&program).unwrap();
 
-        let key_x = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"x".as_slice()))));
+        let key_x = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(b"x".as_slice()))));
         let root_x = vm.add_root(key_x);
-        let key_payload = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"payload".as_slice()))));
+        let key_payload = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(b"payload".as_slice()))));
         let root_payload = vm.add_root(key_payload);
-        let key_extra = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(b"extra".as_slice()))));
+        let key_extra = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(b"extra".as_slice()))));
         let root_extra = vm.add_root(key_extra);
 
         let open_a = vm.heap.alloc(HeapObject::Map(NapalmMap::default()));
@@ -23771,7 +24009,7 @@ let result = r1 + r2 + r3 + r4 + r5;
         let mut vm = Interpreter::new(&program).unwrap();
         let map = vm.heap.alloc(HeapObject::Map(NapalmMap::default()));
         let root_map = vm.add_root(map);
-        let key = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(vec![b'k'; MAX_SHAPED_MAP_KEY_BYTES + 1]))));
+        let key = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(vec![b'k'; MAX_SHAPED_MAP_KEY_BYTES + 1]))));
         let root_key = vm.add_root(key);
 
         {
@@ -23799,9 +24037,9 @@ let result = r1 + r2 + r3 + r4 + r5;
         let root_map = vm.add_root(map);
 
         let bytes = vec![b'k'; MAX_SHAPED_MAP_KEY_BYTES + 1];
-        let key_a = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(bytes.clone()))));
+        let key_a = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(bytes.clone()))));
         let root_a = vm.add_root(key_a);
-        let key_b = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(bytes))));
+        let key_b = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(bytes))));
         let root_b = vm.add_root(key_b);
 
         {
@@ -25480,7 +25718,7 @@ var result = CallLoop.run();
             );
         }
         for i in 0..32 {
-            let child = vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(format!("child{i}").as_bytes()))));
+            let child = vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(format!("child{i}").as_bytes()))));
             let mut context = HostContext { heap: &mut vm.heap };
             context.list_push(list, child).unwrap();
             context.map_set(map, list, child).unwrap();
@@ -25526,7 +25764,7 @@ var result = CallLoop.run();
         let program = simple_program(asm.finish().unwrap(), 1);
         let mut vm = Interpreter::new(&program).unwrap();
         let string = |vm: &mut Interpreter, text: String| {
-            vm.heap.alloc(HeapObject::String(NapalmString::new(Arc::from(text.as_bytes()))))
+            vm.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(text.as_bytes()))))
         };
         let identity = |value: Value| {
             let handle = value.heap_handle().unwrap();

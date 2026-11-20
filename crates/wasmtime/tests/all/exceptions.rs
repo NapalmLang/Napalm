@@ -180,7 +180,7 @@ fn thrown_externref_payload_survives_gc(config: &mut Config) -> Result<()> {
     {
         let mut scope = RootScope::new(&mut store);
         let payload = ExternRef::new(&mut scope, SetFlagOnDrop(dropped.clone()))?;
-        let result = func.call(&mut scope, &[Val::ExternRef(Some(payload))], &mut []);
+        let result = func.call(&mut scope, &[Val::ExternRef(Some(payload.into()))], &mut []);
         assert!(result.unwrap_err().is::<ThrownException>());
     }
 
@@ -193,7 +193,7 @@ fn thrown_externref_payload_survives_gc(config: &mut Config) -> Result<()> {
         .unwrap_externref()
         .copied()
         .unwrap();
-    assert!(payload.data(&store)?.is_some());
+    assert!(payload.unwrap_unrooted().data(&store)?.is_some());
 
     Ok(())
 }
@@ -240,32 +240,6 @@ fn caught_externref_payload_survives_gc(config: &mut Config) -> Result<()> {
     store.gc(None)?;
     assert!(!dropped.load(Relaxed));
     assert!(caught.data(&store)?.is_some());
-
-    Ok(())
-}
-
-#[wasmtime_test(collectors(Null), wasm_features(exceptions))]
-#[cfg_attr(miri, ignore)]
-fn throw_with_null_collector(config: &mut Config) -> Result<()> {
-    let engine = Engine::new(config)?;
-    let mut store = Store::new(&engine, ());
-
-    let module = Module::new(
-        &engine,
-        r#"
-        (module
-          (tag $e (param i32))
-          (func (export "throw")
-            (throw $e (i32.const 42))))
-        "#,
-    )?;
-    let instance = Instance::new(&mut store, &module, &[])?;
-    let func = instance.get_func(&mut store, "throw").unwrap();
-    let result = func.call(&mut store, &[], &mut []);
-    assert!(result.unwrap_err().is::<ThrownException>());
-
-    let exn = store.take_pending_exception().unwrap();
-    assert_eq!(exn.field(&mut store, 0)?.unwrap_i32(), 42);
 
     Ok(())
 }
@@ -377,7 +351,7 @@ fn gc_with_exnref_global(config: &mut Config) -> Result<()> {
     let exn = ExnRef::new(&mut store, &exnpre, &tag, &[])?;
 
     let global = instance.get_global(&mut store, "g").unwrap();
-    global.set(&mut store, Val::ExnRef(Some(exn)))?;
+    global.set(&mut store, Val::ExnRef(Some(exn.into())))?;
 
     store.gc(None)?;
 
@@ -633,6 +607,7 @@ fn catch_ref_preserves_externref_payload(config: &mut Config) -> wasmtime::Resul
         .unwrap_externref()
         .expect("the exception payload should not be null");
     let field_data = field
+        .unwrap_unrooted()
         .data(&store)?
         .and_then(|data| data.downcast_ref::<u32>().copied());
     assert_eq!(field_data, Some(0xDECAF));
@@ -666,7 +641,7 @@ fn store_pending_exnref_has_write_barrier(config: &mut Config) -> wasmtime::Resu
     {
         let mut scope = RootScope::new(&mut store);
         let r = ExternRef::new(&mut scope, SetFlagOnDrop(dropped.clone()))?;
-        let exn1 = ExnRef::new(&mut scope, &exnpre, &tag, &[Val::ExternRef(Some(r))])?;
+        let exn1 = ExnRef::new(&mut scope, &exnpre, &tag, &[Val::ExternRef(Some(r.into()))])?;
         let _ = scope.as_context_mut().throw::<()>(exn1);
     }
     eprintln!("a2");

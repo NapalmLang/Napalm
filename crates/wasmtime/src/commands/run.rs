@@ -420,6 +420,7 @@ impl RunCommand {
             .common
             .wasm
             .timeout
+            .map(|t| *t)
             .unwrap_or(std::time::Duration::MAX);
         let result = tokio::time::timeout(dur, async {
             let mut profiled_modules: Vec<(String, Module)> = Vec::new();
@@ -575,7 +576,7 @@ impl RunCommand {
                 store.set_epoch_deadline(1);
                 let engine = store.engine().clone();
                 thread::spawn(move || {
-                    thread::sleep(timeout);
+                    thread::sleep(*timeout);
                     engine.increment_epoch();
                 });
             }
@@ -722,16 +723,16 @@ impl RunCommand {
                 let instance = linker
                     .instantiate_async(&mut *store, &module)
                     .await
-                    .with_context(|| {
-                        format!("failed to instantiate {:?}", self.module_and_args[0])
-                    })?;
+                    .with_context(|| format!("failed to instantiate {:?}", self.module_and_args[0]))
+                    .map_err(|e| self.handle_core_dump(&mut *store, e))?;
 
                 // If `_initialize` is present, meaning a reactor, then invoke
                 // the function.
                 if let Some(func) = instance.get_func(&mut *store, "_initialize") {
                     func.typed::<(), ()>(&store)?
                         .call_async(&mut *store, ())
-                        .await?;
+                        .await
+                        .map_err(|e| self.handle_core_dump(&mut *store, e))?;
                 }
 
                 // Look for the specific function provided or otherwise look for
@@ -1115,14 +1116,15 @@ impl RunCommand {
             Some(path) => path,
             None => return err,
         };
-        if !err.is::<wasmtime::Trap>() {
+        let Some(core_dump) = err.downcast_ref::<wasmtime::WasmCoreDump>() else {
             return err;
-        }
+        };
         let source_name = self.module_and_args[0]
             .to_str()
             .unwrap_or_else(|| "unknown");
 
-        if let Err(coredump_err) = super::write_core_dump(store, &err, &source_name, coredump_path)
+        if let Err(coredump_err) =
+            super::write_core_dump(store, core_dump, &source_name, coredump_path)
         {
             eprintln!("warning: coredump failed to generate: {coredump_err}");
             err

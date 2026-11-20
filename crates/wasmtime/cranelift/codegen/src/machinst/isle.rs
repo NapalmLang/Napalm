@@ -19,7 +19,7 @@ pub type ValueArray2 = [Value; 2];
 pub type ValueArray3 = [Value; 3];
 pub type BlockArray2 = [BlockCall; 2];
 pub type WritableReg = Writable<Reg>;
-pub type VecRetPair = Vec<RetPair>;
+pub type BoxedSliceRetPair = Box<[RetPair]>;
 pub type VecMask = Vec<u8>;
 pub type ValueRegs = crate::machinst::ValueRegs<Reg>;
 pub type WritableValueRegs = crate::machinst::ValueRegs<WritableReg>;
@@ -353,6 +353,15 @@ macro_rules! isle_lower_prelude_methods {
         #[inline]
         fn preserve_frame_pointers(&mut self) -> Option<()> {
             if self.backend.flags().preserve_frame_pointers() {
+                Some(())
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        fn separate_constant_pool(&mut self) -> Option<()> {
+            if self.backend.flags().separate_constant_pool() {
                 Some(())
             } else {
                 None

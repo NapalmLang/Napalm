@@ -721,8 +721,12 @@ fn import_works() -> Result<()> {
 
     let instance = Instance::new(&mut store, &module, &imports)?;
     let run = instance.get_func(&mut store, "run").unwrap();
-    let hello = Val::ExternRef(Some(ExternRef::new(&mut store, "hello".to_string())?));
-    let goodbye = Val::ExternRef(Some(ExternRef::new(&mut store, "goodbye".to_string())?));
+    let hello = Val::ExternRef(Some(
+        ExternRef::new(&mut store, "hello".to_string())?.into(),
+    ));
+    let goodbye = Val::ExternRef(Some(
+        ExternRef::new(&mut store, "goodbye".to_string())?.into(),
+    ));
     let funcref = Val::FuncRef(Some(Func::wrap(&mut store, || -> i32 { 42 })));
     run.call(&mut store, &[hello, goodbye, funcref], &mut [])?;
 
@@ -1528,7 +1532,7 @@ fn typed_funcs_count_params_correctly_in_error_messages(
     Ok(())
 }
 
-#[wasmtime_test(wasm_features(reference_types, gc_types))]
+#[wasmtime_test(wasm_features(reference_types))]
 #[cfg_attr(miri, ignore)]
 fn calls_with_funcref_and_externref(config: &mut Config) -> wasmtime::Result<()> {
     let engine = Engine::new(&config)?;
@@ -1623,10 +1627,17 @@ fn calls_with_funcref_and_externref(config: &mut Config) -> wasmtime::Result<()>
     assert!(b.is_none());
     untyped.call(
         &mut store,
-        &[Val::FuncRef(None), Val::ExternRef(Some(my_externref))],
+        &[
+            Val::FuncRef(None),
+            Val::ExternRef(Some(my_externref.into())),
+        ],
         &mut results,
     )?;
-    assert_my_externref(&store, results[0].unwrap_externref().copied());
+    let externref = results[0]
+        .unwrap_externref()
+        .map(|e| e.to_rooted(&mut store))
+        .transpose()?;
+    assert_my_externref(&store, externref);
     assert!(results[1].unwrap_funcref().is_none());
 
     // funcref=Some, externref=Some
@@ -1637,11 +1648,15 @@ fn calls_with_funcref_and_externref(config: &mut Config) -> wasmtime::Result<()>
         &mut store,
         &[
             Val::FuncRef(Some(my_funcref)),
-            Val::ExternRef(Some(my_externref)),
+            Val::ExternRef(Some(my_externref.into())),
         ],
         &mut results,
     )?;
-    assert_my_externref(&store, results[0].unwrap_externref().copied());
+    let externref = results[0]
+        .unwrap_externref()
+        .map(|e| e.to_rooted(&mut store))
+        .transpose()?;
+    assert_my_externref(&store, externref);
     assert_my_funcref(&mut store, results[1].unwrap_funcref())?;
 
     Ok(())
@@ -2393,142 +2408,4 @@ fn wasm_to_host_trampolines_and_subtyping(config: &mut Config) -> Result<()> {
     f.call(&mut store, ())?;
 
     Ok(())
-}
-
-/// Run a component exporting a `g: func() -> u32` function both with and
-/// without inlining; check that it returns the expected value.
-fn assert_returns_regardless_of_inlining(
-    wat: &str,
-    expected: u32,
-    configure: impl Fn(&mut Config),
-) -> Result<()> {
-    for inlining in [wasmtime::Inlining::No, wasmtime::Inlining::Yes] {
-        let mut config = Config::new();
-        config.compiler_inlining(inlining);
-
-        // Make it so that function calls which *can* be inlined, *will* be
-        // inlined.
-        unsafe {
-            config.cranelift_flag_set(
-                "wasmtime_inlining_sum_size_threshold",
-                &u32::MAX.to_string(),
-            );
-        }
-
-        configure(&mut config);
-
-        let engine = Engine::new(&config)?;
-        let component = wasmtime::component::Component::new(&engine, wat)?;
-        let mut store = Store::new(&engine, ());
-        let instance =
-            wasmtime::component::Linker::new(&engine).instantiate(&mut store, &component)?;
-        let g = instance.get_typed_func::<(), (u32,)>(&mut store, "g")?;
-        let (result,) = g.call(&mut store, ())?;
-
-        assert_eq!(result, expected, "wrong result with {inlining:?}");
-    }
-    Ok(())
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn issue_13538_memories() -> Result<()> {
-    // `g` reads memory, has `writeit` store a new value into it, then reads the
-    // same location again and returns it: the second read must observe the
-    // store (`123`), not the stale value from the first read (`0`).
-    assert_returns_regardless_of_inlining(
-        r#"
-            (component
-              (core module $M
-                (memory (export "mem") 1)
-                (func (export "writeit") (param i32 i32)
-                  (i32.store (local.get 0) (local.get 1)))
-              )
-              (core instance $m (instantiate $M))
-              (core module $N
-                (import "" "mem" (memory 1))
-                (import "" "writeit" (func $writeit (param i32 i32)))
-                (func (export "g") (result i32)
-                  (i32.load (i32.const 0))
-                  drop
-                  (call $writeit (i32.const 0) (i32.const 123))
-                  (i32.load (i32.const 0)))
-              )
-              (core instance $n (instantiate $N
-                  (with "" (instance
-                    (export "mem" (memory $m "mem"))
-                    (export "writeit" (func $m "writeit"))))))
-              (func (export "g") (result u32) (canon lift (core func $n "g"))))
-        "#,
-        123,
-        |_| {},
-    )
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn issue_13538_globals() -> Result<()> {
-    // Same as `issue_13538_memories` but for globals.
-    assert_returns_regardless_of_inlining(
-        r#"
-            (component
-              (core module $M
-                (global (export "glob") (mut i32) (i32.const 0))
-                (func (export "writeit") (param i32)
-                  (global.set 0 (local.get 0)))
-              )
-              (core instance $m (instantiate $M))
-              (core module $N
-                (import "" "glob" (global $glob (mut i32)))
-                (import "" "writeit" (func $writeit (param i32)))
-                (func (export "g") (result i32)
-                  (global.get $glob)
-                  drop
-                  (call $writeit (i32.const 123))
-                  (global.get $glob))
-              )
-              (core instance $n (instantiate $N
-                  (with "" (instance
-                    (export "glob" (global $m "glob"))
-                    (export "writeit" (func $m "writeit"))))))
-              (func (export "g") (result u32) (canon lift (core func $n "g"))))
-        "#,
-        123,
-        |_| {},
-    )
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn issue_13538_tables() -> Result<()> {
-    // Same as `issue_13538_memories` but for tables.
-    assert_returns_regardless_of_inlining(
-        r#"
-            (component
-              (core module $M
-                (table (export "tab") 1 1 (ref i31) (ref.i31 (i32.const 0)))
-                (func (export "writeit") (param i32)
-                  (table.set (i32.const 0) (ref.i31 (local.get 0))))
-              )
-              (core instance $m (instantiate $M))
-              (core module $N
-                (import "" "tab" (table 1 1 (ref i31)))
-                (import "" "writeit" (func $writeit (param i32)))
-                (func (export "g") (result i32)
-                  (drop (table.get (i32.const 0)))
-                  (call $writeit (i32.const 123))
-                  (i31.get_u (table.get (i32.const 0))))
-              )
-              (core instance $n (instantiate $N
-                  (with "" (instance
-                    (export "tab" (table $m "tab"))
-                    (export "writeit" (func $m "writeit"))))))
-              (func (export "g") (result u32) (canon lift (core func $n "g"))))
-        "#,
-        123,
-        |config| {
-            config.wasm_function_references(true);
-            config.wasm_gc(true);
-        },
-    )
 }

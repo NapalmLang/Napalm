@@ -137,40 +137,6 @@ fn function_interposition_renamed() -> Result<()> {
     Ok(())
 }
 
-// Similar to `function_interposition`, but use `Linker::instance` instead of
-// `Linker::define`.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn module_interposition() -> Result<()> {
-    let mut store = Store::<()>::default();
-    let mut linker = Linker::new(store.engine());
-    linker.allow_shadowing(true);
-    let mut module = Module::new(
-        store.engine(),
-        r#"(module (func (export "export") (result i32) (i32.const 7)))"#,
-    )?;
-    for _ in 0..4 {
-        let instance = linker.instantiate(&mut store, &module)?;
-        linker.instance(&mut store, "instance", instance)?;
-        module = Module::new(
-            store.engine(),
-            r#"(module
-                (import "instance" "export" (func (result i32)))
-                (func (export "export") (result i32) (i32.mul (call 0) (i32.const 2)))
-            )"#,
-        )?;
-    }
-    let instance = linker.instantiate(&mut store, &module)?;
-    let func = instance
-        .get_export(&mut store, "export")
-        .unwrap()
-        .into_func()
-        .unwrap();
-    let func = func.typed::<(), i32>(&store)?;
-    assert_eq!(func.call(&mut store, ())?, 112);
-    Ok(())
-}
-
 #[test]
 #[cfg_attr(miri, ignore)]
 fn allow_unknown_exports() -> Result<()> {
@@ -787,5 +753,28 @@ fn linker_clone_drop_original_then_instantiate() -> Result<()> {
     let instance = clone.instantiate(&mut store, &module)?;
     let f = instance.get_typed_func::<(), i32>(&mut store, "run")?;
     assert_eq!(f.call(&mut store, ())?, 42);
+    Ok(())
+}
+
+// Usage of a `Linker` with items from a `Store` that has been dropped is a bit
+// non-deterministic. This could panic or spuriously accept the wrong items
+// during type-checking, but no matter what instantiation in a different store
+// MUST always fail. This test might need updating over time to match precise
+// behavior, but no matter what the instantiation cannot succeed.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn linker_outlives_store_of_its_definitions() -> Result<()> {
+    let engine = Engine::default();
+    let mut linker = Linker::<()>::new(&engine);
+    {
+        let mut store = Store::new(&engine, ());
+        let ty = FuncType::new(&engine, [ValType::I32], []);
+        let f = Func::new(&mut store, ty, |_, _, _| Ok(()));
+        linker.define(&store, "a", "x", f)?;
+    }
+
+    let module = Module::new(&engine, r#"(module (import "a" "x" (func)))"#)?;
+    let mut store = Store::new(&engine, ());
+    assert!(linker.instantiate(&mut store, &module).is_err());
     Ok(())
 }

@@ -83,8 +83,10 @@
 ///
 /// Beyond a struct's rules, each variant needs an explicit discriminant (the
 /// tag values compiled code compares against), braces even when empty, and its
-/// own `#[snake_name]` for its generated accessors. Variant fields take a
-/// struct field's marker attributes but no visibility.
+/// own `#[snake_name]` for its generated accessors. Later attributes reach only
+/// the runtime definition; `#[cfg]` is not among them, since a type's layout
+/// must not vary with Cargo features. Variant fields take a struct field's
+/// marker attributes but no visibility.
 ///
 /// An enum gets two alias regions rather than a struct's one per field: one for
 /// the tag, one shared by all variants' fields, because they overlap.
@@ -356,39 +358,6 @@ macro_rules! for_each_vm_type {
                 /// yield if running asynchronously.
                 pub epoch_deadline: UnsafeCell<u64>,
 
-                /// The "store version".
-                ///
-                /// This is used to test whether stack-frame handles referring to
-                /// suspended stack frames remain valid.
-                ///
-                /// The invariant that this upward-counting number must satisfy
-                /// is: the number must be incremented whenever execution starts
-                /// or resumes in the `Store` or when any stack is
-                /// dropped/freed. That way, if we take a reference to some
-                /// suspended stack frame and track the "version" at the time we
-                /// took that reference, if the version still matches, we can be
-                /// sure that nothing could have unwound the referenced Wasm
-                /// frame.
-                ///
-                /// This version number is incremented in exactly one place: the
-                /// Wasm-to-host trampolines, after return from host code. Note
-                /// that this captures both the normal "return into Wasm" case
-                /// (where Wasm frames can subsequently return normally and thus
-                /// invalidate frames), and the "trap/exception unwinds Wasm
-                /// frames" case, which is done internally via the `raise` libcall
-                /// invoked after the main hostcall returns an error, and after we
-                /// increment this version number.
-                ///
-                /// Note that this also handles the fiber/future-drop case because
-                /// because we *always* return into the trampoline to clean up;
-                /// that trampoline immediately raises an error and uses the
-                /// longjmp-like unwind within Cranelift frames to skip over all
-                /// the guest Wasm frames, but not before it increments the
-                /// store's execution version number.
-                ///
-                /// This field is in use only if guest debugging is enabled.
-                pub execution_version: u64,
-
                 /// Current stack limit of the wasm module.
                 ///
                 /// For more information see `crates/cranelift/src/lib.rs`.
@@ -505,6 +474,19 @@ macro_rules! for_each_vm_type {
                 ///
                 /// NB: `UnsafeCell` because JIT code writes to this field.
                 pub current_thread: UnsafeCell<VMLazyThread>,
+
+                /// Resource lends made under unforced `VMDeferredThread`s and not
+                /// yet reflected in any handle's `lend_count`.
+                ///
+                /// Holds `LAZY_LENDERS_CAPACITY` entries.
+                #[readonly]
+                #[can_move]
+                pub lazy_lenders: VmPtr<VMResourceIndex>,
+
+                /// Number of occupied slots at the front of `lazy_lenders`.
+                ///
+                /// NB: `UnsafeCell` because JIT code writes to this field.
+                pub lazy_lenders_len: UnsafeCell<usize>,
             }
 
             /// JIT-visible representation of the store's current thread for the component
@@ -554,6 +536,213 @@ macro_rules! for_each_vm_type {
                 thread: Option<VmPtr<VMDeferredThread>>,
             }
 
+            /// JIT-visible encoding of a component-model resource handle, as stored in
+            /// the `VMStoreContext::lazy_lenders` buffer.
+            ///
+            /// This is the raw version of `TypedResourceIndex` that is exposed to Wasm
+            /// code; use `VMResourceIndex::{new,get}` to convert.
+            #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+            #[repr(C)]
+            #[snake_name = vm_resource_index]
+            pub struct VMResourceIndex {
+                /// The raw `TypeResourceTableIndex`, or `u32::MAX` for a host resource.
+                pub(crate) ty: u32,
+
+                /// The handle's index within its table.
+                pub(crate) index: u32,
+            }
+
+            /// A resource's type and "rep", as stored in a `VMHandleTableSlot`.
+            #[cfg(feature = "component-model")]
+            #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+            #[repr(C)]
+            #[snake_name = vm_typed_resource]
+            pub struct VMTypedResource {
+                /// The raw `TypeResourceTableIndex`, or `u32::MAX` for a host resource.
+                pub(crate) ty: u32,
+
+                /// An integer whose meaning is up to whoever defined the
+                /// resource.
+                pub(crate) rep: u32,
+            }
+
+            /// A call's resource-borrow scope, as stored in a
+            /// `VMHandleTableSlot::ResourceBorrow`.
+            ///
+            /// Compiled code never reads this; it needs a defined layout only because
+            /// it shares a slot with `lend_count`, which compiled code does read.
+            #[cfg(feature = "component-model")]
+            #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+            #[repr(C)]
+            #[snake_name = vm_scope]
+            pub struct VMScope {
+                /// The kind of scope. See the `id`/`host_id` constructors.
+                pub(crate) kind: u32,
+
+                /// The scope's identifier, whose meaning depends on `kind`.
+                pub(crate) id: u32,
+            }
+
+            /// One instance's view of a stream or future handle, as stored in a
+            /// `VMHandleTableSlot::{Stream,Future}`.
+            ///
+            /// As with `VMScope`, compiled code never reads this; it needs a defined
+            /// layout only because it sits inside a slot.
+            #[cfg(feature = "component-model")]
+            #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+            #[repr(C)]
+            #[snake_name = vm_transmit_local_state]
+            pub struct VMTransmitLocalState {
+                /// The kind of transmit state. See the `VMTransmitLocalState`
+                /// constructors for details.
+                pub(crate) kind: u32,
+
+                /// Meaningful only for the `Write` and `Read` kinds.
+                pub(crate) done: u32,
+            }
+
+            /// One slot of a component instance's `HandleTable`.
+            ///
+            /// An instance keeps every kind of handle in one heterogeneous table, so a
+            /// slot is a tagged union over all of them, with free slots threaded into a
+            /// free list through `Free::next`.
+            ///
+            /// The layout is guaranteed because compiled adapter code reads and writes
+            /// slots directly; see `transfer_borrow_to_owner`.
+            #[cfg(feature = "component-model")]
+            #[derive(Debug)]
+            #[repr(C, u32)]
+            #[snake_name = vm_handle_table_slot]
+            pub enum VMHandleTableSlot {
+                /// An unallocated slot, holding the index of the next free slot.
+                #[snake_name = free]
+                Free {
+                    /// The next free slot's index, forming a free list.
+                    next: u32,
+                } = 0,
+
+                /// An owned resource handle.
+                #[snake_name = resource_own]
+                ResourceOwn {
+                    /// The resource's type and representation.
+                    #[aggregate]
+                    resource: VMTypedResource,
+
+                    /// How many times this handle has been lent out as a `borrow`.
+                    ///
+                    /// A handle with a nonzero lend count cannot be removed.
+                    ///
+                    /// NB: must be at the same offset as `Self::ResourceBorrow::lend_count`.
+                    lend_count: u32,
+                } = 1,
+
+                /// A borrowed resource handle, connected to the call scope it was
+                /// created within.
+                ///
+                /// Dropping the borrow decrements that scope's borrow count.
+                #[snake_name = resource_borrow]
+                ResourceBorrow {
+                    /// The resource's type and representation.
+                    #[aggregate]
+                    resource: VMTypedResource,
+
+                    /// How many times this borrow has been lent out to other calls.
+                    ///
+                    /// NB: must be at the same offset as `Self::ResourceOwn::lend_count`.
+                    lend_count: u32,
+
+                    /// The scope this borrow was created within.
+                    #[aggregate]
+                    scope: VMScope,
+                } = 2,
+
+                /// A host task handle.
+                #[snake_name = host_task]
+                HostTask {
+                    /// The task's representation.
+                    rep: u32,
+                } = 3,
+
+                /// A guest task handle.
+                #[snake_name = guest_task]
+                GuestTask {
+                    /// The task's representation.
+                    rep: u32,
+                } = 4,
+
+                /// A guest thread handle.
+                #[snake_name = guest_thread]
+                #[cfg_attr(
+                    not(feature = "component-model-async"),
+                    allow(
+                        dead_code,
+                        reason = "slot layout should not vary with cargo features"
+                    )
+                )]
+                GuestThread {
+                    /// The thread's representation.
+                    rep: u32,
+                } = 5,
+
+                /// A stream handle.
+                #[snake_name = stream]
+                Stream {
+                    /// The stream's `TypeStreamTableIndex`.
+                    ty: u32,
+
+                    /// The stream's representation.
+                    rep: u32,
+
+                    /// This instance's view of the stream's state.
+                    #[aggregate]
+                    state: VMTransmitLocalState,
+                } = 6,
+
+                /// A future handle.
+                #[snake_name = future]
+                Future {
+                    /// The future's `TypeFutureTableIndex`.
+                    ty: u32,
+
+                    /// The future's representation.
+                    rep: u32,
+
+                    /// This instance's view of the future's state.
+                    #[aggregate]
+                    state: VMTransmitLocalState,
+                } = 7,
+
+                /// A waitable-set handle.
+                #[snake_name = waitable_set]
+                WaitableSet {
+                    /// The waitable set's representation.
+                    rep: u32,
+                } = 8,
+
+                /// An error-context handle.
+                #[snake_name = error_context]
+                ErrorContext {
+                    /// The error context's representation.
+                    rep: u32,
+                } = 9,
+            }
+
+            /// One `HandleTable`'s slots, as compiled code sees them.
+            ///
+            /// The length lets a fused adapter's inline to-owner lend bounds check a
+            /// guest-supplied handle. Must be rewritten whenever the buffer grows.
+            #[cfg(feature = "component-model")]
+            #[derive(Debug, Copy, Clone)]
+            #[repr(C)]
+            #[snake_name = vm_handle_table]
+            pub struct VMHandleTable {
+                /// Pointer to the slots.
+                pub base: VmPtr<VMHandleTableSlot>,
+
+                /// The number of slots in `base`.
+                pub current_slots: usize,
+            }
+
             /// A deferred component-model thread.
             ///
             /// This is an on-stack record pushed by a fused sync-to-sync adapter's fast
@@ -571,14 +760,25 @@ macro_rules! for_each_vm_type {
             pub struct VMDeferredThread {
                 /// The previous value of `VMStoreContext::current_thread`.
                 pub parent: VMLazyThread,
+
                 /// Whether the callee is async-lifted (a deferred `enter_sync_call` arg).
                 pub callee_async: u32,
+
                 /// The callee component instance (a deferred `enter_sync_call` argument).
                 pub callee_instance: u32,
+
                 /// The caller thread's `context.{get,set}` slots, saved on entry and
                 /// restored on the fast-path exit (or recovered while forcing).
                 #[indexed]
                 pub saved_context: [u32; NUM_COMPONENT_CONTEXT_SLOTS],
+
+                /// `VMStoreContext::lazy_lenders_len` as of this frame's push, so
+                /// that the lends this frame recorded are everything at or after it.
+                ///
+                /// Frames nest with the call stack, so that is always a contiguous
+                /// suffix by the time this frame exits, and exiting an unforced frame
+                /// discards it by resetting `lazy_lenders_len` back to this.
+                pub lazy_lenders_start: usize,
             }
 
             /// This type is used to save (and subsequently restore) a subset of

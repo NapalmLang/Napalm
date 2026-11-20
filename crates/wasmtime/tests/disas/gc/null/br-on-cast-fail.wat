@@ -18,9 +18,9 @@
 )
 ;; function u0:0(i64 vmctx, i64, i32) tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
-;;     region2 = 196 ""
-;;     region3 = 206 ""
+;;     region1 = 25 ""
+;;     region2 = 160 ""
+;;     region3 = 196 ""
 ;;     region4 = 77 ""
 ;;     region5 = 130 ""
 ;;     region6 = 134 ""
@@ -29,7 +29,7 @@
 ;;     region9 = 174 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     sig0 = (i64 vmctx, i64) tail
 ;;     stack_limit = gv2
 ;;
@@ -41,19 +41,19 @@
 ;;                                 block3:
 ;; @002e                               v7 = iconst.i32 1
 ;; @002e                               v8 = band.i32 v2, v7  ; v7 = 1
-;;                                     v38 = iconst.i32 0
+;; @002e                               v38 = iconst.i32 0
 ;; @002e                               brif v8, block5(v38), block4  ; v38 = 0
 ;;
 ;;                                 block4:
 ;; @002e                               v11 = load.i64 notrap aligned readonly can_move region0 v0+8
-;; @002e                               v12 = load.i64 notrap aligned readonly can_move region2 v11+32
+;; @002e                               v12 = load.i64 notrap aligned readonly can_move region2 v11+24
 ;; @002e                               v10 = uextend.i64 v2
 ;; @002e                               v13 = iadd v12, v10
 ;; @002e                               v16 = load.i32 user2 readonly region4 v13
 ;; @002e                               v17 = iconst.i32 -1342177280
 ;; @002e                               v18 = band v16, v17  ; v17 = -1342177280
 ;; @002e                               v19 = icmp eq v18, v17  ; v17 = -1342177280
-;;                                     v39 = iconst.i32 0
+;; @002e                               v39 = iconst.i32 0
 ;; @002e                               brif v19, block6, block5(v39)  ; v39 = 0
 ;;
 ;;                                 block6:

@@ -242,6 +242,14 @@ WASMTIME_CONFIG_PROP(void, wasm_gc, bool)
 WASMTIME_CONFIG_PROP(void, gc_support, bool)
 
 /**
+ * \brief Configures whether the WebAssembly stack switching
+ * proposal is enabled.
+ *
+ * This setting is `false` by default.
+ */
+WASMTIME_CONFIG_PROP(void, wasm_stack_switching, bool)
+
+/**
  * \brief Configures whether the WebAssembly SIMD proposal is
  * enabled.
  *
@@ -341,14 +349,6 @@ WASMTIME_CONFIG_PROP(void, wasm_custom_page_sizes, bool)
 WASMTIME_CONFIG_PROP(void, wasm_compact_imports, bool)
 
 #ifdef WASMTIME_FEATURE_COMPILER
-
-/**
- * \brief Configures whether the WebAssembly stack switching
- * proposal is enabled.
- *
- * This setting is `false` by default.
- */
-WASMTIME_CONFIG_PROP(void, wasm_stack_switching, bool)
 
 /**
  * \brief Configures how JIT code will be compiled.
@@ -471,6 +471,19 @@ WASMTIME_CONFIG_PROP(void, memory_reservation_for_growth, uint64_t)
  * https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.native_unwind_info
  */
 WASMTIME_CONFIG_PROP(void, native_unwind_info, bool)
+
+/**
+ * \brief Configures whether compiled code is compatible with a Wasmtime runtime
+ * built with AddressSanitizer.
+ *
+ * This option defaults to whether this Wasmtime was itself built with
+ * AddressSanitizer. Compiled artifacts can only be deserialized by an engine
+ * with the same setting.
+ *
+ * For more information see the Rust documentation at
+ * https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.asan_compatible_code
+ */
+WASMTIME_CONFIG_PROP(void, asan_compatible_code, bool)
 
 #ifdef WASMTIME_FEATURE_CACHE
 

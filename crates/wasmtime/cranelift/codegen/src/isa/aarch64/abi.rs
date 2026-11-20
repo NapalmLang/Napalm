@@ -502,11 +502,11 @@ impl ABIMachineSpec for AArch64MachineDeps {
         Inst::gen_extend(to_reg, from_reg, op, to)
     }
 
-    fn gen_args(args: Vec<ArgPair>) -> Inst {
+    fn gen_args(args: Box<[ArgPair]>) -> Inst {
         Inst::Args { args }
     }
 
-    fn gen_rets(rets: Vec<RetPair>) -> Inst {
+    fn gen_rets(rets: Box<[RetPair]>) -> Inst {
         Inst::Rets { rets }
     }
 
@@ -1281,7 +1281,11 @@ impl ABIMachineSpec for AArch64MachineDeps {
             })
             .collect();
 
-        if call_conv == isa::CallConv::AppleAarch64 && flags.enable_compact_unwind_abi() {
+        // AppleAarch64 and Tail use the same callee-saved registers, so both
+        // calling conventions can be represented in the Mach-O compact unwind format.
+        if matches!(call_conv, isa::CallConv::AppleAarch64 | isa::CallConv::Tail)
+            && flags.enable_compact_unwind_abi()
+        {
             add_macho_compact_unwind_paired_regs(&mut regs);
             // For Mach-O compact unwind, these pushes/pops must be emitted in
             // the fixed expected order. The encoding specifies only which

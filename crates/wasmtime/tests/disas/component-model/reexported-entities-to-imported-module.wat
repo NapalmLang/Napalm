@@ -63,13 +63,13 @@
 )
 ;; function u0:0(i64 vmctx, i64) -> i32 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 215 ""
 ;;     region3 = 105 ""
 ;;     region4 = 61 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64):
@@ -83,11 +83,11 @@
 ;;
 ;; function u0:1(i64 vmctx, i64) -> i32 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 87 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64):
@@ -100,13 +100,13 @@
 ;;
 ;; function u0:2(i64 vmctx, i64) -> i64 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 93 ""
 ;;     region3 = 211 ""
 ;;     region4 = 99 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     sig0 = (i64 vmctx, i32, i64) -> i64 tail
 ;;     fn0 = colocated u805306368:6 sig0
 ;;     stack_limit = gv2
@@ -125,7 +125,7 @@
 ;; @00a8                               brif v13, block3(v15), block2
 ;;
 ;;                                 block2 cold:
-;;                                     v25 = iconst.i32 0
+;; @00a6                               v25 = iconst.i32 0
 ;;                                     v26 = iconst.i64 0
 ;; @00a8                               v19 = call fn0(v0, v25, v26)  ; v25 = 0, v26 = 0
 ;; @00a8                               jump block3(v19)
@@ -139,14 +139,14 @@
 ;;
 ;; function u1:0(i64 vmctx, i64) -> i32 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 75 ""
 ;;     region3 = 215 ""
 ;;     region4 = 105 ""
 ;;     region5 = 61 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64):
@@ -161,12 +161,12 @@
 ;;
 ;; function u1:1(i64 vmctx, i64) -> i32 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 57 ""
 ;;     region3 = 87 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64):
@@ -180,14 +180,14 @@
 ;;
 ;; function u1:2(i64 vmctx, i64) -> i64 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 13 ""
 ;;     region3 = 93 ""
 ;;     region4 = 211 ""
 ;;     region5 = 99 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     sig0 = (i64 vmctx, i32, i64) -> i64 tail
 ;;     fn0 = colocated u805306368:6 sig0
 ;;     stack_limit = gv2
@@ -207,7 +207,7 @@
 ;; @0139                               brif v15, block3(v17), block2
 ;;
 ;;                                 block2 cold:
-;;                                     v27 = iconst.i32 0
+;; @0137                               v27 = iconst.i32 0
 ;;                                     v28 = iconst.i64 0
 ;; @0139                               v21 = call fn0(v0, v27, v28)  ; v27 = 0, v28 = 0
 ;; @0139                               jump block3(v21)

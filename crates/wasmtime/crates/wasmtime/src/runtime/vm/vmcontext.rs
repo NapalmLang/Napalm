@@ -369,6 +369,7 @@ macro_rules! define_vm_types {
             $(
                 $(#[doc = $vdoc:literal])*
                 #[snake_name = $vsnake:ident]
+                $(#[$vattr:meta])*
                 $Variant:ident {
                     $(
                         $(#[doc = $fdoc:literal])*
@@ -395,6 +396,7 @@ macro_rules! define_vm_types {
                 $svis enum $Name {
                     $(
                         $(#[doc = $vdoc])*
+                        $(#[$vattr])*
                         $Variant {
                             $(
                                 $(#[doc = $fdoc])*
@@ -1013,11 +1015,6 @@ impl VMStoreContext {
     pub(crate) fn component_context_mut(&mut self) -> &mut [u32; NUM_COMPONENT_CONTEXT_SLOTS] {
         self.component_context.get_mut()
     }
-
-    #[cfg(feature = "component-model-async")]
-    pub(crate) fn current_thread_mut(&mut self) -> &mut VMLazyThread {
-        self.current_thread.get_mut()
-    }
 }
 
 // The `VMStoreContext` type is a pod-type with no destructor, and we don't
@@ -1035,7 +1032,6 @@ impl Default for VMStoreContext {
         VMStoreContext {
             fuel_consumed: UnsafeCell::new(0),
             epoch_deadline: UnsafeCell::new(0),
-            execution_version: 0,
             stack_limit: UnsafeCell::new(usize::MAX),
             gc_heap: UnsafeCell::new(VMMemoryDefinition {
                 base: NonNull::dangling().into(),
@@ -1051,6 +1047,8 @@ impl Default for VMStoreContext {
             store_data: VmPtr::dangling(),
             component_context: UnsafeCell::new([0; NUM_COMPONENT_CONTEXT_SLOTS]),
             current_thread: UnsafeCell::new(VMLazyThread::none()),
+            lazy_lenders: VmPtr::dangling(),
+            lazy_lenders_len: UnsafeCell::new(0),
         }
     }
 }

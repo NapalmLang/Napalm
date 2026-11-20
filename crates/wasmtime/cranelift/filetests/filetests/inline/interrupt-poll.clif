@@ -1,6 +1,8 @@
 test inline precise-output
 target x86_64
 
+;; Verify that interrupt_poll is preserved during inlining and that
+;; its user stack maps are copied and remapped into the caller.
 ;; `interrupt_poll` is not a call instruction (it has no callee, arguments,
 ;; or calling convention), but it is a safepoint that can hold user stack maps.
 ;; When a function containing `interrupt_poll` is inlined, the poll instruction

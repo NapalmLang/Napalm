@@ -52,6 +52,12 @@ pub enum Reloc {
     S390xPCRel32Dbl,
     /// s390x PC-relative 4-byte offset to PLT
     S390xPLTRel32Dbl,
+    /// s390x PC-relative 4-byte doubled offset to GOT entry (R_390_GOTENT).
+    ///
+    /// Applied to the 32-bit doubled-offset field of a LARL instruction.
+    /// The linker fills in the PC-relative distance (in doublewords) to the
+    /// GOT entry for the referenced symbol.
+    S390xGOTRel32Dbl,
 
     /// Elf x86_64 32 bit signed PC relative offset to two GOT entries for GD symbol.
     ElfX86_64TlsGd,
@@ -92,6 +98,10 @@ pub enum Reloc {
     Aarch64AdrPrelPgHi21,
     /// Equivalent of `R_AARCH64_ADD_ABS_LO12_NC`.
     Aarch64AddAbsLo12Nc,
+    /// Equivalent of `R_AARCH64_LDST64_ABS_LO12_NC`.
+    Aarch64Ldst64AbsLo12Nc,
+    /// Equivalent of `R_AARCH64_LDST128_ABS_LO12_NC`.
+    Aarch64Ldst128AbsLo12Nc,
 
     /// AArch64 GOT Low bits
 
@@ -165,6 +175,7 @@ impl Reloc {
             | Self::Arm64Call
             | Self::S390xPCRel32Dbl
             | Self::S390xPLTRel32Dbl
+            | Self::S390xGOTRel32Dbl
             | Self::MachOX86_64Tlv
             | Self::MachOAarch64TlsAdrPage21
             | Self::MachOAarch64TlsAdrPageOff12
@@ -175,6 +186,8 @@ impl Reloc {
             | Self::Aarch64AdrGotPage21
             | Self::Aarch64AdrPrelPgHi21
             | Self::Aarch64AddAbsLo12Nc
+            | Self::Aarch64Ldst64AbsLo12Nc
+            | Self::Aarch64Ldst128AbsLo12Nc
             | Self::Aarch64Ld64GotLo12Nc
             | Self::RiscvTlsGdHi20
             | Self::RiscvPCRelLo12I
@@ -202,6 +215,7 @@ impl fmt::Display for Reloc {
             Self::Abs8 => write!(f, "Abs8"),
             Self::S390xPCRel32Dbl => write!(f, "PCRel32Dbl"),
             Self::S390xPLTRel32Dbl => write!(f, "PLTRel32Dbl"),
+            Self::S390xGOTRel32Dbl => write!(f, "GOTRel32Dbl"),
             Self::X86PCRel4 => write!(f, "PCRel4"),
             Self::X86CallPCRel4 => write!(f, "CallPCRel4"),
             Self::X86CallPLTRel4 => write!(f, "CallPLTRel4"),
@@ -225,6 +239,8 @@ impl fmt::Display for Reloc {
             Self::Aarch64Ld64GotLo12Nc => write!(f, "Aarch64AdrGotLo12Nc"),
             Self::Aarch64AdrPrelPgHi21 => write!(f, "Aarch64AdrPrelPgHi21"),
             Self::Aarch64AddAbsLo12Nc => write!(f, "Aarch64AddAbsLo12Nc"),
+            Self::Aarch64Ldst64AbsLo12Nc => write!(f, "Aarch64Ldst64AbsLo12Nc"),
+            Self::Aarch64Ldst128AbsLo12Nc => write!(f, "Aarch64Ldst128AbsLo12Nc"),
             Self::S390xTlsGd64 => write!(f, "TlsGd64"),
             Self::S390xTlsGdCall => write!(f, "TlsGdCall"),
             Self::PulleyPcRel => write!(f, "PulleyPcRel"),

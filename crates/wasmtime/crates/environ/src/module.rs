@@ -130,7 +130,42 @@ pub struct TableSegment {
     /// The base offset to start this segment at.
     pub offset: ConstExpr,
     /// The values to write into the table elements.
-    pub elements: TableSegmentElements,
+    pub init: TableSegmentInit,
+}
+
+/// How the values of an active table segment are produced.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TableSegmentInit {
+    /// The elements are evaluated and written directly to the table in
+    /// segment order. These never appear in `vm::Instance`.
+    ///
+    /// This is used when the elements cannot trap, or when a trap could not
+    /// be observed because no imported table has been written to yet.
+    Direct(TableSegmentElements),
+    /// The elements may trap during evaluation, so they are instead evaluated
+    /// up-front into this passive element segment's storage alongside all
+    /// other passive element segments. The segment is then copied into the
+    /// table in segment order and dropped.
+    ///
+    /// Instantiation evaluates all element segment expressions before any
+    /// active segment is written to a table, so a trapping expression must not
+    /// leave earlier segments' writes visible in imported tables.
+    Staged {
+        /// The passive element segment holding the evaluated elements.
+        index: PassiveElemIndex,
+        /// The number of elements in this segment.
+        len: u64,
+    },
+}
+
+impl TableSegmentInit {
+    /// Returns the number of elements in this segment.
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Direct(elements) => elements.len(),
+            Self::Staged { len, .. } => *len,
+        }
+    }
 }
 
 /// Elements of a table segment, either a list of functions or list of arbitrary
@@ -187,7 +222,7 @@ pub struct Module {
     pub initializers: TryVec<Initializer>,
 
     /// Exported entities.
-    pub exports: TryIndexMap<Atom, EntityIndex>,
+    pub exports: ModuleExports,
 
     /// Whether or not this module has a start function,
     pub startup: ModuleStartup,
@@ -242,6 +277,11 @@ pub struct Module {
 
     /// Does this module need a GC heap to run?
     pub needs_gc_heap: bool,
+
+    /// Does this module's compiled code check its memories' shadows for
+    /// watchpoints (`Tunables::memory_watchpoints`), and so need a pointer to
+    /// each memory's shadow `VMMemoryDefinition` in its `VMContext`?
+    pub has_shadow_memories: bool,
 
     /// Number of functions that "escape" from this module may need to have a
     /// `VMFuncRef` constructed for them.
@@ -345,6 +385,7 @@ impl Module {
             num_imported_globals: Default::default(),
             num_imported_tags: Default::default(),
             needs_gc_heap: Default::default(),
+            has_shadow_memories: Default::default(),
             num_escaped_funcs: Default::default(),
             functions: Default::default(),
             tables: Default::default(),
@@ -402,7 +443,7 @@ impl Module {
     /// Test whether the given table index is for an exported table.
     #[inline]
     pub fn is_exported_table(&self, index: TableIndex) -> bool {
-        self.exports.values().any(|entity| *entity == index.into())
+        self.exports.tables.contains(index)
     }
 
     /// Test whether the given table index is for an imported table.
@@ -455,7 +496,7 @@ impl Module {
     /// Test whether the given memory index is for an exported memory.
     #[inline]
     pub fn is_exported_memory(&self, index: MemoryIndex) -> bool {
-        self.exports.values().any(|entity| *entity == index.into())
+        self.exports.memories.contains(index)
     }
 
     /// Test whether the given memory index is for an imported memory.
@@ -486,7 +527,7 @@ impl Module {
     /// Test whether the given global index is for an exported global.
     #[inline]
     pub fn is_exported_global(&self, index: GlobalIndex) -> bool {
-        self.exports.values().any(|entity| *entity == index.into())
+        self.exports.globals.contains(index)
     }
 
     /// Test whether the given global index is for an imported global.
@@ -693,6 +734,7 @@ impl TypeTrace for Module {
             num_imported_tags: _,
             num_escaped_funcs: _,
             needs_gc_heap: _,
+            has_shadow_memories: _,
             functions,
             tables,
             memories: _,
@@ -745,6 +787,7 @@ impl TypeTrace for Module {
             num_imported_tags: _,
             num_escaped_funcs: _,
             needs_gc_heap: _,
+            has_shadow_memories: _,
             functions,
             tables,
             memories: _,
@@ -864,5 +907,162 @@ impl ModuleStartup {
     /// Returns if this is `ModuleStartup::None`.
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
+    }
+}
+
+/// The exports of a [`Module`].
+///
+/// In addition to the name-to-entity map this maintains sets for exported
+/// globals, memories and tables, such that [`Module::is_exported_global`],
+/// `-memory` and `-table` lookups are constant time.
+///
+/// The sets are derived from the map during construction and during de-
+/// serialization (see the custom `serde` impl).
+/// [`ModuleExports::insert`] ensures the map and the sets remain in sync.
+#[derive(Debug, Default)]
+pub struct ModuleExports {
+    map: TryIndexMap<Atom, EntityIndex>,
+    globals: TryEntitySet<GlobalIndex>,
+    memories: TryEntitySet<MemoryIndex>,
+    tables: TryEntitySet<TableIndex>,
+}
+
+impl ModuleExports {
+    /// Reserves capacity for at least `additional` more exports.
+    pub fn reserve(&mut self, additional: usize) -> Result<(), OutOfMemory> {
+        self.map.reserve(additional)
+    }
+
+    /// Adds a new export called `name` which refers to `entity`.
+    ///
+    /// Export names are unique within a module, so `name` must not already be
+    /// exported.
+    pub fn insert(&mut self, name: Atom, entity: EntityIndex) -> Result<(), OutOfMemory> {
+        self.map.reserve(1)?;
+        Self::index(
+            &mut self.globals,
+            &mut self.memories,
+            &mut self.tables,
+            entity,
+        )?;
+        let prev = self.map.insert(name, entity)?;
+        debug_assert!(prev.is_none(), "duplicate export name");
+        Ok(())
+    }
+
+    /// Looks up the export called `name`, if any.
+    pub fn get(&self, name: &Atom) -> Option<&EntityIndex> {
+        self.map.get(name)
+    }
+
+    /// Iterates over all exports in the order that they were inserted.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&Atom, &EntityIndex)> + '_ {
+        self.map.iter()
+    }
+
+    /// Records `entity` in the reverse index.
+    fn index(
+        globals: &mut TryEntitySet<GlobalIndex>,
+        memories: &mut TryEntitySet<MemoryIndex>,
+        tables: &mut TryEntitySet<TableIndex>,
+        entity: EntityIndex,
+    ) -> Result<(), OutOfMemory> {
+        match entity {
+            EntityIndex::Global(i) => {
+                globals.insert(i)?;
+            }
+            EntityIndex::Memory(i) => {
+                memories.insert(i)?;
+            }
+            EntityIndex::Table(i) => {
+                tables.insert(i)?;
+            }
+            // Nothing queries whether these are exported by index.
+            EntityIndex::Function(_) | EntityIndex::Tag(_) => {}
+        }
+        Ok(())
+    }
+}
+
+impl core::ops::Index<&Atom> for ModuleExports {
+    type Output = EntityIndex;
+
+    fn index(&self, name: &Atom) -> &EntityIndex {
+        &self.map[name]
+    }
+}
+
+impl serde::ser::Serialize for ModuleExports {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Only the map is serialized, the sets are derived from it.
+        self.map.serialize(serializer)
+    }
+}
+
+impl<'de> serde::de::Deserialize<'de> for ModuleExports {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let map = TryIndexMap::<Atom, EntityIndex>::deserialize(deserializer)?;
+
+        let mut globals = TryEntitySet::new();
+        let mut memories = TryEntitySet::new();
+        let mut tables = TryEntitySet::new();
+        for entity in map.values() {
+            Self::index(&mut globals, &mut memories, &mut tables, *entity)
+                .map_err(D::Error::custom)?;
+        }
+
+        Ok(ModuleExports {
+            map,
+            globals,
+            memories,
+            tables,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exports_reverse_index_survives_serde() -> Result<()> {
+        let mut module = Module::new(StaticModuleIndex::from_u32(0));
+        let entities = [
+            ("f", EntityIndex::Function(FuncIndex::from_u32(4))),
+            ("g", EntityIndex::Global(GlobalIndex::from_u32(3))),
+            ("m", EntityIndex::Memory(MemoryIndex::from_u32(0))),
+            ("t", EntityIndex::Table(TableIndex::from_u32(70))),
+            ("g2", EntityIndex::Global(GlobalIndex::from_u32(3))),
+        ];
+        for (name, entity) in entities {
+            let name = module.strings.insert(name)?;
+            module.exports.insert(name, entity)?;
+        }
+
+        let bytes = postcard::to_allocvec(&module)?;
+        let decoded: Module = postcard::from_bytes(&bytes)?;
+
+        for module in [&module, &decoded] {
+            assert_eq!(module.exports.iter().count(), entities.len());
+            for (i, expected) in [(0, false), (3, true), (4, false), (70, false), (71, false)] {
+                assert_eq!(
+                    module.is_exported_global(GlobalIndex::from_u32(i)),
+                    expected
+                );
+            }
+            assert!(module.is_exported_memory(MemoryIndex::from_u32(0)));
+            assert!(!module.is_exported_memory(MemoryIndex::from_u32(1)));
+            assert!(module.is_exported_table(TableIndex::from_u32(70)));
+            assert!(!module.is_exported_table(TableIndex::from_u32(3)));
+        }
+        Ok(())
     }
 }

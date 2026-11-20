@@ -305,7 +305,11 @@ impl Config {
             wmemcheck: false,
             #[cfg(feature = "coredump")]
             coredump_on_trap: false,
-            macos_use_mach_ports: !cfg!(miri),
+            // Disable mach ports on miri since it doesn't emulate those APIs,
+            // and additionally disable it with ASAN by default because
+            // otherwise mach ports routes around signal handlers installed by
+            // ASAN.
+            macos_use_mach_ports: !cfg!(miri) && !cfg!(asan),
             #[cfg(feature = "std")]
             detect_host_feature: Some(detect_host_feature),
             #[cfg(not(feature = "std"))]
@@ -633,9 +637,20 @@ impl Config {
     /// you'll have to be sure to pour some fuel into [`Store`] before
     /// executing some code.
     ///
+    /// Fuel accounting is not precise when WebAssembly traps. Each call is
+    /// still bounded by the fuel in the [`Store`], but the amount of fuel
+    /// listed as being consumed when WebAssembly traps may not accurately
+    /// reflect the exact amount that was consumed. This tradeoff enables
+    /// Wasmtime to optimize fuel-consumption primarily while still ensuring
+    /// that non-trapping code is always bounded. Embedders which need precise
+    /// fuel consumption metrics should not reuse a [`Store`] after a trap and
+    /// should not rely on the precise value of [`Store::get_fuel`] in the event
+    /// of a trap.
+    ///
     /// By default this option is `false`.
     ///
     /// [`Store`]: crate::Store
+    /// [`Store::get_fuel`]: crate::Store::get_fuel
     pub fn consume_fuel(&mut self, enable: bool) -> &mut Self {
         self.tunables.consume_fuel = Some(enable);
         self
@@ -668,7 +683,7 @@ impl Config {
     /// compiled form of the Wasm code so that it maintains a precise
     /// instruction count, frequently checking this count against the
     /// remaining fuel. If one does not need this precise count or
-    /// deterministic interruptions, and only needs a periodic
+    /// deterministic interruptions and needs only a periodic
     /// interrupt of some form, then It would be better to have a more
     /// lightweight mechanism.
     ///
@@ -784,6 +799,91 @@ impl Config {
     pub fn epoch_interruption(&mut self, enable: bool) -> &mut Self {
         self.tunables.epoch_interruption = Some(enable);
         self
+    }
+
+    /// XXX: MMU interruption is not yet fully landed; this config flag, not yet
+    /// plumbed through to the CLI, serves as a feature flag that keeps its
+    /// landed portions from kicking in.
+    ///
+    /// Enables MMU-based interruption, a lower-overhead alternative to
+    /// [`Config::epoch_interruption`]. It uses memory-protection faults instead
+    /// of epoch deadline comparisons to prod a running Wasm guest to yield.
+    ///
+    /// # How it works
+    ///
+    /// Cranelift emits, at each loop backedge and function prologue, a load
+    /// from a per-store "interrupt page". To trigger an interruption, the
+    /// embedder marks that page as inaccessible; the resulting SIGSEGV is
+    /// caught by Wasmtime's signal handler, which distinguishes an
+    /// interrupt-check load from an actual crash by consulting a record of each
+    /// such load in the trap table. The signal handler then causes the active
+    /// fiber to yield.
+    ///
+    /// # Compared to `epoch_interruption`
+    ///
+    /// - Faster. Whereas epoch interruption needs to compare, branch, and keep
+    ///   a deadline register coherent, MMU interruption does only a single
+    ///   (dead) load from a per-store memory page. In the no-interruption case,
+    ///   the load completes successfully, and overhead (versus doing nothing)
+    ///   is 2.8% on the SpiderMonkey Sightglass benchmark, compared to 14.4%
+    ///   for epoch interruption. Factoring in interruptions, the SpiderMonkey
+    ///   Markdown-parsing workload, when run under `wasmtime serve`, shows a
+    ///   12% boost in throughput over epoch interruption and a 19% reduction in
+    ///   p50 latency.
+    /// - Also non-deterministic. The same guidance in
+    ///   [`Config::epoch_interruption`] about fuel vs. epochs applies here.
+    /// - Equally fine-grained. Checks for MMU interruption happen at the same
+    ///   points in the compiled Wasm as checks for epoch interruption.
+    /// - Less flexible. Unlike epochs, there is, as of yet, no configurable
+    ///   per-store interrupt behavior. When triggered, interruption always
+    ///   causes the running fiber to yield; the `Store::epoch_deadline_*`
+    ///   callbacks are not consulted.
+    ///
+    /// # Triggering an interruption
+    ///
+    /// Interruptions are triggered from outside the Wasm guest code by an
+    /// [`MmuInterrupter`](crate::MmuInterrupter), which hands each running
+    /// [`Store`] an interrupt page and protects it when that store is due to
+    /// yield. The [`Engine`] owns a single interrupter, shared by all its
+    /// stores. You must provide this interrupter using
+    /// [`Config::with_mmu_interrupter`] before running code.
+    /// [`TimingWheelInterrupter`](crate::TimingWheelInterrupter) is a good
+    /// default implementation; like the epoch counter, it does nothing until
+    /// you tick it.
+    ///
+    /// # Requirements
+    ///
+    /// - **Async.** Since MMU interruption always causes the fiber to yield,
+    ///   wasmtime must be built with the `async` feature. Configuring an engine
+    ///   with `mmu_interruption()` puts every [`Store`] derived from it into
+    ///   async mode automatically.
+    /// - **Cranelift.** Winch does not support it.
+    /// - **Linux on x86_64 or aarch64 target.** Cross-compilation from other
+    ///   hosts is fine.
+    /// - **Native signals**, because we depend on a signal handler.
+    /// - **Signals-based traps**, because signal-handler installation (in
+    ///   [`Engine::new()`]) is currently gated on this. It should be possible
+    ///   to remove this dependency, but the use cases are few, and threading
+    ///   the value of `signals_based_traps` into the signal handler may be
+    ///   nontrivial.
+    ///
+    /// # Errors
+    ///
+    /// Some requirements are validated after config time: some when an
+    /// [`Engine`] is instantiated (which calls [`Config::validate`] herein) and
+    /// others when code is loaded into the engine. Nothing panics; errors are
+    /// reported via return values.
+    #[doc(hidden)]
+    pub fn mmu_interruption(&mut self, enable: bool) -> &mut Self {
+        self.tunables.mmu_interruption = Some(enable);
+        self
+    }
+
+    /// Whether this build of Wasmtime can run code on this host with
+    /// [`Self::mmu_interruption`] enabled.
+    #[doc(hidden)]
+    pub fn is_mmu_interruption_runtime_available() -> bool {
+        cfg!(has_mmu_interruption_runtime)
     }
 
     /// XXX: For internal fuzzing and debugging use only!
@@ -1024,21 +1124,6 @@ impl Config {
     #[cfg(feature = "threads")]
     pub fn wasm_threads(&mut self, enable: bool) -> &mut Self {
         self.wasm_features(WasmFeatures::THREADS, enable);
-        self
-    }
-
-    /// Configures whether the WebAssembly [shared-everything-threads] proposal
-    /// will be enabled for compilation.
-    ///
-    /// This feature gates extended use of the `shared` attribute on items other
-    /// than memories, extra atomic instructions, and new component model
-    /// intrinsics for spawning threads. It depends on the
-    /// [`wasm_threads`][Self::wasm_threads] being enabled.
-    ///
-    /// [shared-everything-threads]:
-    ///     https://github.com/webassembly/shared-everything-threads
-    pub fn wasm_shared_everything_threads(&mut self, enable: bool) -> &mut Self {
-        self.wasm_features(WasmFeatures::SHARED_EVERYTHING_THREADS, enable);
         self
     }
 
@@ -1391,7 +1476,9 @@ impl Config {
     /// and enables the `map<k, v>` type in WIT and the component binary
     /// format.
     ///
-    /// This is `false` by default.
+    /// The default value for this option is whether the `component-model`
+    /// crate feature of Wasmtime is enabled or not. By default this crate
+    /// feature is enabled.
     #[cfg(feature = "component-model")]
     pub fn wasm_component_model_map(&mut self, enable: bool) -> &mut Self {
         self.wasm_features(WasmFeatures::CM_MAP, enable);
@@ -2474,7 +2561,6 @@ impl Config {
         // of features we _definitely can't support_ because wasmtime
         // has never heard of them.
         let features_known_to_wasmtime = WasmFeatures::WASM3
-            | WasmFeatures::SHARED_EVERYTHING_THREADS
             | WasmFeatures::COMPONENT_MODEL
             | WasmFeatures::CUSTOM_PAGE_SIZES
             | WasmFeatures::COMPACT_IMPORTS
@@ -2640,6 +2726,7 @@ impl Config {
             WasmFeatures::COMPONENT_MODEL,
             cfg!(feature = "component-model"),
         );
+        features.set(WasmFeatures::CM_MAP, cfg!(feature = "component-model"));
         features.set(
             WasmFeatures::CM_ASYNC,
             self.tunables
@@ -2729,6 +2816,14 @@ impl Config {
             bail!("exceptions support requires garbage collection (GC) to be enabled in the build");
         }
 
+        if !cfg!(feature = "threads") && features.threads() {
+            bail!("support for threads was disabled at compile time")
+        }
+
+        if !cfg!(feature = "stack-switching") && features.contains(WasmFeatures::STACK_SWITCHING) {
+            bail!("support for stack switching was disabled at compile time")
+        }
+
         match &self.rr_config {
             #[cfg(feature = "rr")]
             RRConfig::Recording | RRConfig::Replaying => {
@@ -2742,7 +2837,8 @@ impl Config {
         // Stack switching is emitted inline in compiled Wasm. In
         // ASan-enabled builds the compiler must arrange the
         // corresponding fiber switch handshake around every such
-        // instruction.
+        // instruction. This defaults to how Wasmtime itself was built
+        // but can be overridden with `Config::asan_compatible_code`.
         tunables.asan_stack_switching = cfg!(asan);
 
         // By default this is enabled with the Cargo feature, and if the feature
@@ -2804,6 +2900,9 @@ impl Config {
 
         self.tunables.configure(&mut tunables);
 
+        // Debuggers set watchpoints through linear memories' shadows.
+        tunables.memory_watchpoints = tunables.debug_guest;
+
         // If no GC heap tunables are explicitly configured, copy the memory
         // tunables' configured values so that GC heaps default to the same
         // configuration as linear memories.
@@ -2815,12 +2914,16 @@ impl Config {
         }
 
         // Validate that the configuration of reservation/guards is sensible
-        // enough to ever possibly actually get allocated. If this overflows a
-        // u64 then there's no hope.
+        // enough to ever possibly actually get allocated. If this doesn't fit
+        // in the target's address space then there's no hope.
         let guard_regions = if tunables.guard_before_linear_memory {
             2
         } else {
             1
+        };
+        let max_size = match self.compiler_target().pointer_width() {
+            Ok(width) if width.bits() < 64 => (1 << width.bits()) - 1,
+            _ => u64::MAX,
         };
         for (what, reservation, guard_size) in [
             (
@@ -2837,11 +2940,11 @@ impl Config {
             if guard_size
                 .checked_mul(guard_regions)
                 .and_then(|g| g.checked_add(reservation))
-                .is_none()
+                .is_none_or(|size| size > max_size)
             {
                 bail!(
                     "`{what}_reservation` ({reservation}) plus `{what}_guard_size` \
-                     ({guard_size}) overflows"
+                     ({guard_size}) overflows the target's address space"
                 );
             }
         }
@@ -2883,6 +2986,14 @@ impl Config {
             );
         }
 
+        if tunables.mmu_interruption {
+            // Only with signals-based traps can MMU interruption's signal
+            // handler be installed (at engine creation time).
+            ensure!(
+                tunables.signals_based_traps,
+                "MMU interruption requires signals-based traps"
+            );
+        }
         // Concurrency support is required for some component model features.
         let requires_concurrency = WasmFeatures::CM_ASYNC
             | WasmFeatures::CM_MORE_ASYNC_BUILTINS
@@ -3506,6 +3617,36 @@ impl Config {
     /// [`StreamReader`]: crate::component::StreamReader
     pub fn concurrency_support(&mut self, enable: bool) -> &mut Self {
         self.tunables.concurrency_support = Some(enable);
+        self
+    }
+
+    /// Configures whether compiled code is compatible with a Wasmtime runtime
+    /// built with AddressSanitizer (ASan) enabled.
+    ///
+    /// Some code Wasmtime generates must cooperate with ASan's bookkeeping
+    /// when it runs inside an ASan-instrumented host. For example,
+    /// stack-switching instructions must tell ASan about every switch between
+    /// stacks. When this option is enabled the generated code includes those
+    /// hooks. A runtime built without ASan treats them as no-ops.
+    ///
+    /// This option is part of a compiled artifact's compatibility key.
+    /// Artifacts produced by [`Module::serialize`] or
+    /// [`Component::serialize`] can only be deserialized by an [`Engine`]
+    /// with the same setting. Code compiled without this option must not run
+    /// in an ASan-enabled runtime.
+    ///
+    /// This option is useful when compiling code outside of ASan, for
+    /// example with `Engine::precompile_module`, that will later run in a
+    /// Wasmtime built with `-Zsanitizer=address`.
+    ///
+    /// This option defaults to `true` if Wasmtime itself was built with ASan
+    /// and `false` otherwise.
+    ///
+    /// [`Engine`]: crate::Engine
+    /// [`Module::serialize`]: crate::Module::serialize
+    /// [`Component::serialize`]: crate::component::Component::serialize
+    pub fn asan_compatible_code(&mut self, enable: bool) -> &mut Self {
+        self.tunables.asan_stack_switching = Some(enable);
         self
     }
 
@@ -5160,9 +5301,20 @@ impl Engine {
         self.tunables().concurrency_support
     }
 
+    /// Returns the configured [`Config::asan_compatible_code`] value.
+    pub fn get_asan_compatible_code(&self) -> bool {
+        self.tunables().asan_stack_switching
+    }
+
     /// Returns the configured [`Config::epoch_interruption`] value.
     pub fn get_epoch_interruption(&self) -> bool {
         self.tunables().epoch_interruption
+    }
+
+    /// Returns the configured [`Config::mmu_interruption`] value.
+    #[doc(hidden)]
+    pub fn get_mmu_interruption(&self) -> bool {
+        self.tunables().mmu_interruption
     }
 
     /// Returns the configured [`Config::consume_fuel`] value.

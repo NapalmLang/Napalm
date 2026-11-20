@@ -11,7 +11,8 @@ use crate::{
     MachTextSectionBuilder, TextSectionBuilder,
     dominator_tree::DominatorTree,
     ir,
-    isa::{self, IsaFlagsHashKey, OwnedTargetIsa, TargetIsa},
+    isa::{IsaFlagsHashKey, OwnedTargetIsa, TargetIsa},
+    loop_analysis::LoopAnalysis,
     machinst::{self, CompiledCode, CompiledCodeStencil, MachInst, SigSet, VCode},
     result::CodegenResult,
     settings::{self as shared_settings, Flags},
@@ -122,6 +123,7 @@ where
         &self,
         func: &ir::Function,
         domtree: &DominatorTree,
+        loop_analysis: &LoopAnalysis,
         regalloc_ctx: &mut regalloc2::Ctx,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<VCode<inst::InstAndKind<P>>> {
@@ -135,6 +137,7 @@ where
         machinst::compile::<Self>(
             func,
             domtree,
+            loop_analysis,
             regalloc_ctx,
             self,
             abi,
@@ -182,11 +185,12 @@ where
         &self,
         func: &ir::Function,
         domtree: &DominatorTree,
+        loop_analysis: &LoopAnalysis,
         regalloc_ctx: &mut regalloc2::Ctx,
         want_disasm: bool,
         ctrl_plane: &mut cranelift_control::ControlPlane,
     ) -> CodegenResult<CompiledCodeStencil> {
-        let vcode = self.compile_vcode(func, domtree, regalloc_ctx, ctrl_plane)?;
+        let vcode = self.compile_vcode(func, domtree, loop_analysis, regalloc_ctx, ctrl_plane)?;
 
         let want_disasm =
             want_disasm || (cfg!(feature = "trace-log") && log::log_enabled!(log::Level::Debug));
@@ -207,11 +211,12 @@ where
         }))
     }
 
+    #[cfg(feature = "unwind")]
     fn emit_unwind_info(
         &self,
-        _result: &crate::CompiledCode,
+        _result: &CompiledCode,
         _kind: super::unwind::UnwindInfoKind,
-    ) -> CodegenResult<Option<isa::unwind::UnwindInfo>> {
+    ) -> CodegenResult<Option<super::unwind::UnwindInfo>> {
         // TODO: actually support unwind info?
         Ok(None)
     }
@@ -284,6 +289,7 @@ fn isa_constructor_32(
     builder: &shared_settings::Builder,
 ) -> CodegenResult<OwnedTargetIsa> {
     use crate::settings::Configurable;
+    super::check_no_separate_constant_pool(&shared_flags, "pulley32")?;
     let mut builder = builder.clone();
     builder.set("pointer_width", "pointer32").unwrap();
     if triple.endianness().unwrap() == target_lexicon::Endianness::Big {
@@ -302,6 +308,7 @@ fn isa_constructor_64(
     builder: &shared_settings::Builder,
 ) -> CodegenResult<OwnedTargetIsa> {
     use crate::settings::Configurable;
+    super::check_no_separate_constant_pool(&shared_flags, "pulley64")?;
     let mut builder = builder.clone();
     builder.set("pointer_width", "pointer64").unwrap();
     if triple.endianness().unwrap() == target_lexicon::Endianness::Big {

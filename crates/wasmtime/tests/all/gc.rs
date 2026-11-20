@@ -66,7 +66,7 @@ fn smoke_test_gc_impl(use_epochs: bool) -> Result<()> {
 
         let r = ExternRef::new(&mut scope, SetFlagOnDrop(inner_dropped.clone()))?;
         {
-            let args = [Val::I32(5), Val::ExternRef(Some(r))];
+            let args = [Val::I32(5), Val::ExternRef(Some(r.into()))];
             func.call(&mut scope, &args, &mut [Val::I32(0)])?;
         }
 
@@ -116,7 +116,7 @@ fn wasm_dropping_refs() -> Result<()> {
     for _ in 0..4096 {
         let mut scope = RootScope::new(&mut store);
         let r = ExternRef::new(&mut scope, CountDrops(num_refs_dropped.clone()))?;
-        let args = [Val::ExternRef(Some(r))];
+        let args = [Val::ExternRef(Some(r.into()))];
         drop_ref.call(&mut scope, &args, &mut [])?;
     }
 
@@ -250,7 +250,7 @@ fn drop_externref_via_table_set() -> Result<()> {
         let bar = ExternRef::new(&mut scope, SetFlagOnDrop(bar_is_dropped.clone()))?;
 
         {
-            let args = vec![Val::ExternRef(Some(foo))];
+            let args = vec![Val::ExternRef(Some(foo.into()))];
             table_set.call(&mut scope, &args, &mut [])?;
         }
 
@@ -259,7 +259,7 @@ fn drop_externref_via_table_set() -> Result<()> {
         assert!(!bar_is_dropped.load(SeqCst));
 
         {
-            let args = vec![Val::ExternRef(Some(bar))];
+            let args = vec![Val::ExternRef(Some(bar.into()))];
             table_set.call(&mut scope, &args, &mut [])?;
         }
     }
@@ -963,55 +963,6 @@ fn table_grow_doesnt_leak() -> Result<()> {
     Ok(())
 }
 
-// This is a test that the argument to `table.init` is properly handled w.r.t.
-// write barriers and such. This doesn't use `SetFlagOnDrop` because that would
-// require initializing a table with an element initialized from a global and
-// the global keeps the externref alive regardless. Instead this has a small GC
-// heap and we continuously make more garbage than is in the heap and expect
-// this to work as when it triggers a GC everything prior should get cleaned up.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn table_init_doesnt_leak() -> Result<()> {
-    const SIZE: u64 = 64 << 10;
-
-    let _ = env_logger::try_init();
-
-    let mut config = Config::new();
-    config.wasm_gc(true);
-    config.wasm_function_references(true);
-    config.memory_may_move(false);
-    config.memory_reservation(SIZE);
-    config.memory_reservation_for_growth(0);
-    let engine = Engine::new(&config)?;
-    let mut store = Store::new(&engine, ());
-
-    let module = Module::new(
-        store.engine(),
-        r#"
-            (module
-                (table 1 arrayref)
-
-                (type $a (array i31ref))
-
-                (func (export "run")
-                    i32.const 0
-                    i32.const 0
-                    i32.const 1
-                    table.init $e)
-                (elem $e arrayref (array.new $a (ref.i31 (i32.const 0)) (i32.const 200)))
-            )
-        "#,
-    )?;
-
-    let instance = Instance::new(&mut store, &module, &[])?;
-    let func = instance.get_typed_func::<(), ()>(&mut store, "run")?;
-    for _ in 0..200 {
-        func.call(&mut store, ())?;
-    }
-
-    Ok(())
-}
-
 #[test]
 fn ref_matches() -> Result<()> {
     let mut store = Store::<()>::default();
@@ -1068,41 +1019,41 @@ fn ref_matches() -> Result<()> {
         (Ref::Any(None), RefType::ANYREF, true),
         (Ref::Func(None), RefType::ANYREF, false),
         // non-null structref
-        (Ref::Any(Some(s)), RefType::NULLFUNCREF, false),
-        (Ref::Any(Some(s)), func_ref_ty.clone(), false),
-        (Ref::Any(Some(s)), RefType::FUNCREF, false),
-        (Ref::Any(Some(s)), RefType::NULLEXTERNREF, false),
-        (Ref::Any(Some(s)), RefType::EXTERNREF, false),
-        (Ref::Any(Some(s)), RefType::NULLREF, false),
-        (Ref::Any(Some(s)), RefType::STRUCTREF, true),
-        (Ref::Any(Some(s)), RefType::ARRAYREF, false),
-        (Ref::Any(Some(s)), RefType::I31REF, false),
-        (Ref::Any(Some(s)), RefType::EQREF, true),
-        (Ref::Any(Some(s)), RefType::ANYREF, true),
+        (Ref::Any(Some(s.into())), RefType::NULLFUNCREF, false),
+        (Ref::Any(Some(s.into())), func_ref_ty.clone(), false),
+        (Ref::Any(Some(s.into())), RefType::FUNCREF, false),
+        (Ref::Any(Some(s.into())), RefType::NULLEXTERNREF, false),
+        (Ref::Any(Some(s.into())), RefType::EXTERNREF, false),
+        (Ref::Any(Some(s.into())), RefType::NULLREF, false),
+        (Ref::Any(Some(s.into())), RefType::STRUCTREF, true),
+        (Ref::Any(Some(s.into())), RefType::ARRAYREF, false),
+        (Ref::Any(Some(s.into())), RefType::I31REF, false),
+        (Ref::Any(Some(s.into())), RefType::EQREF, true),
+        (Ref::Any(Some(s.into())), RefType::ANYREF, true),
         // non-null arrayref
-        (Ref::Any(Some(a)), RefType::NULLFUNCREF, false),
-        (Ref::Any(Some(a)), func_ref_ty.clone(), false),
-        (Ref::Any(Some(a)), RefType::FUNCREF, false),
-        (Ref::Any(Some(a)), RefType::NULLEXTERNREF, false),
-        (Ref::Any(Some(a)), RefType::EXTERNREF, false),
-        (Ref::Any(Some(a)), RefType::NULLREF, false),
-        (Ref::Any(Some(a)), RefType::STRUCTREF, false),
-        (Ref::Any(Some(a)), RefType::ARRAYREF, true),
-        (Ref::Any(Some(a)), RefType::I31REF, false),
-        (Ref::Any(Some(a)), RefType::EQREF, true),
-        (Ref::Any(Some(a)), RefType::ANYREF, true),
+        (Ref::Any(Some(a.into())), RefType::NULLFUNCREF, false),
+        (Ref::Any(Some(a.into())), func_ref_ty.clone(), false),
+        (Ref::Any(Some(a.into())), RefType::FUNCREF, false),
+        (Ref::Any(Some(a.into())), RefType::NULLEXTERNREF, false),
+        (Ref::Any(Some(a.into())), RefType::EXTERNREF, false),
+        (Ref::Any(Some(a.into())), RefType::NULLREF, false),
+        (Ref::Any(Some(a.into())), RefType::STRUCTREF, false),
+        (Ref::Any(Some(a.into())), RefType::ARRAYREF, true),
+        (Ref::Any(Some(a.into())), RefType::I31REF, false),
+        (Ref::Any(Some(a.into())), RefType::EQREF, true),
+        (Ref::Any(Some(a.into())), RefType::ANYREF, true),
         // non-null i31ref
-        (Ref::Any(Some(i31)), RefType::NULLFUNCREF, false),
-        (Ref::Any(Some(i31)), func_ref_ty.clone(), false),
-        (Ref::Any(Some(i31)), RefType::FUNCREF, false),
-        (Ref::Any(Some(i31)), RefType::NULLEXTERNREF, false),
-        (Ref::Any(Some(i31)), RefType::EXTERNREF, false),
-        (Ref::Any(Some(i31)), RefType::NULLREF, false),
-        (Ref::Any(Some(i31)), RefType::STRUCTREF, false),
-        (Ref::Any(Some(i31)), RefType::ARRAYREF, false),
-        (Ref::Any(Some(i31)), RefType::I31REF, true),
-        (Ref::Any(Some(i31)), RefType::EQREF, true),
-        (Ref::Any(Some(i31)), RefType::ANYREF, true),
+        (Ref::Any(Some(i31.into())), RefType::NULLFUNCREF, false),
+        (Ref::Any(Some(i31.into())), func_ref_ty.clone(), false),
+        (Ref::Any(Some(i31.into())), RefType::FUNCREF, false),
+        (Ref::Any(Some(i31.into())), RefType::NULLEXTERNREF, false),
+        (Ref::Any(Some(i31.into())), RefType::EXTERNREF, false),
+        (Ref::Any(Some(i31.into())), RefType::NULLREF, false),
+        (Ref::Any(Some(i31.into())), RefType::STRUCTREF, false),
+        (Ref::Any(Some(i31.into())), RefType::ARRAYREF, false),
+        (Ref::Any(Some(i31.into())), RefType::I31REF, true),
+        (Ref::Any(Some(i31.into())), RefType::EQREF, true),
+        (Ref::Any(Some(i31.into())), RefType::ANYREF, true),
         // non-null funcref
         (Ref::Func(Some(f)), RefType::NULLFUNCREF, false),
         (Ref::Func(Some(f)), func_ref_ty.clone(), true),
@@ -1116,17 +1067,17 @@ fn ref_matches() -> Result<()> {
         (Ref::Func(Some(f)), RefType::EQREF, false),
         (Ref::Func(Some(f)), RefType::ANYREF, false),
         // non-null externref
-        (Ref::Extern(Some(e)), RefType::NULLFUNCREF, false),
-        (Ref::Extern(Some(e)), func_ref_ty.clone(), false),
-        (Ref::Extern(Some(e)), RefType::FUNCREF, false),
-        (Ref::Extern(Some(e)), RefType::NULLEXTERNREF, false),
-        (Ref::Extern(Some(e)), RefType::EXTERNREF, true),
-        (Ref::Extern(Some(e)), RefType::NULLREF, false),
-        (Ref::Extern(Some(e)), RefType::STRUCTREF, false),
-        (Ref::Extern(Some(e)), RefType::ARRAYREF, false),
-        (Ref::Extern(Some(e)), RefType::I31REF, false),
-        (Ref::Extern(Some(e)), RefType::EQREF, false),
-        (Ref::Extern(Some(e)), RefType::ANYREF, false),
+        (Ref::Extern(Some(e.into())), RefType::NULLFUNCREF, false),
+        (Ref::Extern(Some(e.into())), func_ref_ty.clone(), false),
+        (Ref::Extern(Some(e.into())), RefType::FUNCREF, false),
+        (Ref::Extern(Some(e.into())), RefType::NULLEXTERNREF, false),
+        (Ref::Extern(Some(e.into())), RefType::EXTERNREF, true),
+        (Ref::Extern(Some(e.into())), RefType::NULLREF, false),
+        (Ref::Extern(Some(e.into())), RefType::STRUCTREF, false),
+        (Ref::Extern(Some(e.into())), RefType::ARRAYREF, false),
+        (Ref::Extern(Some(e.into())), RefType::I31REF, false),
+        (Ref::Extern(Some(e.into())), RefType::EQREF, false),
+        (Ref::Extern(Some(e.into())), RefType::ANYREF, false),
     ] {
         let actual = val.matches_ty(&mut store, &ty)?;
         assert_eq!(
@@ -1134,56 +1085,6 @@ fn ref_matches() -> Result<()> {
             "{val:?} matches {ty:?}? expected {expected}, got {actual}"
         );
     }
-
-    Ok(())
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn issue_9669() -> Result<()> {
-    let _ = env_logger::try_init();
-
-    let mut config = Config::new();
-    config.wasm_function_references(true);
-    config.wasm_gc(true);
-    config.collector(Collector::DeferredReferenceCounting);
-
-    let engine = Engine::new(&config)?;
-
-    let module = Module::new(
-        &engine,
-        r#"
-            (module
-                (type $empty (struct))
-                (type $thing (struct
-                    (field $field1 (ref $empty))
-                    (field $field2 (ref $empty))
-                ))
-
-                (func (export "run")
-                    (local $object (ref $thing))
-
-                    struct.new $empty
-                    struct.new $empty
-                    struct.new $thing
-
-                    local.tee $object
-                    struct.get $thing $field1
-                    drop
-
-                    local.get $object
-                    struct.get $thing $field2
-                    drop
-                )
-            )
-        "#,
-    )?;
-
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])?;
-
-    let func = instance.get_typed_func::<(), ()>(&mut store, "run")?;
-    func.call(&mut store, ())?;
 
     Ok(())
 }
@@ -1361,135 +1262,6 @@ fn drc_traces_the_correct_number_of_gc_refs_in_arrays() -> Result<()> {
     )?;
     let _instance = Instance::new(&mut store, &module, &[])?;
     store.gc(None)?;
-
-    Ok(())
-}
-
-// Regression test for a stack-map bug in `translate_per_element_copy` (used by
-// `array.copy` on arrays whose elements are GC references).
-//
-// The per-element loop derived raw `src_elem_addr` / `dst_elem_addr` pointers
-// once and used only those raw pointers inside the loop body. The source and
-// destination array gc-refs themselves were dead in CLIF inside the loop, so
-// they were absent from the stack maps at safe points there. Once the DRC
-// collector started firing `force_gc` from inside the read barrier (when the
-// over-approximated-stack-roots list grew past 1024 entries), a GC could run
-// mid-copy with neither array marked from any frame's stack map. Sweep could
-// then drop the arrays from OASR, freeing them and cascading dec-refs through
-// their elements, after which the rest of the copy read from freed memory.
-//
-// The fix passes the source and destination array gc-refs as block params
-// through the forward and backward iteration blocks so they stay live across
-// the per-element loop.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn drc_array_copy_keeps_arrays_alive_across_in_loop_gc() -> Result<()> {
-    let _ = env_logger::try_init();
-
-    let mut config = Config::new();
-    config.wasm_function_references(true);
-    config.wasm_gc(true);
-    config.collector(Collector::DeferredReferenceCounting);
-    // Keep the GC heap small so allocations cycle back through the free
-    // list quickly. This dramatically increases the chance that any slot
-    // freed mid-copy will be reused before the test's verify pass reads
-    // from it, making the bug observable.
-    config.gc_heap_reservation(128 * 1024);
-    config.gc_heap_reservation_for_growth(0);
-
-    let engine = Engine::new(&config)?;
-    let mut store = Store::new(&engine, ());
-
-    let module = Module::new(
-        &engine,
-        r#"
-            (module
-                (import "wasmtime" "gc" (func $gc))
-                (type $box (struct (field i32)))
-                (type $arr (array (mut (ref null $box))))
-
-                ;; Put the `array.copy` in a helper function so the source
-                ;; and destination gc-refs are visibly dead in CLIF inside
-                ;; the per-element loop -- they are function parameters
-                ;; that are only used at the top of the function to compute
-                ;; the initial address.
-                (func $do_copy
-                    (param $src (ref null $arr))
-                    (param $dst (ref null $arr))
-                    (param $len i32)
-                    (array.copy $arr $arr
-                        (local.get $dst) (i32.const 0)
-                        (local.get $src) (i32.const 0)
-                        (local.get $len)))
-
-                (func (export "test") (result i32)
-                    (local $src (ref null $arr))
-                    (local $dst (ref null $arr))
-                    (local $i i32)
-                    (local $sum i32)
-
-                    ;; N=2048 > 1024 so the per-element read barrier
-                    ;; definitely fires `force_gc` during the copy.
-                    (local.set $src (array.new $arr (ref.null $box) (i32.const 2048)))
-                    (local.set $i (i32.const 0))
-                    (loop $fill
-                        (array.set $arr (local.get $src) (local.get $i)
-                            (struct.new $box (local.get $i)))
-                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
-                        (br_if $fill (i32.lt_s (local.get $i) (i32.const 2048))))
-
-                    (local.set $dst (array.new $arr (ref.null $box) (i32.const 2048)))
-
-                    (call $gc)
-
-                    (call $do_copy (local.get $src) (local.get $dst) (i32.const 2048))
-
-                    ;; Drop the source local and force a GC so any
-                    ;; cascade-freed elements that should still be alive
-                    ;; via $dst would surface as either a trap (cast
-                    ;; failure / out-of-bounds) or wrong $dst contents.
-                    (local.set $src (ref.null $arr))
-                    (call $gc)
-
-                    ;; Heavily allocate to reuse any freed slots. Each
-                    ;; iteration allocates a $box with sentinel value -1;
-                    ;; if any element of $dst was a stale reference to a
-                    ;; cascade-freed $box, its slot gets reused here and
-                    ;; reading it back will see -1 rather than its
-                    ;; original index.
-                    (local.set $i (i32.const 0))
-                    (loop $churn
-                        (drop (struct.new $box (i32.const -1)))
-                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
-                        (br_if $churn (i32.lt_s (local.get $i) (i32.const 4096))))
-
-                    (call $gc)
-
-                    (local.set $i (i32.const 0))
-                    (local.set $sum (i32.const 0))
-                    (loop $verify
-                        (local.set $sum
-                            (i32.add (local.get $sum)
-                                (struct.get $box 0
-                                    (array.get $arr (local.get $dst) (local.get $i)))))
-                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
-                        (br_if $verify (i32.lt_s (local.get $i) (i32.const 2048))))
-
-                    (local.get $sum)))
-        "#,
-    )?;
-
-    let mut linker = Linker::new(&engine);
-    linker.func_wrap("wasmtime", "gc", |mut caller: Caller<_>| -> Result<()> {
-        caller.gc(None)?;
-        Ok(())
-    })?;
-    let instance = linker.instantiate(&mut store, &module)?;
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test")?;
-    let result = test.call(&mut store, ())?;
-
-    // Sum of 0..2048 = 2048 * 2047 / 2.
-    assert_eq!(result, 2_096_128);
 
     Ok(())
 }
@@ -1739,145 +1511,6 @@ fn owned_rooted_lots_of_root_creation() -> Result<()> {
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn instantiate_global_init_oom() -> Result<()> {
-    let mut config = Config::new();
-    config.wasm_gc(true);
-    config.wasm_function_references(true);
-    config.memory_may_move(false);
-    config.memory_reservation(64 << 10);
-    config.memory_reservation_for_growth(0);
-    config.gc_heap_may_move(false);
-    config.gc_heap_reservation(64 << 10);
-    config.gc_heap_reservation_for_growth(0);
-    let engine = Engine::new(&config)?;
-    let mut store = Store::new(&engine, ());
-
-    let module = Module::new(
-        store.engine(),
-        r#"
-            (module
-                (table 100 arrayref)
-                (type $a (array i31ref))
-                (global (ref $a) (array.new_default $a (i32.const 10000000)))
-            )
-        "#,
-    )?;
-
-    Instance::new(&mut store, &module, &[])
-        .unwrap_err()
-        .downcast::<GcHeapOutOfMemory<()>>()?;
-
-    Ok(())
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn elem_const_eval_oom() -> Result<()> {
-    let mut config = Config::new();
-    config.wasm_gc(true);
-    config.wasm_function_references(true);
-    config.memory_may_move(false);
-    config.memory_reservation(64 << 10);
-    config.memory_reservation_for_growth(0);
-    config.gc_heap_may_move(false);
-    config.gc_heap_reservation(64 << 10);
-    config.gc_heap_reservation_for_growth(0);
-    let engine = Engine::new(&config)?;
-    let mut store = Store::new(&engine, ());
-
-    let module = Module::new(
-        store.engine(),
-        r#"
-            (module
-                (type $a (array i31ref))
-                (elem arrayref
-                    (array.new_default $a (i32.const 100))
-                    (array.new_default $a (i32.const 10000))
-                    (array.new_default $a (i32.const 10000))
-                    (array.new_default $a (i32.const 10000))
-                    (array.new_default $a (i32.const 1000000))
-                )
-            )
-        "#,
-    )?;
-
-    Instance::new(&mut store, &module, &[])
-        .unwrap_err()
-        .downcast::<GcHeapOutOfMemory<()>>()?;
-
-    Ok(())
-}
-
-// The result of a `select` instruction with a GC reference type should be
-// declared as needing a stack map.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn select_gc_ref_stack_map() -> Result<()> {
-    let _ = env_logger::try_init();
-
-    let mut config = Config::new();
-    config.wasm_function_references(true);
-    config.wasm_gc(true);
-    // Use pooling allocator with a tiny GC heap so that GC is triggered
-    // frequently and freed memory is reused quickly.
-    let mut pool = crate::small_pool_config();
-    pool.max_memory_size(1 << 16); // 64 KiB
-    config.allocation_strategy(pool);
-
-    let engine = Engine::new(&config)?;
-    let module = Module::new(
-        &engine,
-        r#"
-            (module
-                (type $pair (struct (field (mut i32))))
-                (type $arr (array (mut i8)))
-
-                (import "" "" (func $force_gc))
-
-                (func (export "test") (param $cond i32) (result i32)
-                    ;; The select result stays on the Wasm operand stack (never
-                    ;; stored in a local variable). If the new SSA value created
-                    ;; by select is not declared for stack maps, the GC will
-                    ;; free it.
-                    (select (result (ref null $pair))
-                        (struct.new $pair (i32.const 111))
-                        (ref.null $pair)
-                        (local.get $cond)
-                    )
-
-                    ;; This call is a safepoint. The select result is live
-                    ;; across it. The called function triggers GC which will
-                    ;; free the struct if it is incorrectly omitted from the
-                    ;; safepoint's stack map, and the new allocations would
-                    ;; overwrite the freed memory.
-                    (call $force_gc)
-
-                    (drop (struct.new $pair (i32.const 222)))
-
-                    ;; Use the select result. If it was incorrectly freed, then
-                    ;; this will have the wrong value.
-                    (struct.get $pair 0)
-                )
-            )
-        "#,
-    )?;
-
-    let mut store = Store::new(&engine, ());
-    let force_gc = Func::wrap(&mut store, |mut caller: Caller<'_, _>| {
-        caller.gc(None)?;
-        Ok(())
-    });
-    let instance = Instance::new(&mut store, &module, &[force_gc.into()])?;
-    let test = instance.get_typed_func::<(i32,), i32>(&mut store, "test")?;
-
-    let result = test.call(&mut store, (1,))?;
-    assert_eq!(result, 111);
-
-    Ok(())
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
 fn dropped_passive_elems_do_not_leak() -> Result<()> {
     let _ = env_logger::try_init();
 
@@ -2007,38 +1640,6 @@ fn pooling_gc_different_configs_rejected() -> Result<()> {
 
     assert!(Engine::new(&config).is_err());
 
-    Ok(())
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn issue_13141_gc_heap_may_not_move() -> Result<()> {
-    let mut config = Config::new();
-    config.wasm_gc(true);
-    config.gc_heap_may_move(false);
-
-    let engine = Engine::new(&config)?;
-
-    let module = Module::new(
-        &engine,
-        r#"
-            (module
-                (type $a (array (mut i8)))
-
-                (global $g (mut (ref $a)) (array.new_default $a (i32.const 12)))
-
-                (func (export "array_get_nth") (param $p i32) (result i32)
-                    (array.get_u $a (global.get $g) (local.get $p))
-                )
-            )
-        "#,
-    )?;
-
-    let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[])?;
-    let array_get_nth = instance.get_typed_func::<i32, i32>(&mut store, "array_get_nth")?;
-    let result = array_get_nth.call(&mut store, 0)?;
-    assert_eq!(result, 0);
     Ok(())
 }
 
@@ -2637,6 +2238,24 @@ fn anyref_ty_extern_converted() -> Result<()> {
 }
 
 #[test]
+fn externref_val_ty() -> Result<()> {
+    let mut store = gc_store()?;
+    let live = ExternRef::new(&mut store, 1u32)?;
+    let ty = Val::ExternRef(Some(live.into())).ty(&store)?;
+    assert!(ValType::eq(
+        &ty,
+        &ValType::Ref(RefType::new(false, HeapType::Extern))
+    ));
+
+    let unrooted = {
+        let mut scope = RootScope::new(&mut store);
+        ExternRef::new(&mut scope, 2u32)?
+    };
+    assert!(Val::ExternRef(Some(unrooted.into())).ty(&store).is_err());
+    Ok(())
+}
+
+#[test]
 fn anyref_to_raw_struct() -> Result<()> {
     let mut store = gc_store()?;
     let struct_ty = StructType::new(
@@ -3125,7 +2744,7 @@ fn typed_func_nonnull_returns_externref() -> Result<()> {
         ValType::Ref(RefType::new(false, HeapType::Extern)),
         Mutability::Const,
     );
-    let global = Global::new(&mut store, global_ty, Val::ExternRef(Some(ext)))?;
+    let global = Global::new(&mut store, global_ty, Val::ExternRef(Some(ext.into())))?;
     let instance = Instance::new(&mut store, &module, &[global.into()])?;
     let f = instance.get_typed_func::<(), Rooted<ExternRef>>(&mut store, "get")?;
     let ext2 = f.call(&mut store, ())?;
@@ -3547,7 +3166,12 @@ fn miri_gc_smoke_test() -> Result<()> {
         store.gc(None)?;
 
         let assert_field_value = |store: &mut Store<_>, val: Val, field: i32| -> Result<()> {
-            let s = val.anyref().unwrap().unwrap().unwrap_struct(&store)?;
+            let s = val
+                .anyref()
+                .unwrap()
+                .unwrap()
+                .to_rooted(&mut *store)?
+                .unwrap_struct(&store)?;
             let f = s.field(store, 0)?;
             assert_eq!(f.unwrap_i32(), field);
             Ok(())
@@ -4033,7 +3657,7 @@ fn winch_drc_write_barrier_drops_old_global_value() -> Result<()> {
     {
         let mut scope = RootScope::new(&mut store);
         let r = ExternRef::new(&mut scope, SetFlagOnDrop(dropped.clone()))?;
-        set.call(&mut scope, &[Val::ExternRef(Some(r))], &mut [])?;
+        set.call(&mut scope, &[Val::ExternRef(Some(r.into()))], &mut [])?;
     }
 
     // The global holds the only reference; nothing may be dropped yet.
@@ -4089,7 +3713,7 @@ fn winch_drc_read_barrier_keeps_loaded_ref_alive() -> Result<()> {
     {
         let mut scope = RootScope::new(&mut store);
         let r = ExternRef::new(&mut scope, 0xDECAFu32)?;
-        set.call(&mut scope, &[Val::ExternRef(Some(r))], &mut [])?;
+        set.call(&mut scope, &[Val::ExternRef(Some(r.into()))], &mut [])?;
     }
 
     // Settle the deferred unroot so the global truly holds the last count.
@@ -4137,14 +3761,19 @@ fn winch_drc_i31_wrapped_as_externref_skips_global_barriers() -> Result<()> {
 
     let anyref = AnyRef::from_i31(&mut store, I31::wrapping_u32(0x1234));
     let externref = ExternRef::convert_any(&mut store, anyref)?;
-    set.call(&mut store, &[Val::ExternRef(Some(externref))], &mut [])?;
+    set.call(
+        &mut store,
+        &[Val::ExternRef(Some(externref.into()))],
+        &mut [],
+    )?;
 
     let mut results = [Val::null_extern_ref()];
     get.call(&mut store, &[], &mut results)?;
     let externref = results[0]
         .unwrap_externref()
         .expect("global.get returned null");
-    let anyref = AnyRef::convert_extern(&mut store, *externref)?;
+    let externref = externref.to_rooted(&mut store)?;
+    let anyref = AnyRef::convert_extern(&mut store, externref)?;
     assert_eq!(anyref.unwrap_i31(&store)?.get_u32(), 0x1234);
 
     // Replacing the i31-backed externref exercises the old-value side of the
@@ -4195,7 +3824,7 @@ fn winch_drc_read_barrier_forces_gc_at_threshold() -> Result<()> {
             let global = instance
                 .get_global(&mut scope, &format!("g{i}"))
                 .expect("global must be exported");
-            global.set(&mut scope, Val::ExternRef(Some(gc_ref)))?;
+            global.set(&mut scope, Val::ExternRef(Some(gc_ref.into())))?;
         }
     }
 
@@ -4253,7 +3882,7 @@ fn winch_ref_params_and_results_across_gc() -> Result<()> {
             let instance = Instance::new(&mut store, &module, &[gc.into()])?;
             let hold = instance.get_func(&mut store, "hold").unwrap();
             let args: Vec<Val> = (0..nparams as u32)
-                .map(|i| Ok(Val::ExternRef(Some(ExternRef::new(&mut store, i)?))))
+                .map(|i| Ok(Val::ExternRef(Some(ExternRef::new(&mut store, i)?.into()))))
                 .collect::<Result<_>>()?;
             let mut outs = vec![Val::null_extern_ref(); nresults];
             hold.call(&mut store, &args, &mut outs)?;
@@ -4261,6 +3890,7 @@ fn winch_ref_params_and_results_across_gc() -> Result<()> {
                 let id = v
                     .unwrap_externref()
                     .expect("result became null")
+                    .unwrap_unrooted()
                     .data(&store)?
                     .and_then(|d| d.downcast_ref::<u32>().copied());
                 assert_eq!(

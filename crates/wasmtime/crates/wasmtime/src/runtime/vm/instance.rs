@@ -579,7 +579,8 @@ impl Instance {
 
     unsafe fn set_gc_heap(self: Pin<&mut Self>, gc_store: Option<&GcStore>) {
         if let Some(gc_store) = gc_store {
-            *self.gc_heap_data() = Some(unsafe { gc_store.gc_heap.vmctx_gc_heap_data().into() });
+            *self.gc_heap_data() =
+                Some(unsafe { gc_store.gc_heap.get().vmctx_gc_heap_data().into() });
         } else {
             *self.gc_heap_data() = None;
         }
@@ -1310,6 +1311,35 @@ impl Instance {
             }
         }
 
+        // If this module's code checks memory shadows, point to each memory's
+        // watchpoint shadow, if it has one. An imported memory's shadow
+        // belongs to the instance that defines it.
+        if module.has_shadow_memories {
+            // SAFETY: the imports were written above and refer to live
+            // instances.
+            unsafe {
+                let offsets = instance.runtime_info.offsets();
+                let mut ptr = instance.vmctx_plus_offset_raw::<VmPtr<VMMemoryDefinition>>(
+                    offsets.shadow_memories().begin(),
+                );
+                for i in 0..module.memories.len() {
+                    let index = MemoryIndex::new(i);
+                    let memory = match module.defined_memory_index(index) {
+                        Some(def_index) => instance.get_defined_memory(def_index),
+                        None => {
+                            let import = instance.imported_memory(index);
+                            instance
+                                .sibling_vmctx(import.vmctx.as_non_null())
+                                .get_defined_memory(import.index)
+                        }
+                    };
+                    let shadow = memory.shadow().map(|s| s.vmmemory_ptr());
+                    ptr.write(VmPtr::from(shadow.unwrap_or(NonNull::dangling())));
+                    ptr = ptr.add(1);
+                }
+            }
+        }
+
         // Zero-initialize the globals so that nothing is uninitialized memory
         // after this function returns. The globals are actually initialized
         // with their const expression initializers after the instance is fully
@@ -1488,6 +1518,17 @@ impl Instance {
             EntityIndex::Function(i) => {
                 Export::Function(unsafe { self.get_exported_func(registry, store, i) })
             }
+            _ => self.get_export_by_index(store, export).unwrap(),
+        }
+    }
+
+    /// Like `get_export_by_index_mut`, but with only shared access to the
+    /// instance, so it returns `None` for functions: looking up a function
+    /// may need to lazily initialize its `VMFuncRef`, which needs mutable
+    /// access.
+    pub fn get_export_by_index(&self, store: StoreId, export: EntityIndex) -> Option<Export> {
+        Some(match export {
+            EntityIndex::Function(_) => return None,
             EntityIndex::Global(i) => Export::Global(self.get_exported_global(store, i)),
             EntityIndex::Table(i) => Export::Table(self.get_exported_table(store, i)),
             EntityIndex::Memory(i) => match self.get_exported_memory(store, i) {
@@ -1495,7 +1536,7 @@ impl Instance {
                 ExportMemory::Shared(m, i) => Export::SharedMemory(m, i),
             },
             EntityIndex::Tag(i) => Export::Tag(self.get_exported_tag(store, i)),
-        }
+        })
     }
 
     fn store_mut(self: Pin<&mut Self>) -> &mut Option<VMStoreRawPtr> {

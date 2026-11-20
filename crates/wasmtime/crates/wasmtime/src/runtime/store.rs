@@ -79,8 +79,10 @@
 use crate::error::OutOfMemory;
 #[cfg(feature = "async")]
 use crate::fiber;
+use crate::hash_map::HashMap;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
+use crate::runtime::epoch_state::EpochState;
 #[cfg(feature = "stack-switching")]
 use crate::runtime::vm::VMContRef;
 use crate::runtime::vm::mpk::ProtectionKey;
@@ -92,7 +94,7 @@ use crate::runtime::vm::{
 };
 use crate::trampoline::VMHostGlobalContext;
 #[cfg(feature = "debug")]
-use crate::{BreakpointState, DebugHandler, FrameDataCache};
+use crate::{Breakpoints, DebugHandler, FrameDataCache};
 use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
 use crate::{Global, Instance, Table};
 use core::convert::Infallible;
@@ -107,7 +109,10 @@ use core::pin::Pin;
 use core::ptr::NonNull;
 #[cfg(any(feature = "async", feature = "gc"))]
 use core::task::Poll;
-use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, TripleExt};
+use wasmtime_core::undo::Undo;
+use wasmtime_environ::{
+    DefinedGlobalIndex, DefinedTableIndex, EntityRef, TripleExt, VMSharedTypeIndex,
+};
 
 mod context;
 pub use self::context::*;
@@ -463,6 +468,16 @@ pub struct StoreOpaque {
     engine: Engine,
     vm_store_context: VMStoreContext,
 
+    /// A stand-in for all state that Wasm execution can mutate in this
+    /// store (e.g. its stack frames); see `WasmState`.
+    ///
+    /// Invariant: this is mutated (and its epoch is thus bumped)
+    /// whenever Wasm executes, after it runs and before host code can
+    /// observe what it did. We ensure this by mutating it on every
+    /// transfer of control from Wasm to the host; see
+    /// `StoreOpaque::on_wasm_to_host_transition`.
+    wasm_state: EpochState<WasmState>,
+
     // Contains all continuations ever allocated throughout the lifetime of this
     // store.
     #[cfg(feature = "stack-switching")]
@@ -478,6 +493,28 @@ pub struct StoreOpaque {
     gc_store: Option<GcStore>,
     #[cfg(feature = "gc")]
     gc_data: gc::StoreGcData,
+
+    /// A store-local cache of engine-level subtype checks.
+    ///
+    /// Dynamic subtype checks (e.g. for `ref.cast` instructions) consult the
+    /// engine's type registry, which is protected by a read-write lock.
+    /// Testing locally shows that parallel readers take a significant
+    /// performance hit when using this lock (as measured with `wasmtime
+    /// serve`). Thus this cache is intended to serve as a fast path where the
+    /// lock need not be hit at all.
+    ///
+    /// Note that the size of this cache is currently bounded to a fixed size.
+    /// Once this cache is full then all future consultations which aren't in
+    /// the cache go upstream to the engine itself (slow). In the future
+    /// this'll either be removed entirely (see #13484) or will have some sort
+    /// of LRU-like behavior.
+    ///
+    /// FIXME(#13484) this field is a temporary workaround for a "true
+    /// solution" where supertypes are stored inline in a compiled-code-visible
+    /// location which means that a libcall isn't needed at all (nor
+    /// synchronization) to determine subtype/supertype relationships.
+    subtype_check_cache:
+        HashMap<(VMSharedTypeIndex, VMSharedTypeIndex), bool, foldhash::fast::FixedState>,
 
     // Numbers of resources instantiated in this store, and their limits
     instance_count: usize,
@@ -532,7 +569,7 @@ pub struct StoreOpaque {
     /// handler defined above, if any, has a chance to perform some
     /// logic before returning to allow execution to resume.
     #[cfg(feature = "debug")]
-    breakpoints: BreakpointState,
+    breakpoints: Breakpoints,
 
     /// The debug PC-to-FrameData cache for this store.
     ///
@@ -550,6 +587,22 @@ pub struct StoreOpaque {
     #[cfg(feature = "debug")]
     frame_data_cache: FrameDataCache,
 }
+
+/// A stand-in for the state that Wasm execution mutates in a store.
+///
+/// The actual state that Wasm mutates (e.g. its stack frames on the
+/// machine stack) can't be placed inside an `EpochState`, so instead
+/// we keep this unit type in an `EpochState` and mutate it whenever
+/// Wasm executes (see `StoreOpaque::wasm_state` for how this is
+/// ensured). Mutation of this value is thus a proxy for any mutation
+/// that actual Wasm code performs.
+///
+/// We use epoch handles (whose validity we can check, and which are
+/// invalidated by subsequent mutations) to guard other kinds of
+/// Wasm-mutated state, such as `FrameHandle`s in the debug API that
+/// refer to live (and frozen) Wasm stack frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WasmState;
 
 /// Self-pointer to `StoreInner<T>` from within a `StoreOpaque` which is chiefly
 /// used to copy into instances during instantiation.
@@ -611,7 +664,7 @@ impl<'a> AutoAssertNoGc<'a> {
         let entered = if !cfg!(feature = "gc") {
             false
         } else if let Some(gc_store) = store.gc_store.as_mut() {
-            gc_store.gc_heap.enter_no_gc_scope();
+            gc_store.gc_heap.get_mut().enter_no_gc_scope();
             true
         } else {
             false
@@ -664,7 +717,11 @@ impl Drop for AutoAssertNoGc<'_> {
     #[inline]
     fn drop(&mut self) {
         if self.entered {
-            self.store.unwrap_gc_store_mut().gc_heap.exit_no_gc_scope();
+            self.store
+                .unwrap_gc_store_mut()
+                .gc_heap
+                .get_mut()
+                .exit_no_gc_scope();
         }
     }
 }
@@ -719,15 +776,17 @@ impl<T> Store<T> {
     /// memory allocation fails. See the `OutOfMemory` type's documentation for
     /// details on Wasmtime's out-of-memory handling.
     pub fn try_new(engine: &Engine, data: T) -> Result<Self> {
-        let store_data = StoreData::new(engine);
+        let store_data = StoreData::new(engine)?;
         log::trace!("creating new store {:?}", store_data.id());
 
         let pkey = engine.allocator().next_available_pkey();
+        let wasm_state = EpochState::new(store_data.id(), WasmState);
 
         let inner = StoreOpaque {
             _marker: marker::PhantomPinned,
             engine: engine.clone(),
             vm_store_context: Default::default(),
+            wasm_state,
             #[cfg(feature = "stack-switching")]
             continuations: Vec::new(),
             instances: TryPrimaryMap::new(),
@@ -735,6 +794,7 @@ impl<T> Store<T> {
             gc_store: None,
             #[cfg(feature = "gc")]
             gc_data: Default::default(),
+            subtype_check_cache: Default::default(),
             modules: ModuleRegistry::default(),
             func_refs: FuncRefs::default(),
             host_globals: TryPrimaryMap::new(),
@@ -774,6 +834,18 @@ impl<T> Store<T> {
         let store_data =
             <NonNull<ManuallyDrop<T>>>::from(&mut inner.data_no_provenance).cast::<()>();
         inner.inner.vm_store_context.store_data = store_data.into();
+
+        // SAFETY: `store_data` and the `VMStoreContext` beside it live in the
+        // same boxed `StoreInner`, so neither outlives nor moves out from under
+        // the other.
+        unsafe {
+            let StoreOpaque {
+                store_data,
+                vm_store_context,
+                ..
+            } = &mut inner.inner;
+            store_data.publish_to_vm_store_context(vm_store_context);
+        }
 
         inner.traitobj = StorePtr(Some(NonNull::from(&mut *inner)));
 
@@ -1403,6 +1475,14 @@ impl<T> StoreInner<T> {
         (data, limiter, &mut self.inner)
     }
 
+    /// Borrows the store's `T` and the rest of the store, which are
+    /// disjoint, mutably at the same time.
+    #[inline]
+    pub(crate) fn data_and_opaque_mut(&mut self) -> (&mut T, &mut StoreOpaque) {
+        let (data, _limiter, opaque) = self.data_limiter_and_opaque();
+        (data, opaque)
+    }
+
     #[inline]
     fn data_mut(&mut self) -> &mut T {
         self.data_limiter_and_opaque().0
@@ -1429,14 +1509,16 @@ impl<T> StoreInner<T> {
         }
 
         // Temporarily take the configured behavior to avoid mutably borrowing
-        // multiple times.
-        if let Some(mut call_hook) = self.call_hook.take() {
-            let result = self.invoke_call_hook(&mut call_hook, s);
-            self.call_hook = Some(call_hook);
-            return result;
+        // multiple times, and put it back when done, even if the hook panics.
+        let call_hook = self.call_hook.take();
+        let mut undo = Undo::new((self, call_hook), |(store, call_hook)| {
+            store.call_hook = call_hook;
+        });
+        let (store, call_hook) = &mut *undo;
+        match call_hook {
+            Some(call_hook) => store.invoke_call_hook(call_hook, s),
+            None => Ok(()),
         }
-
-        Ok(())
     }
 
     fn invoke_call_hook(&mut self, call_hook: &mut CallHookInner<T>, s: CallHook) -> Result<()> {
@@ -1537,6 +1619,34 @@ fn bump(slot: &mut usize, max: usize, amt: usize, desc: &str) -> Result<()> {
 
 #[doc(hidden)]
 impl StoreOpaque {
+    /// Is type `sub` a subtype of `sup`?
+    ///
+    /// Equivalent to `self.engine().signatures().is_subtype(sub, sup)` but
+    /// caches results store-locally to avoid contention on the engine's type
+    /// registry lock. See the documentation of the `subtype_check_cache` field
+    /// for details.
+    pub(crate) fn is_subtype_cached(
+        &mut self,
+        sub: VMSharedTypeIndex,
+        sup: VMSharedTypeIndex,
+    ) -> bool {
+        const MAX_SIZE: usize = 1 << 16; // 64k entries
+
+        let key = (sub, sup);
+        let engine_answer = || self.engine.signatures().is_subtype(sub, sup);
+        if self.subtype_check_cache.len() < MAX_SIZE {
+            *self
+                .subtype_check_cache
+                .entry(key)
+                .or_insert_with(engine_answer)
+        } else {
+            self.subtype_check_cache
+                .get(&key)
+                .copied()
+                .unwrap_or_else(engine_answer)
+        }
+    }
+
     pub fn id(&self) -> StoreId {
         self.store_data.id()
     }
@@ -1585,23 +1695,32 @@ impl StoreOpaque {
         (&mut self.store_data, &self.modules)
     }
 
+    /// Borrows the `VMStoreContext` and the store's data at the same time.
+    ///
+    /// These are disjoint fields, so JIT-visible state can be reached alongside
+    /// the tables in `StoreData` without a whole-store borrow in between.
+    #[cfg(feature = "component-model")]
+    pub(crate) fn vm_store_context_and_store_data_mut(
+        &mut self,
+    ) -> (&mut VMStoreContext, &mut StoreData) {
+        (&mut self.vm_store_context, &mut self.store_data)
+    }
+
     #[cfg(feature = "debug")]
     pub(crate) fn breakpoints_and_registry_and_engine_mut(
         &mut self,
-    ) -> (&mut BreakpointState, &mut ModuleRegistry, &Engine) {
+    ) -> (&mut Breakpoints, &mut ModuleRegistry, &Engine) {
         (&mut self.breakpoints, &mut self.modules, &self.engine)
     }
 
     #[cfg(feature = "debug")]
-    pub(crate) fn breakpoints_and_registry(&self) -> (&BreakpointState, &ModuleRegistry) {
+    pub(crate) fn breakpoints_and_registry(&self) -> (&Breakpoints, &ModuleRegistry) {
         (&self.breakpoints, &self.modules)
     }
 
     #[cfg(feature = "debug")]
-    pub(crate) fn frame_data_cache_mut_and_registry(
-        &mut self,
-    ) -> (&mut FrameDataCache, &ModuleRegistry) {
-        (&mut self.frame_data_cache, &self.modules)
+    pub(crate) fn frame_data_cache(&self) -> &FrameDataCache {
+        &self.frame_data_cache
     }
 
     #[inline]
@@ -1743,7 +1862,7 @@ impl StoreOpaque {
     }
 
     /// Get all instances (ignoring dummy instances) within this store.
-    pub fn all_instances<'a>(&'a mut self) -> impl ExactSizeIterator<Item = Instance> + 'a {
+    pub fn all_instances<'a>(&'a self) -> impl ExactSizeIterator<Item = Instance> + 'a {
         let instances = self
             .instances
             .iter()
@@ -1816,6 +1935,64 @@ impl StoreOpaque {
     #[inline]
     pub fn vm_store_context_mut(&mut self) -> &mut VMStoreContext {
         &mut self.vm_store_context
+    }
+
+    /// Hook invoked on every transfer of control from Wasm to the host,
+    /// before any host code can observe what Wasm did: when a
+    /// host-to-Wasm call returns (normally, or by unwinding or trapping)
+    /// back to the host, and when Wasm calls out to the host (via a host
+    /// function or libcall).
+    ///
+    /// Wasm may have mutated state in this store without going through
+    /// the `EpochState`s that guard it, so we treat invalidation of
+    /// handles to that state as a deferred effect of running Wasm,
+    /// performed here. Specifically, we:
+    ///
+    /// - bump `wasm_state`'s epoch, invalidating handles to Wasm
+    ///   execution state, such as debugger `FrameHandle`s; and
+    /// - invalidate every [`Unrooted`](crate::Unrooted) reference into
+    ///   this store's GC heap, since compiled Wasm mutates the GC heap
+    ///   directly; see `GcStore::invalidate_unrooted_refs`. (The GC heap
+    ///   has its own `EpochState`, separate from `wasm_state`, because
+    ///   the host API can also mutate it.)
+    ///
+    /// NB: there is intentionally no corresponding hook for transfers
+    /// of control from the host to Wasm (calls into Wasm, returns from
+    /// host functions or libcalls back to Wasm, or resumption of Wasm at
+    /// an exception handler). Wasm has not run yet at that point, so
+    /// there is nothing to invalidate: host code cannot observe anything
+    /// Wasm does until control next transfers back to the host, which
+    /// comes through here. Avoiding work after host functions and
+    /// libcalls return is also important for performance: it would keep
+    /// state live across those calls and defeat tail calls in libcall
+    /// wrappers.
+    #[inline(always)]
+    pub(crate) fn on_wasm_to_host_transition(&mut self) {
+        let _ = self.wasm_state.get_mut();
+        if let Some(gc_store) = &mut self.gc_store {
+            gc_store.invalidate_unrooted_refs();
+        }
+    }
+
+    /// The state standing in for all Wasm-mutated state in this store.
+    ///
+    /// The point of this is to allow taking handles from this
+    /// `EpochState`, and later checking if they are still valid. If an
+    /// epoch handle is still valid, that means that Wasm has not run in
+    /// this store since the handle was created. That allows us to make
+    /// certain assumptions, such as that observed Wasm stack frames are
+    /// still present, and build higher-level safe primitives for
+    /// observing these kinds of Wasm state.
+    #[cfg(feature = "debug")]
+    pub(crate) fn wasm_state(&self) -> &EpochState<WasmState> {
+        &self.wasm_state
+    }
+
+    /// Like `Self::optional_gc_store_mut`, but shared.
+    #[inline]
+    #[cfg(feature = "gc")]
+    pub(crate) fn optional_gc_store(&self) -> Option<&GcStore> {
+        self.gc_store.as_ref()
     }
 
     /// Attempts to access the GC store that has been previously allocated.
@@ -1896,6 +2073,7 @@ impl StoreOpaque {
 
     /// Helper function to clone `gc_ref` notably avoiding allocating a
     /// `GcStore` where possible.
+    #[cfg(feature = "gc")]
     pub(crate) fn clone_gc_ref(&mut self, gc_ref: &VMGcRef) -> VMGcRef {
         if gc_ref.is_i31() {
             gc_ref.copy_i31()
@@ -2414,15 +2592,15 @@ unsafe impl<T> VMStore for StoreInner<T> {
     fn new_epoch_updated_deadline(&mut self) -> Result<UpdateDeadline> {
         // Temporarily take the configured behavior to avoid mutably borrowing
         // multiple times.
-        let mut behavior = self.epoch_deadline_behavior.take();
-        let update = match &mut behavior {
-            Some(callback) => callback(StoreHookState::new((&mut *self).as_context_mut())),
+        let behavior = self.epoch_deadline_behavior.take();
+        let mut undo = Undo::new((self, behavior), |(store, behavior)| {
+            store.epoch_deadline_behavior = behavior;
+        });
+        let (store, behavior) = &mut *undo;
+        match behavior {
+            Some(callback) => callback(StoreHookState::new((&mut **store).as_context_mut())),
             None => Ok(UpdateDeadline::Interrupt),
-        };
-
-        // Put back the original behavior which was replaced by `take`.
-        self.epoch_deadline_behavior = behavior;
-        update
+        }
     }
 
     #[cfg(feature = "debug")]
@@ -2499,9 +2677,9 @@ impl Drop for StoreOpaque {
                 let gc_alloc_index = gc_store.allocation_index;
                 log::trace!("store {store_id:?} is deallocating GC heap {gc_alloc_index:?}");
                 debug_assert!(self.engine.features().gc_types());
-                let mem = gc_store.gc_heap.detach();
+                let mem = gc_store.gc_heap.get_mut().detach();
                 let mem_alloc_index =
-                    allocator.deallocate_gc_heap(gc_alloc_index, gc_store.gc_heap);
+                    allocator.deallocate_gc_heap(gc_alloc_index, gc_store.gc_heap.into_inner());
                 allocator.deallocate_memory(None, mem_alloc_index, mem);
             }
 

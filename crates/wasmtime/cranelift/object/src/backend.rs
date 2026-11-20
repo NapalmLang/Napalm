@@ -453,6 +453,13 @@ impl Module for ObjectModule {
         let alignment = res.buffer.min_alignment as u64;
 
         let compiled = ctx.compiled_code().unwrap();
+        if !compiled.buffer.constant_pool().is_empty() {
+            return Err(ModuleError::Compilation(
+                cranelift_codegen::CodegenError::Unsupported(
+                    "cranelift-object does not support the `separate_constant_pool` setting".into(),
+                ),
+            ));
+        }
         #[cfg(feature = "unwind")]
         let unwind_info = if self.unwind.is_some() {
             compiled.create_unwind_info(self.isa())?
@@ -1052,6 +1059,16 @@ impl ObjectModule {
                 encoding: RelocationEncoding::S390xDbl,
                 size: 32,
             },
+            Reloc::S390xGOTRel32Dbl => {
+                assert_eq!(
+                    self.object.format(),
+                    object::BinaryFormat::Elf,
+                    "S390xGOTRel32Dbl is only supported for ELF"
+                );
+                RelocationFlags::Elf {
+                    r_type: object::elf::R_390_GOTENT,
+                }
+            }
             Reloc::S390xTlsGd64 => {
                 assert_eq!(
                     self.object.format(),

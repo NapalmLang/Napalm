@@ -60,10 +60,10 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
         Resource<udp::IncomingDatagramStream>,
         Resource<udp::OutgoingDatagramStream>,
     )> {
-        let has_active_streams = self
-            .table
-            .iter_children(&this)?
-            .any(|c| c.is::<IncomingDatagramStream>() || c.is::<OutgoingDatagramStream>());
+        let has_active_streams = self.table.iter_children(&this)?.any(|c| {
+            let c = c.entry();
+            c.is::<IncomingDatagramStream>() || c.is::<OutgoingDatagramStream>()
+        });
 
         if has_active_streams {
             return Err(SocketError::trap(format_err!(
@@ -190,7 +190,7 @@ impl udp::HostIncomingDatagramStream for WasiSocketsCtxView<'_> {
         let mut datagrams = vec![];
         let mut sum = 0;
 
-        while datagrams.len() < max_results && sum < crate::MAX_READ_SIZE_ALLOC {
+        while datagrams.len() < max_results && sum < self.ctx.max_io_size.get() {
             match stream.try_recv() {
                 Err(ErrorCode::WouldBlock) => break,
                 Ok((data, remote_addr)) => {

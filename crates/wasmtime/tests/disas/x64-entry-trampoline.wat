@@ -15,11 +15,11 @@
 ;;       movq    %r15, 0x30(%rsp)
 ;;       movq    %rbp, %rcx
 ;;       movq    8(%rdi), %r8
-;;       movq    %rcx, 0x48(%r8)
-;;       movq    %rsp, %rcx
 ;;       movq    %rcx, 0x40(%r8)
+;;       movq    %rsp, %rcx
+;;       movq    %rcx, 0x38(%r8)
 ;;       leaq    0x34(%rip), %rcx
-;;       movq    %rcx, 0x50(%r8)
+;;       movq    %rcx, 0x48(%r8)
 ;;       movq    %r8, (%rsp)
 ;;       callq   0
 ;;       ├─╼ exception frame offset: SP = FP - 0x40
@@ -35,14 +35,15 @@
 ;;       popq    %rbp
 ;;       retq
 ;;   77: movq    (%rsp), %r8
-;;   7b: movq    $1, 0x88(%r8)
-;;   86: xorl    %eax, %eax
-;;   88: movq    0x10(%rsp), %rbx
-;;   8d: movq    0x18(%rsp), %r12
-;;   92: movq    0x20(%rsp), %r13
-;;   97: movq    0x28(%rsp), %r14
-;;   9c: movq    0x30(%rsp), %r15
-;;   a1: addq    $0x40, %rsp
-;;   a5: movq    %rbp, %rsp
-;;   a8: popq    %rbp
-;;   a9: retq
+;;   7b: movq    $1, 0x80(%r8)
+;;   86: movq    $0, 0x90(%r8)
+;;   91: xorl    %eax, %eax
+;;   93: movq    0x10(%rsp), %rbx
+;;   98: movq    0x18(%rsp), %r12
+;;   9d: movq    0x20(%rsp), %r13
+;;   a2: movq    0x28(%rsp), %r14
+;;   a7: movq    0x30(%rsp), %r15
+;;   ac: addq    $0x40, %rsp
+;;   b0: movq    %rbp, %rsp
+;;   b3: popq    %rbp
+;;   b4: retq

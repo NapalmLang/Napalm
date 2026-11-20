@@ -30,6 +30,9 @@
 //! its own resumption information into this slot as well.
 
 use crate::stackswitch::*;
+
+/// Raw fibers use this crate's stack-switching routines.
+pub(crate) use crate::stackswitch::raw;
 use crate::{RunResult, RuntimeFiberStack};
 use std::boxed::Box;
 use std::cell::Cell;
@@ -184,7 +187,9 @@ impl MmapFiberStack {
 
         unsafe {
             // Add in one page for a guard page and then ask for some memory.
-            let mmap_len = size + page_size;
+            let mmap_len = size
+                .checked_add(page_size)
+                .ok_or_else(|| OutOfMemory::new(usize::MAX))?;
             let mmap = rustix::mm::mmap_anonymous(
                 ptr::null_mut(),
                 mmap_len,

@@ -4,8 +4,9 @@
 //! section in a compiled artifact as produced by
 //! [`crate::compile::FrameTableBuilder`].
 
-use crate::{FuncKey, ModulePC};
+use crate::{FuncKey, ModulePC, StaticModuleIndex};
 use alloc::vec::Vec;
+use core::ops::Range;
 use object::{Bytes, LittleEndian, U32};
 
 /// An index into the table of stack shapes.
@@ -53,6 +54,7 @@ pub struct FrameTable<'a> {
     progpoint_descriptor_offsets: &'a [U32<LittleEndian>],
     progpoint_descriptor_data: &'a [U32<LittleEndian>],
 
+    breakpoint_modules: &'a [U32<LittleEndian>],
     breakpoint_pcs: &'a [U32<LittleEndian>],
     breakpoint_patch_offsets: &'a [U32<LittleEndian>],
     breakpoint_patch_data_ends: &'a [U32<LittleEndian>],
@@ -115,6 +117,9 @@ impl<'a> FrameTable<'a> {
         let (progpoint_descriptor_offsets, data) =
             object::slice_from_bytes::<U32<LittleEndian>>(data, num_progpoint_descriptors)
                 .map_err(|_| anyhow::anyhow!("Unable to read progpoint descriptor offset slice"))?;
+        let (breakpoint_modules, data) =
+            object::slice_from_bytes::<U32<LittleEndian>>(data, num_breakpoints)
+                .map_err(|_| anyhow::anyhow!("Unable to read breakpoint module slice"))?;
         let (breakpoint_pcs, data) =
             object::slice_from_bytes::<U32<LittleEndian>>(data, num_breakpoints)
                 .map_err(|_| anyhow::anyhow!("Unable to read breakpoint PC slice"))?;
@@ -146,6 +151,7 @@ impl<'a> FrameTable<'a> {
             progpoint_pcs,
             progpoint_descriptor_offsets,
             progpoint_descriptor_data,
+            breakpoint_modules,
             breakpoint_pcs,
             breakpoint_patch_offsets,
             breakpoint_patch_data_ends,
@@ -292,67 +298,74 @@ impl<'a> FrameTable<'a> {
         }
     }
 
-    /// Find a list of breakpoint patches for a given Wasm PC.
+    /// The range of breakpoint indices for the given module.
+    ///
+    /// A component's modules share one frame table, and one module's
+    /// Wasm PCs mean nothing in another, so every breakpoint lookup is
+    /// scoped to one module first.
+    fn module_breakpoints(&self, module: StaticModuleIndex) -> Range<usize> {
+        let module = module.as_u32();
+        let start = self
+            .breakpoint_modules
+            .partition_point(|m| m.get(LittleEndian) < module);
+        let end = start
+            + self.breakpoint_modules[start..].partition_point(|m| m.get(LittleEndian) == module);
+        start..end
+    }
+
+    /// Find a list of breakpoint patches for a given Wasm PC in the
+    /// given module.
+    ///
+    /// There may be more than one, as inlining can copy a Wasm PC into
+    /// several functions.
     pub fn lookup_breakpoint_patches_by_pc(
         &self,
+        module: StaticModuleIndex,
         pc: ModulePC,
     ) -> impl Iterator<Item = FrameTableBreakpointData<'_>> + '_ {
-        // Find *some* entry with a matching Wasm PC. Note that there
-        // may be multiple entries for one PC.
-        let pc_raw = pc.raw();
-        let range = match self
-            .breakpoint_pcs
-            .binary_search_by_key(&pc_raw, |p| p.get(LittleEndian))
-        {
-            Ok(mut i) => {
-                // Scan backward to first index with this PC.
-                while i > 0 && self.breakpoint_pcs[i - 1].get(LittleEndian) == pc_raw {
-                    i -= 1;
-                }
-
-                // Scan forward to find the end of the range.
-                let mut end = i;
-                while end < self.breakpoint_pcs.len()
-                    && self.breakpoint_pcs[end].get(LittleEndian) == pc_raw
-                {
-                    end += 1;
-                }
-
-                i..end
-            }
-            Err(_) => 0..0,
-        };
-
-        range.map(|i| self.breakpoint_patch(i))
+        let range = self.module_breakpoints(module);
+        let pcs = &self.breakpoint_pcs[range.clone()];
+        let start = pcs.partition_point(|p| p.get(LittleEndian) < pc.raw());
+        let end = pcs.partition_point(|p| p.get(LittleEndian) <= pc.raw());
+        (range.start + start..range.start + end).map(|i| self.breakpoint_patch(i))
     }
 
-    /// Find the nearest breakpoint PC at or after the given PC.
-    pub fn nearest_breakpoint(&self, pc: ModulePC) -> Option<ModulePC> {
-        match self
-            .breakpoint_pcs
-            .binary_search_by_key(&pc.raw(), |p| p.get(LittleEndian))
-        {
-            Ok(_) => Some(pc),
-            Err(i) => {
-                if i < self.breakpoint_pcs.len() {
-                    Some(ModulePC::new(self.breakpoint_pcs[i].get(LittleEndian)))
-                } else {
-                    None
-                }
-            }
-        }
+    /// Find the nearest breakpoint PC at or after the given PC in the
+    /// given module.
+    pub fn nearest_breakpoint(&self, module: StaticModuleIndex, pc: ModulePC) -> Option<ModulePC> {
+        let pcs = &self.breakpoint_pcs[self.module_breakpoints(module)];
+        let i = pcs.partition_point(|p| p.get(LittleEndian) < pc.raw());
+        pcs.get(i).map(|p| ModulePC::new(p.get(LittleEndian)))
     }
 
-    /// Return an iterator over all breakpoint patches.
+    /// Return an iterator over all breakpoint patches for Wasm code
+    /// from the given module, wherever it was compiled (including
+    /// copies inlined into other modules' functions).
     ///
     /// Returned tuples are (module-relative Wasm PC, breakpoint data).
     pub fn breakpoint_patches(
         &self,
+        module: StaticModuleIndex,
     ) -> impl Iterator<Item = (ModulePC, FrameTableBreakpointData<'_>)> + '_ {
-        self.breakpoint_pcs.iter().enumerate().map(|(i, wasm_pc)| {
-            let wasm_pc = ModulePC::new(wasm_pc.get(LittleEndian));
-            let data = self.breakpoint_patch(i);
-            (wasm_pc, data)
+        self.module_breakpoints(module).map(|i| {
+            let wasm_pc = ModulePC::new(self.breakpoint_pcs[i].get(LittleEndian));
+            (wasm_pc, self.breakpoint_patch(i))
+        })
+    }
+
+    /// Return an iterator over all breakpoint patches, for every
+    /// module.
+    ///
+    /// Returned tuples are (module, module-relative Wasm PC, breakpoint
+    /// data).
+    pub fn all_breakpoint_patches(
+        &self,
+    ) -> impl Iterator<Item = (StaticModuleIndex, ModulePC, FrameTableBreakpointData<'_>)> + '_
+    {
+        (0..self.breakpoint_pcs.len()).map(|i| {
+            let module = StaticModuleIndex::from_u32(self.breakpoint_modules[i].get(LittleEndian));
+            let wasm_pc = ModulePC::new(self.breakpoint_pcs[i].get(LittleEndian));
+            (module, wasm_pc, self.breakpoint_patch(i))
         })
     }
 }

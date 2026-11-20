@@ -70,6 +70,9 @@ struct FunctionSlot {
     /// Set after a speculative body bailed out too often: recompile with the
     /// generic helper fallbacks only.
     speculation_disabled: bool,
+    /// Failed speculative guards since compilation (other bailouts, such as
+    /// the native depth limit, do not count against speculation).
+    speculation_failures: u32,
 }
 
 impl Default for FunctionSlot {
@@ -77,6 +80,7 @@ impl Default for FunctionSlot {
         Self {
             hotness: 0, profile_retries: 0, state: FunctionState::Cold, entry: None,
             native_entries: 0, bailouts: 0, speculative: false, speculation_disabled: false,
+            speculation_failures: 0,
         }
     }
 }
@@ -99,6 +103,7 @@ pub(super) struct WholeFunctionJit {
     reserved_typed_array: cranelift::module::FuncId,
     class_factory_probe: cranelift::module::FuncId,
     class_factory_commit: cranelift::module::FuncId,
+    speculation_failed: cranelift::module::FuncId,
     slots: Vec<FunctionSlot>,
     threshold: u32,
     active_depth: u32,
@@ -151,6 +156,7 @@ impl WholeFunctionJit {
         );
         builder.symbol("napalm_wfjit_class_factory_probe", napalm_wfjit_class_factory_probe as *const u8);
         builder.symbol("napalm_wfjit_class_factory_commit", napalm_wfjit_class_factory_commit as *const u8);
+        builder.symbol("napalm_wfjit_speculation_failed", napalm_wfjit_speculation_failed as *const u8);
         let mut module = JITModule::new(builder);
         if module.target_config().pointer_type() != types::I64 {
             return Err("Napalm whole-function JIT requires a 64-bit host".to_owned());
@@ -286,6 +292,12 @@ impl WholeFunctionJit {
             .declare_function("napalm_wfjit_class_factory_commit", Linkage::Import, &commit_sig)
             .map_err(|e| format!("cannot declare native class commit: {e}"))?;
 
+        let mut speculation_sig = module.make_signature();
+        speculation_sig.params.extend([AbiParam::new(pointer), AbiParam::new(types::I32)]);
+        let speculation_failed_id = module
+            .declare_function("napalm_wfjit_speculation_failed", Linkage::Import, &speculation_sig)
+            .map_err(|e| format!("cannot declare speculation feedback helper: {e}"))?;
+
         let context = module.make_context();
         let function_context = FunctionBuilderContext::new();
         let result = Self {
@@ -306,6 +318,7 @@ impl WholeFunctionJit {
             reserved_typed_array: reserved_typed_array_id,
             class_factory_probe: class_factory_probe_id,
             class_factory_commit: class_factory_commit_id,
+            speculation_failed: speculation_failed_id,
             slots: (0..function_count).map(|_| FunctionSlot::default()).collect(),
             // Direct-call tiering runs before the callee's entry hook. Matching
             // its threshold avoids compiling an entry trace just before a whole
@@ -351,8 +364,8 @@ impl WholeFunctionJit {
         // A speculative body whose guards keep failing replays work in the
         // interpreter on every bailout: drop it and recompile it with the
         // generic (rejoining) helper fallbacks once it is hot again.
-        if bailed_out && slot.speculative && slot.bailouts >= 8
-            && u64::from(slot.bailouts) * 64 >= u64::from(slot.native_entries)
+        if bailed_out && slot.speculative && slot.speculation_failures >= 8
+            && u64::from(slot.speculation_failures) * 64 >= u64::from(slot.native_entries)
         {
             slot.speculation_disabled = true;
             slot.speculative = false;
@@ -361,7 +374,15 @@ impl WholeFunctionJit {
             slot.hotness = 0;
             slot.native_entries = 0;
             slot.bailouts = 0;
+            slot.speculation_failures = 0;
             self.stats.deoptimized_functions = self.stats.deoptimized_functions.saturating_add(1);
+        }
+    }
+
+    /// Feedback from a failed speculative guard (cold path of compiled code).
+    fn note_speculation_failure(&mut self, function: u32) {
+        if let Some(slot) = self.slots.get_mut(function as usize) {
+            slot.speculation_failures = slot.speculation_failures.saturating_add(1);
         }
     }
 
@@ -462,6 +483,13 @@ impl WholeFunctionJit {
         // trampoline (`entry_signature`) that forwards to the body.
         let entry_signature = signature.clone();
         signature.call_conv = cranelift::codegen::isa::CallConv::Tail;
+        // Native self-call ABI: the chain depth and the declared arguments travel
+        // in registers. The body stores the arguments into its own bank, so its
+        // later reads forward from those stores instead of reloading values the
+        // caller wrote across the call boundary.
+        let arity = function.arity as usize;
+        signature.params.push(AbiParam::new(types::I32));
+        for _ in 0..arity { signature.params.push(AbiParam::new(types::I64)); }
         let func_id = self.module.declare_anonymous_function(&signature)
             .map_err(|e| format!("cannot declare whole function: {e}"))?;
 
@@ -516,6 +544,7 @@ impl WholeFunctionJit {
         let reserved_typed_array_module_id = self.reserved_typed_array;
         let class_factory_probe_module_id = self.class_factory_probe;
         let class_factory_commit_module_id = self.class_factory_commit;
+        let speculation_failed_module_id = self.speculation_failed;
 
         {
             let target_config = self.module.target_config();
@@ -535,6 +564,16 @@ impl WholeFunctionJit {
             b.switch_to_block(entry);
             let vm = b.block_params(entry)[0];
             let regs = b.block_params(entry)[1];
+            let entry_depth = b.block_params(entry)[2];
+            let entry_args = b.block_params(entry)[3..].to_vec();
+            for (argument, value) in entry_args.into_iter().enumerate() {
+                let destination = function.entry_arg_dsts[argument];
+                if destination != u16::MAX { store_reg(&mut b, regs, destination as u8, value); }
+            }
+            // Native chain depth of each region's frame (the root frame's comes
+            // from the caller; an inlined child's is its call site's depth + 1).
+            let root_depth = b.declare_var(types::I32);
+            b.def_var(root_depth, entry_depth);
             b.ins().jump(blocks[0], &[BlockArg::Value(vm), BlockArg::Value(regs)]);
             b.seal_block(entry);
 
@@ -561,11 +600,14 @@ impl WholeFunctionJit {
                 self.module.declare_func_in_func(class_factory_probe_module_id, b.func);
             let class_factory_commit_ref =
                 self.module.declare_func_in_func(class_factory_commit_module_id, b.func);
+            let speculation_failed_ref =
+                self.module.declare_func_in_func(speculation_failed_module_id, b.func);
 
             // Expand one recursion level for small replay-safe bodies. Child
             // registers and leaf branches become visible to the optimizer.
             // Separate return/bailout edges preserve shadow-frame unwinding.
             let mut regions = vec![(blocks, abort, None)];
+            let mut region_depths = vec![root_depth];
             let mut inline_calls = vec![None; function.ops.len()];
             let self_calls: Vec<_> = function.ops.iter().enumerate().filter_map(|(i, op)| {
                 (reachable[i] && op.x == function_index
@@ -585,10 +627,12 @@ impl WholeFunctionJit {
                     }).collect();
                     let resume = b.create_block();
                     b.append_block_param(resume, types::I64);
-                    inline_calls[index] = Some((child_blocks[0], resume));
+                    let child_depth = b.declare_var(types::I32);
+                    inline_calls[index] = Some((child_blocks[0], resume, child_depth));
                     let child_abort = b.create_block();
                     b.set_cold_block(child_abort);
                     regions.push((child_blocks, child_abort, Some(resume)));
+                    region_depths.push(child_depth);
                     self.stats.inlined_recursive_sites += 1;
                 }
             }
@@ -898,9 +942,10 @@ impl WholeFunctionJit {
                     Opcode::CallDirect
                         if native_recursive_safe && prepared_op.x == function_index =>
                     {
+                        let depth = b.use_var(region_depths[region_index]);
                         let value = emit_native_self_call(
                             &mut b, self_ref, vm, regs, function_index,
-                            function, index, recursive_needs_roots,
+                            function, index, recursive_needs_roots, depth,
                             if region_index == 0 { inline_calls[index] } else { None }, abort,
                         );
                         store_reg(&mut b, regs, op.a, value);
@@ -1005,6 +1050,8 @@ impl WholeFunctionJit {
             for (block, index, vm, regs, abort) in deopts {
                 let flags = MemFlagsData::trusted();
                 b.switch_to_block(block);
+                let function_arg = b.ins().iconst(types::I32, function_index as i64);
+                b.ins().call(speculation_failed_ref, &[vm, function_arg]);
                 let hot_regs = b.ins().load(types::I64, flags, vm,
                     offset_of!(Interpreter<'static>, hot_registers) as i32);
                 let is_top = b.ins().icmp(IntCC::Equal, regs, hot_regs);
@@ -1051,7 +1098,25 @@ impl WholeFunctionJit {
             b.switch_to_block(block);
             b.seal_block(block);
             let params = b.block_params(block).to_vec();
-            let call = b.ins().call(body_ref, &params);
+            let (vm, regs) = (params[0], params[1]);
+            // The interpreter-built frame already holds the arguments at their
+            // entry registers; the chain depth starts at the VM's active_depth
+            // (already counting this entry).
+            let flags = MemFlagsData::trusted();
+            let jit = b.ins().load(types::I64, flags, vm,
+                offset_of!(Interpreter<'static>, whole_function_jit) as i32);
+            let depth = b.ins().load(types::I32, flags, jit,
+                offset_of!(WholeFunctionJit, active_depth) as i32);
+            let mut arguments = vec![vm, regs, depth];
+            for argument in 0..arity {
+                let destination = function.entry_arg_dsts[argument];
+                arguments.push(if destination == u16::MAX {
+                    b.ins().iconst(types::I64, TAG_NULL as i64)
+                } else {
+                    load_reg(&mut b, regs, destination as u8)
+                });
+            }
+            let call = b.ins().call(body_ref, &arguments);
             let result = b.inst_results(call)[0];
             b.ins().return_(&[result]);
             b.finalize(target_config);
@@ -1070,6 +1135,7 @@ impl WholeFunctionJit {
         slot.speculative = speculative_sites > 0;
         slot.native_entries = 0;
         slot.bailouts = 0;
+        slot.speculation_failures = 0;
         self.stats.compiled_functions = self.stats.compiled_functions.saturating_add(1);
         Ok(())
     }
@@ -2495,7 +2561,8 @@ fn emit_native_self_call(
     function: &PreparedFunction,
     index: usize,
     needs_roots: bool,
-    inline_region: Option<(cranelift::prelude::Block, cranelift::prelude::Block)>,
+    depth: cranelift::prelude::Value,
+    inline_region: Option<(cranelift::prelude::Block, cranelift::prelude::Block, cranelift::frontend::Variable)>,
     abort: cranelift::prelude::Block,
 ) -> cranelift::prelude::Value {
     let op = function.ops[index];
@@ -2510,16 +2577,11 @@ fn emit_native_self_call(
         emit_native_root_map_update(b, vm, regs, map, index as u32);
     }
 
-    // Option<Box<T>> has the nullable-pointer ABI. A native entry always owns
-    // a live JIT; its box and compiled code cannot be replaced while active.
-    let jit = b.ins().load(types::I64, flags, vm,
-        offset_of!(Interpreter<'static>, whole_function_jit) as i32);
-    // `active_depth` and the statistics live in the WholeFunctionJit box, which
-    // generated code touches only here. A dedicated alias region keeps these
-    // stores from acting as fences that would discard the register values the
-    // argument copies just stored (and the inlined child would reload).
-    let jit_flags = jit_state_flags(b);
-    let depth = b.ins().load(types::I32, jit_flags, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
+    // The native chain depth travels in a register (it starts at the VM's
+    // `active_depth` in the host-ABI entry). Nested native frames never run
+    // host helpers that could enter other compiled code (those abort outside
+    // the top frame), so `active_depth` stays exact wherever Rust reads it,
+    // and the chain is still bounded by MAX_NATIVE_CALL_DEPTH overall.
     let allowed = b.ins().icmp_imm(IntCC::UnsignedLessThan, depth, MAX_NATIVE_CALL_DEPTH as i64);
     let call_block = b.create_block();
     b.ins().brif(allowed, call_block, &[], call_abort, &[]);
@@ -2531,15 +2593,20 @@ fn emit_native_self_call(
     let storage = b.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot, u32::from(count.max(1)) * 8, 3));
     let child_regs = b.ins().stack_addr(types::I64, storage, 0);
+    // A real call passes the declared arguments in registers (the callee
+    // stores them); the inlined child and any extra arguments go to memory.
+    let mut passed = Vec::with_capacity(function.arity as usize);
     for argument in 0..function.arity.max(op.c) as usize {
         let destination = function.entry_arg_dsts[argument];
-        if destination == u16::MAX { continue; }
+        let register_arg = inline_region.is_none() && argument < function.arity as usize;
+        if destination == u16::MAX && !register_arg { continue; }
         let value = if argument < op.c as usize {
             let source = unsafe { wfjit_call_source_reg(function, &op, argument) }.unwrap();
             load_reg(b, regs, source)
         } else {
             b.ins().iconst(types::I64, TAG_NULL as i64)
         };
+        if register_arg { passed.push(value); continue; }
         store_reg(b, child_regs, destination as u8, value);
     }
 
@@ -2563,7 +2630,6 @@ fn emit_native_self_call(
         None
     };
     let child_depth = b.ins().iadd_imm(depth, 1);
-    b.ins().store(jit_flags, child_depth, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
     // Two memory read-modify-writes per recursive call are measurable on tiny
     // recursive bodies; count them only when the statistics can be observed.
     let counters: &[usize] = if wfjit_call_counters_enabled() {
@@ -2572,35 +2638,32 @@ fn emit_native_self_call(
     } else {
         &[]
     };
+    let jit_flags = jit_state_flags(b);
+    let jit = if counters.is_empty() { None } else {
+        Some(b.ins().load(types::I64, flags, vm, offset_of!(Interpreter<'static>, whole_function_jit) as i32))
+    };
     for &counter in counters {
+        let jit = jit.expect("counters need the JIT box");
         let offset = (offset_of!(WholeFunctionJit, stats) + counter) as i32;
         let old = b.ins().load(types::I64, jit_flags, jit, offset);
         let next = b.ins().iadd_imm(old, 1);
         b.ins().store(jit_flags, next, jit, offset);
     }
 
-    let value = if let Some((entry, resume)) = inline_region {
+    let value = if let Some((entry, resume, child_depth_var)) = inline_region {
+        b.def_var(child_depth_var, child_depth);
         b.ins().jump(entry, &[BlockArg::Value(vm), BlockArg::Value(child_regs)]);
         b.switch_to_block(resume);
         b.block_params(resume)[0]
     } else {
-        let call = b.ins().call(callee, &[vm, child_regs]);
+        let mut arguments = vec![vm, child_regs, child_depth];
+        arguments.extend(passed);
+        let call = b.ins().call(callee, &arguments);
         b.inst_results(call)[0]
     };
     if let Some(previous) = previous {
         b.ins().store(flags, previous, vm, offset_of!(Interpreter<'static>, native_shadow_top) as i32);
     }
-    // Every native call site restores `active_depth` before it returns or
-    // branches to its bailout, so here it again holds `child_depth`. Re-deriving
-    // the restored depth (rather than keeping `jit` and `depth` alive across the
-    // call) frees two callee-saved registers, which every recursive invocation
-    // otherwise pays for in its prologue and epilogue.
-    let jit = b.ins().load(types::I64, flags, vm,
-        offset_of!(Interpreter<'static>, whole_function_jit) as i32);
-    let returned_depth = b.ins().load(types::I32, jit_flags, jit,
-        offset_of!(WholeFunctionJit, active_depth) as i32);
-    let depth = b.ins().iadd_imm(returned_depth, -1);
-    b.ins().store(jit_flags, depth, jit, offset_of!(WholeFunctionJit, active_depth) as i32);
     let failed = b.ins().icmp_imm(IntCC::Equal, value, WFJIT_BAILOUT as i64);
     let done = b.create_block();
     b.ins().brif(failed, call_abort, &[], done, &[]);
@@ -3747,6 +3810,15 @@ unsafe extern "C" fn napalm_wfjit_specialized_factory(
 /// the live managed registers to MMTk. Auto-memoized functions can never reach
 /// this helper because whole-function compilation rejects them, and the helper
 /// repeats that guard defensively.
+/// Cold-path counter for failed speculative guards. Only touches the JIT's
+/// bookkeeping; never the frame, registers or heap.
+unsafe extern "C" fn napalm_wfjit_speculation_failed(vm: *mut c_void, function: u32) {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'_>) };
+    if let Some(jit) = vm.whole_function_jit.as_mut() {
+        jit.note_speculation_failure(function);
+    }
+}
+
 unsafe extern "C" fn napalm_wfjit_native_self_call(
     vm: *mut c_void,
     function_index: u32,

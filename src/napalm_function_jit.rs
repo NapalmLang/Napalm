@@ -64,13 +64,19 @@ struct FunctionSlot {
     /// Native entries / bailouts since compilation (bailout feedback).
     native_entries: u32,
     bailouts: u32,
+    /// The compiled body speculates on numeric quick sites (a failed guard
+    /// bails out instead of calling the generic helper).
+    speculative: bool,
+    /// Set after a speculative body bailed out too often: recompile with the
+    /// generic helper fallbacks only.
+    speculation_disabled: bool,
 }
 
 impl Default for FunctionSlot {
     fn default() -> Self {
         Self {
             hotness: 0, profile_retries: 0, state: FunctionState::Cold, entry: None,
-            native_entries: 0, bailouts: 0,
+            native_entries: 0, bailouts: 0, speculative: false, speculation_disabled: false,
         }
     }
 }
@@ -342,6 +348,21 @@ impl WholeFunctionJit {
         let Some(slot) = self.slots.get_mut(function as usize) else { return; };
         slot.native_entries = slot.native_entries.saturating_add(1);
         if bailed_out { slot.bailouts = slot.bailouts.saturating_add(1); }
+        // A speculative body whose guards keep failing replays work in the
+        // interpreter on every bailout: drop it and recompile it with the
+        // generic (rejoining) helper fallbacks once it is hot again.
+        if bailed_out && slot.speculative && slot.bailouts >= 8
+            && u64::from(slot.bailouts) * 64 >= u64::from(slot.native_entries)
+        {
+            slot.speculation_disabled = true;
+            slot.speculative = false;
+            slot.state = FunctionState::Cold;
+            slot.entry = None;
+            slot.hotness = 0;
+            slot.native_entries = 0;
+            slot.bailouts = 0;
+            self.stats.deoptimized_functions = self.stats.deoptimized_functions.saturating_add(1);
+        }
     }
 
     fn reject(&mut self, function: u32) {
@@ -451,6 +472,18 @@ impl WholeFunctionJit {
 
         let native_recursive_safe =
             native_recursive_body_safe(function_index, function, bytecode, identity_sites);
+        // Speculate on profiled numeric sites unless this function already
+        // bailed out too often. A failed guard resumes the interpreter at the
+        // guarded op (top frame) or replays the outermost native self-call,
+        // which is only emitted for replay-safe bodies.
+        let speculate = !self.slots[function_index as usize].speculation_disabled;
+        let type_facts = if speculate {
+            speculative_type_facts(function_index, function, bytecode, constants, &reachable,
+                native_recursive_safe, identity_sites)
+        } else {
+            vec![TypeFacts::NONE; function.ops.len()]
+        };
+        let mut speculative_sites = 0usize;
         // In the replay-safe subset, AllocMap is the only operation that can
         // collect. Failed nested guards unwind before entering a runtime helper.
         let recursive_needs_roots = !native_recursive_safe || reachable.iter().enumerate().any(|(i, &live)| {
@@ -560,6 +593,9 @@ impl WholeFunctionJit {
                 }
             }
 
+            // Cold bailout blocks of speculative guards: (block, op, vm, regs, abort).
+            let mut deopts: Vec<(cranelift::prelude::Block, usize, cranelift::prelude::Value,
+                cranelift::prelude::Value, cranelift::prelude::Block)> = Vec::new();
             for (region_index, (blocks, abort, return_to)) in regions.iter().enumerate() {
             let abort = *abort;
             for index in 0..function.ops.len() {
@@ -736,6 +772,7 @@ impl WholeFunctionJit {
                             emit_map_property_fast_path(
                                 &mut b, runtime_ref, vm, regs, index as u32,
                                 op.a, op.b, pic, expected_method_epoch, abort,
+                                type_facts[index].epoch_checked,
                             )
                         } else {
                             call_runtime_helper(&mut b, runtime_ref, vm, regs, index as u32, abort)
@@ -886,6 +923,13 @@ impl WholeFunctionJit {
                     }
                     Opcode::Invoke if native_numeric_quick(function, index).is_some() => {
                         let quick = native_numeric_quick(function, index).unwrap();
+                        let deopt = speculate.then(|| {
+                            let block = b.create_block();
+                            b.set_cold_block(block);
+                            deopts.push((block, index, vm, regs, abort));
+                            speculative_sites += 1;
+                            block
+                        });
                         regs = emit_numeric_quick_fast_path(
                             &mut b,
                             runtime_ref,
@@ -898,6 +942,8 @@ impl WholeFunctionJit {
                             quick,
                             expected_method_epoch,
                             abort,
+                            type_facts[index],
+                            deopt,
                         );
                         let target = op.next as usize;
                         if target >= blocks.len() { b.ins().jump(abort, &[]); }
@@ -929,6 +975,7 @@ impl WholeFunctionJit {
                             &pic,
                             expected_method_epoch,
                             abort,
+                            type_facts[index].epoch_checked,
                         );
                         let target = op.next as usize;
                         if target >= blocks.len() { b.ins().jump(abort, &[]); }
@@ -950,6 +997,28 @@ impl WholeFunctionJit {
             } else {
                 b.ins().return_(&[bailout]);
             }
+            }
+            // Speculative guard failures. In the interpreter-owned top frame,
+            // publish this op as the resume PC (with its GC map) so baseline
+            // re-executes it generically; in a native child frame just unwind:
+            // the outermost native self-call is replayed (replay-safe bodies).
+            for (block, index, vm, regs, abort) in deopts {
+                let flags = MemFlagsData::trusted();
+                b.switch_to_block(block);
+                let hot_regs = b.ins().load(types::I64, flags, vm,
+                    offset_of!(Interpreter<'static>, hot_registers) as i32);
+                let is_top = b.ins().icmp(IntCC::Equal, regs, hot_regs);
+                let top = b.create_block();
+                b.set_cold_block(top);
+                b.ins().brif(is_top, top, &[], abort, &[]);
+                b.switch_to_block(top);
+                let frame = b.ins().load(types::I64, flags, vm,
+                    offset_of!(Interpreter<'static>, hot_frame) as i32);
+                let root_map = b.ins().iconst(types::I32, function.gc_map_by_op[index] as i64);
+                b.ins().store(flags, root_map, frame, offset_of!(Frame, root_map) as i32);
+                let pc = b.ins().iconst(types::I32, index as i64);
+                b.ins().store(flags, pc, vm, offset_of!(Interpreter<'static>, hot_pc) as i32);
+                b.ins().jump(abort, &[]);
             }
             b.seal_all_blocks();
             b.finalize(target_config);
@@ -998,6 +1067,9 @@ impl WholeFunctionJit {
         let slot = &mut self.slots[function_index as usize];
         slot.state = FunctionState::Compiled;
         slot.entry = Some(entry);
+        slot.speculative = speculative_sites > 0;
+        slot.native_entries = 0;
+        slot.bailouts = 0;
         self.stats.compiled_functions = self.stats.compiled_functions.saturating_add(1);
         Ok(())
     }
@@ -1152,7 +1224,78 @@ fn emit_numeric_quick_fast_path(
     quick: NumericQuickOp,
     expected_method_epoch: u64,
     abort: cranelift::prelude::Block,
+    facts: TypeFacts,
+    deopt: Option<cranelift::prelude::Block>,
 ) -> cranelift::prelude::Value {
+    if let Some(deopt) = deopt {
+        // Speculative form: every failed guard bails out at this op, so no
+        // slow path rejoins and the proven facts (operands and result are
+        // Numbers, epoch checked) hold for the rest of the body.
+        let binary = !matches!(quick, NumericQuickOp::Neg);
+        let mut guard = |b: &mut FunctionBuilder<'_>, condition: cranelift::prelude::Value| {
+            let next = b.create_block();
+            b.ins().brif(condition, next, &[], deopt, &[]);
+            b.seal_block(next);
+            b.switch_to_block(next);
+        };
+        if !facts.epoch_checked {
+            let epoch = b.ins().load(types::I64, MemFlagsData::trusted(), vm,
+                offset_of!(Interpreter<'static>, method_epoch) as i32);
+            let ok = b.ins().icmp_imm(IntCC::Equal, epoch, expected_method_epoch as i64);
+            guard(b, ok);
+        }
+        let is_number = |b: &mut FunctionBuilder<'_>, word: cranelift::prelude::Value| {
+            let tag = b.ins().band_imm(word, TAG_MASK as i64);
+            b.ins().icmp_imm(IntCC::NotEqual, tag, TAG_BASE as i64)
+        };
+        let lhs_word = load_reg(b, regs, receiver);
+        if !facts.is_number(receiver) {
+            let ok = is_number(b, lhs_word);
+            guard(b, ok);
+        }
+        let rhs_word = if binary {
+            let word = load_reg(b, regs, rhs_reg);
+            if rhs_reg != receiver && !facts.is_number(rhs_reg) {
+                let ok = is_number(b, word);
+                guard(b, ok);
+            }
+            Some(word)
+        } else {
+            None
+        };
+        let lhs = b.ins().bitcast(types::F64, MemFlagsData::new(), lhs_word);
+        let rhs = rhs_word.map(|word| b.ins().bitcast(types::F64, MemFlagsData::new(), word));
+        if quick.is_comparison() {
+            let rhs = rhs.expect("comparison is binary");
+            let cc = match quick {
+                NumericQuickOp::Lt => FloatCC::LessThan,
+                NumericQuickOp::Le => FloatCC::LessThanOrEqual,
+                NumericQuickOp::Gt => FloatCC::GreaterThan,
+                NumericQuickOp::Ge => FloatCC::GreaterThanOrEqual,
+                NumericQuickOp::Eq => FloatCC::Equal,
+                NumericQuickOp::Ne => FloatCC::NotEqual,
+                _ => unreachable!(),
+            };
+            let condition = b.ins().fcmp(cc, lhs, rhs);
+            store_tagged_bool(b, regs, destination, condition);
+        } else {
+            let result = match quick {
+                NumericQuickOp::Neg => b.ins().fneg(lhs),
+                NumericQuickOp::Add => b.ins().fadd(lhs, rhs.expect("add is binary")),
+                NumericQuickOp::Sub => b.ins().fsub(lhs, rhs.expect("sub is binary")),
+                NumericQuickOp::Mul => b.ins().fmul(lhs, rhs.expect("mul is binary")),
+                NumericQuickOp::Div => b.ins().fdiv(lhs, rhs.expect("div is binary")),
+                _ => unreachable!("remainder/bitwise quick ops are filtered before lowering"),
+            };
+            let is_nan = b.ins().fcmp(FloatCC::Unordered, result, result);
+            let bits = b.ins().bitcast(types::I64, MemFlagsData::new(), result);
+            let canonical_nan = b.ins().iconst(types::I64, CANONICAL_NAN as i64);
+            let word = b.ins().select(is_nan, canonical_nan, bits);
+            store_reg(b, regs, destination, word);
+        }
+        return regs;
+    }
+
     let fallback = b.create_block();
     b.set_cold_block(fallback);
     let receiver_ok = b.create_block();
@@ -1279,6 +1422,7 @@ fn emit_map_property_fast_path(
     pic: &NativeMapPropertyPic,
     expected_method_epoch: u64,
     abort: cranelift::prelude::Block,
+    epoch_checked: bool,
 ) -> cranelift::prelude::Value {
     debug_assert!(!pic.entries.is_empty());
 
@@ -1294,14 +1438,20 @@ fn emit_map_property_fast_path(
     // A method rebind invalidates the meaning of an Invoke site even if the Map
     // shape itself is unchanged. Keep compiled code valid by falling back rather
     // than destroying code that may currently be active on the native stack.
-    let epoch = b.ins().load(
-        types::I64,
-        MemFlagsData::trusted(),
-        vm,
-        offset_of!(Interpreter<'static>, method_epoch) as i32,
-    );
-    let epoch_ok = b.ins().icmp_imm(IntCC::Equal, epoch, expected_method_epoch as i64);
-    b.ins().brif(epoch_ok, tag_ok, &[], fallback, &[]);
+    if epoch_checked {
+        // A dominating speculative guard already checked the epoch and no
+        // call has run since (see `speculative_type_facts`).
+        b.ins().jump(tag_ok, &[]);
+    } else {
+        let epoch = b.ins().load(
+            types::I64,
+            MemFlagsData::trusted(),
+            vm,
+            offset_of!(Interpreter<'static>, method_epoch) as i32,
+        );
+        let epoch_ok = b.ins().icmp_imm(IntCC::Equal, epoch, expected_method_epoch as i64);
+        b.ins().brif(epoch_ok, tag_ok, &[], fallback, &[]);
+    }
 
     b.switch_to_block(tag_ok);
     let tagged = load_reg(b, regs, receiver);
@@ -1826,6 +1976,172 @@ fn reachable_ops(function: &PreparedFunction, bytecode: &BytecodeFunction) -> Ve
         }
     }
     seen
+}
+
+/// Facts that hold on entry to a prepared op of a speculative body: which
+/// GPRs hold a Number (a tagged double, outside NaN-box tag space) and whether
+/// the method epoch has already been checked since the last call. They exist
+/// only because a failed speculative guard bails out instead of rejoining the
+/// fast path with an unknown result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TypeFacts {
+    numbers: [u64; 4],
+    epoch_checked: bool,
+}
+
+impl TypeFacts {
+    const NONE: TypeFacts = TypeFacts { numbers: [0; 4], epoch_checked: false };
+
+    #[inline]
+    fn is_number(&self, reg: u8) -> bool {
+        self.numbers[(reg >> 6) as usize] & (1u64 << (reg & 63)) != 0
+    }
+
+    #[inline]
+    fn set_number(&mut self, reg: u8, number: bool) {
+        let bit = 1u64 << (reg & 63);
+        if number { self.numbers[(reg >> 6) as usize] |= bit; } else { self.numbers[(reg >> 6) as usize] &= !bit; }
+    }
+
+    #[inline]
+    fn meet(&mut self, other: &TypeFacts) {
+        for (word, other) in self.numbers.iter_mut().zip(other.numbers) { *word &= other; }
+        self.epoch_checked &= other.epoch_checked;
+    }
+}
+
+/// Forward type-fact analysis over the acyclic op graph (backward jumps and
+/// exception handlers are rejected before compilation, so one pass in index
+/// order sees every predecessor first). Soundness rules: an op is modeled only
+/// if its exact effects are known; any other op clears every fact and pushes
+/// that empty state to every successor it might have. An op reached by no
+/// recorded edge starts with no facts.
+fn speculative_type_facts(
+    function_index: u32,
+    function: &PreparedFunction,
+    bytecode: &BytecodeFunction,
+    constants: &[RegisterWord],
+    reachable: &[bool],
+    native_recursive_safe: bool,
+    identity_sites: &[Option<NativeIdentitySite>],
+) -> Vec<TypeFacts> {
+    // Optimistically assume native self-calls return Numbers, then verify that
+    // every reachable Return returns a proven Number. The assumption is an
+    // induction over completed native executions (a callee whose guard fails
+    // unwinds the whole native chain, so it never returns a value); if it does
+    // not verify, recompute without it.
+    let optimistic = speculative_type_facts_with(function_index, function, bytecode, constants,
+        reachable, native_recursive_safe, identity_sites, true);
+    let verified = (0..function.ops.len()).all(|index| {
+        !reachable[index]
+            || bytecode.chunk.code.get(function.raw_pcs[index] as usize).and_then(|word| word.opcode())
+                != Some(Opcode::Return)
+            || optimistic[index].is_number(function.original_ops[index].a)
+    });
+    if verified {
+        return optimistic;
+    }
+    speculative_type_facts_with(function_index, function, bytecode, constants,
+        reachable, native_recursive_safe, identity_sites, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn speculative_type_facts_with(
+    function_index: u32,
+    function: &PreparedFunction,
+    bytecode: &BytecodeFunction,
+    constants: &[RegisterWord],
+    reachable: &[bool],
+    native_recursive_safe: bool,
+    identity_sites: &[Option<NativeIdentitySite>],
+    self_calls_return_numbers: bool,
+) -> Vec<TypeFacts> {
+    let count = function.ops.len();
+    let mut incoming: Vec<Option<TypeFacts>> = vec![None; count];
+    let mut facts = vec![TypeFacts::NONE; count];
+    if count == 0 { return facts; }
+    incoming[0] = Some(TypeFacts::NONE);
+    let mut send = |incoming: &mut Vec<Option<TypeFacts>>, target: usize, state: &TypeFacts| {
+        if target >= count { return; }
+        match &mut incoming[target] {
+            Some(existing) => existing.meet(state),
+            slot @ None => *slot = Some(*state),
+        }
+    };
+    for index in 0..count {
+        let input = incoming[index].unwrap_or(TypeFacts::NONE);
+        facts[index] = input;
+        if !reachable[index] { continue; }
+        let op = function.original_ops[index];
+        let prepared = function.ops[index];
+        let opcode = bytecode.chunk.code.get(function.raw_pcs[index] as usize).and_then(|word| word.opcode());
+        let mut out = input;
+        match opcode {
+            Some(Opcode::Nop) => send(&mut incoming, op.next as usize, &out),
+            Some(Opcode::Move) => {
+                out.set_number(op.a, input.is_number(op.b));
+                send(&mut incoming, op.next as usize, &out);
+            }
+            Some(Opcode::LoadConst) => {
+                let number = constants.get(op.x as usize).is_some_and(|word| word.0 & TAG_MASK != TAG_BASE);
+                out.set_number(op.a, number);
+                send(&mut incoming, op.next as usize, &out);
+            }
+            Some(Opcode::LoadNull | Opcode::LoadTrue | Opcode::LoadFalse) => {
+                out.set_number(op.a, false);
+                send(&mut incoming, op.next as usize, &out);
+            }
+            Some(Opcode::Jump) => send(&mut incoming, prepared.x as usize, &out),
+            Some(Opcode::JumpIfFalse | Opcode::JumpIfTrue) => {
+                send(&mut incoming, prepared.x as usize, &out);
+                send(&mut incoming, op.next as usize, &out);
+            }
+            Some(Opcode::Return | Opcode::Return2 | Opcode::Trap) => {}
+            // Must match the code generator's arm order: identity sites win.
+            Some(Opcode::Invoke) if identity_sites[index].is_none()
+                && native_numeric_quick(function, index).is_some() =>
+            {
+                let quick = native_numeric_quick(function, index).unwrap();
+                // Speculative guards prove the operands; the result is a Number
+                // (canonical NaN included) or a Boolean for comparisons.
+                out.epoch_checked = true;
+                out.set_number(op.b, true);
+                if !matches!(quick, NumericQuickOp::Neg) {
+                    out.set_number(prepared.y as u8, true);
+                }
+                out.set_number(op.a, !quick.is_comparison());
+                send(&mut incoming, op.next as usize, &out);
+            }
+            Some(Opcode::CallDirect) if native_recursive_safe && prepared.x == function_index => {
+                // A native self-call runs in its own register bank: only the
+                // destination changes here, but the callee may rebind methods.
+                out.epoch_checked = false;
+                out.set_number(op.a, self_calls_return_numbers);
+                send(&mut incoming, op.next as usize, &out);
+            }
+            // Single-destination ops whose generic path (runtime helper or a
+            // callee in its own frame) writes only A. Callees may run arbitrary
+            // code, so the epoch must be rechecked; other GPRs keep their values.
+            // `next` is the original successor, matching the generator.
+            Some(Opcode::Invoke | Opcode::CallDirect | Opcode::InvokeMethodDirect
+                | Opcode::GetFieldClass | Opcode::GetFieldShape) => {
+                out.epoch_checked = false;
+                out.set_number(op.a, false);
+                send(&mut incoming, op.next as usize, &out);
+            }
+            Some(Opcode::LoadModuleVar) => {
+                out.set_number(op.a, false);
+                send(&mut incoming, op.next as usize, &out);
+            }
+            _ => {
+                out = TypeFacts::NONE;
+                for target in [op.next, prepared.next, prepared.x] {
+                    if (target as usize) > index { send(&mut incoming, target as usize, &out); }
+                }
+            }
+        }
+    }
+    facts
 }
 
 fn native_recursive_body_safe(

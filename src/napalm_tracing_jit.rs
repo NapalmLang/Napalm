@@ -196,7 +196,7 @@ unsafe extern "C" fn native_decode_napalm_code_point(
     code as i32
 }
 
-unsafe extern "C" fn noop_heap_write_barrier(_: *mut c_void, _: usize) {}
+unsafe extern "C" fn noop_heap_write_barrier(_: *mut c_void, _: usize, _: u64) {}
 
 // Unit-test-only callbacks for tests without a live VM heap.
 #[cfg(test)]
@@ -377,7 +377,9 @@ impl TraceHeapEntry {
     }
 }
 
-pub type HeapWriteBarrierFn = unsafe extern "C" fn(*mut c_void, usize);
+/// `(runtime, owner object address, stored tagged value)`: the value lets the
+/// runtime record just the stored young handle instead of the whole owner.
+pub type HeapWriteBarrierFn = unsafe extern "C" fn(*mut c_void, usize, u64);
 
 #[repr(C, align(16))]
 pub struct TraceActivation {
@@ -8358,6 +8360,7 @@ fn compile_trace_function(
     let mut heap_barrier_signature = module.make_signature();
     heap_barrier_signature.params.push(AbiParam::new(pointer_type));
     heap_barrier_signature.params.push(AbiParam::new(pointer_type));
+    heap_barrier_signature.params.push(AbiParam::new(types::I64));
 
     let mut list_push_signature = module.make_signature();
     list_push_signature.params.push(AbiParam::new(pointer_type));
@@ -10869,7 +10872,7 @@ impl CraneliftLoweringState<'_, '_> {
         self.builder.ins().call_indirect(
             self.heap_barrier_signature,
             callee,
-            &[runtime, owner_address],
+            &[runtime, owner_address, tagged],
         );
         self.builder.ins().jump(done, &[]);
 
@@ -12050,7 +12053,7 @@ impl CraneliftLoweringState<'_, '_> {
                     self.builder.ins().call_indirect(
                         self.heap_barrier_signature,
                         callee,
-                        &[runtime, owner_address],
+                        &[runtime, owner_address, tagged_value],
                     );
                     self.builder.ins().jump(done, &[]);
                     self.builder.switch_to_block(done);

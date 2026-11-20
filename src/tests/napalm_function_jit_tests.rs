@@ -110,6 +110,44 @@ fn napalm_whole_function_identity_guards_preserve_other_equality() {
 }
 
 #[test]
+fn napalm_whole_function_speculation_bails_out_and_deoptimizes() {
+    // Hot numeric recursion compiles speculative numeric guards. A String
+    // operand fails them: in the top frame the op is resumed by baseline, deep
+    // in native recursion the outermost self-call is replayed, and repeated
+    // failures drop the speculative body for a generic recompilation.
+    let (program, entry, manifest) = whole_function_program(r#"
+        // Reading a reassigned module variable keeps these out of automatic
+        // memoization (memoized functions never reach this tier).
+        let one = 0;
+        one = 1;
+        function sum(n, step) {
+            if (n < one) return step;
+            return sum(n - one, step) + step;
+        }
+        function leafy(n, leaf) {
+            if (n < one) return leaf;
+            return leafy(n - one, leaf) + one;
+        }
+        let total = 0;
+        for (let i = 0; i < 300; i++) total += sum(20, 1.5) + leafy(25, 3);
+        const strings = [sum(3, 'ab'), leafy(4, 'x')];
+        let mixed = '';
+        for (let i = 0; i < 60; i++) mixed = mixed + leafy(6, i % 2 == 0 ? 'q' : 7);
+        for (let i = 0; i < 300; i++) total += sum(10, 2);
+        const result = [total, strings, mixed.length, sum(2, 0 / 0)];
+    "#);
+    let mut vm = source_vm(&program, &manifest);
+    vm.run_module(entry).unwrap();
+    let value = last_source_variable(&vm);
+    assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), "[24450, [abababab, x1111], 270, NaN]");
+    let stats = vm.whole_function_jit_stats().unwrap();
+    assert!(stats.compiled_functions >= 2, "{stats:?}");
+    assert!(stats.bailouts > 0, "{stats:?}");
+    assert!(stats.deoptimized_functions > 0, "{stats:?}");
+    assert!(vm.native_shadow_top.is_null());
+}
+
+#[test]
 fn napalm_whole_function_recursion_replays_guards_and_depth_limit() {
     let (program, entry, manifest) = whole_function_program(r#"
         function chain(depth, value) {

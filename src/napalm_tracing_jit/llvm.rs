@@ -2655,7 +2655,7 @@ impl LlvmLowering<'_> {
         // their forwarded values (a runtime/GC epoch still clears both caches).
     }
 
-    fn call_heap_barrier(&mut self, owner: &V) {
+    fn call_heap_barrier(&mut self, owner: &V, tagged: &V) {
         let callee = self.heap_barrier_callee();
         let runtime = self.runtime_context();
         let owner = self.as_ptr(owner);
@@ -2680,7 +2680,8 @@ impl LlvmLowering<'_> {
         let done = self.new_block();
         self.cond_br(&is_heap, &barrier, &done, None);
         self.begin(&barrier);
-        self.call_heap_barrier(owner);
+        let tagged = self.word(tagged);
+        self.call_heap_barrier(owner, &tagged);
         self.br(&done);
         self.begin(&done);
         Ok(())
@@ -3530,7 +3531,8 @@ impl LlvmLowering<'_> {
                     // Branch-local owner proof (see the Cranelift tier).
                     let tagged_object = self.lower_value(*object)?;
                     let (_, owner) = self.guard_live_heap_entry(&tagged_object, *exit)?;
-                    self.call_heap_barrier(&owner);
+                    let tagged = self.word(&tagged);
+                    self.call_heap_barrier(&owner, &tagged);
                     self.br(&done);
                     self.begin(&done);
                 }

@@ -4554,6 +4554,50 @@ impl AllocationRootBuffer {
     }
 }
 
+/// Handle-level remembered set for StickyImmix nursery collections.
+///
+/// Napalm values reference objects through the handle table, so "a young
+/// object was stored into a mature one" can be recorded as the young object's
+/// *handle* instead of logging the whole owner: the next nursery collection
+/// roots exactly those handle slots. A mature List receiving one young element
+/// then costs one 4-byte entry instead of a rescan of every element in every
+/// nursery GC (which made large growing collections quadratic).
+///
+/// Entries are valid for one collection epoch: `epoch` is the number of
+/// completed collections when they were recorded, and both the mutator (on
+/// the next record) and `visit` ignore entries from an earlier epoch. Rooting a
+/// stale or no-longer-referenced handle would only retain floating garbage for
+/// one cycle; it can never drop a live object.
+struct RememberedHandles {
+    handles: std::cell::UnsafeCell<Vec<u32>>,
+    epoch: AtomicU64,
+}
+
+impl RememberedHandles {
+    fn new() -> Self {
+        Self { handles: std::cell::UnsafeCell::new(Vec::new()), epoch: AtomicU64::new(0) }
+    }
+}
+
+unsafe impl Send for RememberedHandles {}
+unsafe impl Sync for RememberedHandles {}
+
+unsafe impl GcRootProvider for RememberedHandles {
+    fn visit(&self, visitor: &mut GcRootVisitor<'_>) {
+        // SAFETY: providers run only after the owning mutator has parked.
+        let remembered = unsafe { &*self.handles.get() };
+        // Providers run during a collection, before it is counted as completed.
+        if remembered.is_empty() || self.epoch.load(Ordering::Relaxed) != crate::napalm_gc::collection_epoch() {
+            return;
+        }
+        for &handle in remembered {
+            if let Some(slot) = handles().gc_slot(handle) {
+                visitor.slot(slot);
+            }
+        }
+    }
+}
+
 unsafe impl Send for AllocationRootBuffer {}
 unsafe impl Sync for AllocationRootBuffer {}
 
@@ -4745,6 +4789,9 @@ struct Heap {
     mutator: GcMutator,
     allocation_roots: Arc<AllocationRootBuffer>,
     _allocation_root_registration: GcRootRegistration,
+    /// Handle-level remembered set (see `RememberedHandles`).
+    remembered: Arc<RememberedHandles>,
+    _remembered_registration: GcRootRegistration,
     /// Current fiber stack object. It is re-logged after every safepoint so all
     /// register/bank writes until the next safepoint are covered by StickyImmix's
     /// object remembered set without putting a barrier in every register store.
@@ -4810,12 +4857,17 @@ impl Default for Heap {
         let allocation_roots = Arc::new(AllocationRootBuffer::new());
         let provider: Arc<dyn GcRootProvider> = allocation_roots.clone();
         let allocation_root_registration = mutator.register_roots(provider);
+        let remembered = Arc::new(RememberedHandles::new());
+        let remembered_provider: Arc<dyn GcRootProvider> = remembered.clone();
+        let remembered_registration = mutator.register_roots(remembered_provider);
         Self {
             collector,
             handle_table,
             mutator,
             allocation_roots,
             _allocation_root_registration: allocation_root_registration,
+            remembered,
+            _remembered_registration: remembered_registration,
             stack_owner: Value::NULL,
             map_shapes: Arc::new(MapShapeTable::default()),
             shared_mode: false,
@@ -5782,14 +5834,65 @@ impl Heap {
         self.handle_table.refresh(handle, owner, object);
     }
 
+    /// Barrier for storing `value` into `owner`. A young (or already logged)
+    /// owner needs nothing; a mature `value` cannot be reclaimed by a nursery
+    /// collection, so it needs nothing either. Only a young value stored into a
+    /// mature owner must be found by the next nursery GC: record the value's
+    /// handle instead of logging (and later rescanning) the whole owner.
     #[inline(always)]
     fn remember_if_reference(&mut self, owner: Value, value: Value) {
-        if !value.is_heap() {
+        if !value.is_heap() { return; }
+        let Some(owner_object) = self.object(owner) else { return; };
+        self.remember_store(owner_object, value);
+    }
+
+    /// `remember_if_reference` for an already resolved owner (also used by the
+    /// native-trace write barrier).
+    #[inline(always)]
+    fn remember_store(&mut self, owner_object: GcObject, value: Value) {
+        let Some(value_handle) = value.heap_handle() else { return; };
+        // SAFETY: both objects are live heap objects of this VM.
+        if !unsafe { self.mutator.is_unlogged(owner_object) } {
             return;
         }
-        if let Some(owner) = self.object(owner) {
-            unsafe { self.mutator.probable_write(owner) };
+        let Some(value_object) = self.handle_table.resolve(value_handle) else {
+            // Unpublished/unknown target: keep the conservative owner barrier.
+            unsafe { self.mutator.probable_write(owner_object) };
+            return;
+        };
+        if unsafe { self.mutator.is_unlogged(value_object) } {
+            return;
         }
+        self.remember_handle(value_handle);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn remember_handle_slow(&mut self, handle: u32, epoch: u64) {
+        // SAFETY: only the owning mutator touches the buffer while Running.
+        let handles = unsafe { &mut *self.remembered.handles.get() };
+        if self.remembered.epoch.load(Ordering::Relaxed) != epoch {
+            handles.clear();
+            self.remembered.epoch.store(epoch, Ordering::Relaxed);
+        }
+        handles.push(handle);
+    }
+    /// Record `handle` once per collection epoch. The handle entry's
+    /// `next_free` word is unused while the handle is live (it only links free
+    /// handles, and release overwrites it), so it doubles as a per-epoch
+    /// "already remembered" tag.
+    #[inline(always)]
+    fn remember_handle(&mut self, handle: u32) {
+        let epoch = self.mutator.collection_epoch();
+        let tag = (epoch as u32).wrapping_add(1).max(1);
+        let entry = self.handle_table.entry(handle);
+        if entry.next_free.load(Ordering::Relaxed) == tag
+            && self.remembered.epoch.load(Ordering::Relaxed) == epoch
+        {
+            return;
+        }
+        entry.next_free.store(tag, Ordering::Relaxed);
+        self.remember_handle_slow(handle, epoch);
     }
 
     #[inline]
@@ -21567,11 +21670,13 @@ impl TraceRuntime for Interpreter<'_> {
 /// StickyImmix post barrier used by native heap stores. Generated code calls this
 /// only after all kind/bounds guards have succeeded and only when the stored value
 /// is heap-tagged. It cannot allocate or safepoint.
-unsafe extern "C" fn trace_heap_write_barrier(runtime: *mut std::ffi::c_void, object: usize) {
+unsafe extern "C" fn trace_heap_write_barrier(runtime: *mut std::ffi::c_void, object: usize, value: u64) {
     if object == 0 { return; }
     let vm = unsafe { &mut *(runtime as *mut Interpreter<'_>) };
     let object = unsafe { GcObject::from_address(object) };
-    unsafe { vm.heap.mutator.probable_write(object) };
+    // Same handle-level barrier as the interpreter: only a young stored value
+    // is remembered, never a rescan of the whole owner.
+    vm.heap.remember_store(object, Value::from_word(RegisterWord(value)));
 }
 
 /// `list.push(item)` for native traces (`TraceInst::HeapListPush`): exactly the
@@ -25689,6 +25794,51 @@ var result = CallLoop.run();
         assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
         assert_eq!(mutator.run_finalizers(1), 0);
         assert!(weak.upgrade(mutator).is_none());
+    }
+
+    #[test]
+    fn young_values_in_mature_owners_use_handle_remembered_set() {
+        let mut asm = Assembler::new();
+        asm.emit_a(Opcode::LoadNull, 0);
+        asm.emit_a(Opcode::Return, 0);
+        let program = simple_program(asm.finish().unwrap(), 1);
+        let mut vm = Interpreter::new(&program).unwrap();
+        let list = vm.heap.alloc(HeapObject::List(Vec::new()));
+        let list_root = vm.add_root(list);
+        for round in 0..24 {
+            // Every collection leaves the surviving list mature and unlogged.
+            vm.heap.mutator.collect();
+            let list_object = vm.heap.object(list).unwrap();
+            assert!(unsafe { vm.heap.mutator.is_unlogged(list_object) });
+            let child = vm.heap.alloc(HeapObject::String(NapalmString::new(
+                StrBytes::from(format!("young{round}").as_bytes()))));
+            {
+                let mut context = HostContext { heap: &mut vm.heap };
+                context.list_push(list, child).unwrap();
+                context.list_push(list, child).unwrap();
+            }
+            let list_object = vm.heap.object(list).unwrap();
+            assert!(unsafe { vm.heap.mutator.is_unlogged(list_object) },
+                "a young store must not log (and later rescan) the whole mature owner");
+            let remembered = unsafe { &*vm.heap.remembered.handles.get() };
+            assert_eq!(remembered.iter().filter(|&&h| Some(h) == child.heap_handle()).count(), 1,
+                "the young handle is remembered once per epoch");
+        }
+        vm.heap.mutator.collect();
+        vm.heap.collect_full();
+        match vm.heap.get(list).unwrap() {
+            HeapObject::List(items) => {
+                assert_eq!(items.len(), 48);
+                for (index, item) in items.iter().enumerate() {
+                    let Some(HeapObject::String(text)) = vm.heap.get(*item) else {
+                        panic!("element {index} was reclaimed");
+                    };
+                    assert_eq!(text.as_ref(), format!("young{}", index / 2).as_bytes());
+                }
+            }
+            _ => unreachable!(),
+        }
+        vm.release_root(list_root);
     }
 
     #[test]

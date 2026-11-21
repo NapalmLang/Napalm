@@ -95,7 +95,13 @@ function primitiveMembers(t) {
         property(t, "length", shape("Number"), 10);
         for (const name of "push unshift".split(" ")) property(t, name, method("Number", []), 2);
         for (const name of "pop shift".split(" ")) property(t, name, method("unknown", []), 2);
-        for (const name of "slice fill".split(" ")) property(t, name, method("Array", []), 2);
+        property(t, "count", shape("Number"), 10);
+        property(t, "isEmpty", shape("Boolean"), 10);
+        for (const name of "removeAt remove find add insert reduce forEach clear".split(" ")) property(t, name, method("unknown", []), 2);
+        for (const name of "slice fill concat reverse sort map filter".split(" ")) property(t, name, method("Array", []), 2);
+        for (const name of "indexOf findIndex".split(" ")) property(t, name, method("Number", []), 2);
+        for (const name of "includes some every".split(" ")) property(t, name, method("Boolean", []), 2);
+        property(t, "join", method("String", []), 2);
     } else if (t.name === "Map" || t.name === "Object") {
         property(t, "get", method("unknown", []), 2);
         property(t, "has", method("Boolean", []), 2);

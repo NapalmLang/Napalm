@@ -181,6 +181,74 @@ fn napalm_whole_function_v2_specializes_parameters_and_guards_entry() {
 }
 
 #[test]
+fn napalm_whole_function_v2_inlines_guarded_methods_and_replays_on_miss() {
+    // `addw` inlines both profiled `weight` targets behind class guards; a
+    // swapped receiver pair fails a guard inside the inlined body and replays
+    // the whole call in the interpreter. Setter-like bodies (`bump`) must run
+    // exactly once per call even when their inlining is declined.
+    let (program, entry, manifest) = whole_function_program(r#"
+        let one = 0;
+        one = 1;
+        class A {
+            constructor(v) { this.v = v; this.count = 0; }
+            weight() { return this.v * 2; }
+            bump() { this.count = this.count + one; return this.count; }
+            bumpTwice() { this.bump(); return this.bump(); }
+            get() { return this.v; }
+        }
+        class B {
+            constructor(v) { this.v = v; this.count = 0; }
+            weight() { return this.v + 100; }
+            bump() { this.count = this.count + 10; return this.count; }
+            bumpTwice() { this.bump(); return this.bump(); }
+            get() { return this.v; }
+        }
+        function score(x, n) {
+            if (n < one) return x.weight();
+            return x.weight() + score(x, n - one);
+        }
+        function churn(x) {
+            const a = x.bump();
+            const b = x.bumpTwice();
+            return a + b + x.get() * 2;
+        }
+        function addw(x, y) { return x.weight() + y.weight(); }
+        // Driven from a function so the calls are direct calls that count
+        // toward whole-function hotness.
+        function main(out, a, b) {
+            for (let i = 0; i < 200; i++) out.add(score(a, 10));
+            out.add(score(b, 5));
+            for (let i = 0; i < 200; i++) out.add(churn(a));
+            out.add(churn(b));
+            for (let i = 0; i < 200; i++) out.add(addw(a, b));
+            out.add(addw(b, a));
+            for (const m of [a, b, a, b]) { out.add(score(m, 2)); out.add(churn(m)); }
+            try { out.add(score(new A(null), 2)); } catch (e) { out.add('err'); }
+            return [out.reduce((s, x) => typeof x == 'Number' ? s + x : s, 0),
+                out.slice(-10), a.count, b.count];
+        }
+        const result = main([], new A(3), new B(4));
+    "#);
+    let mut vm = source_vm(&program, &manifest);
+    // Only the whole-function tier: loop traces would otherwise absorb the
+    // calls in `main` before the callees become hot.
+    vm.set_jit_options(Some(TracingJitOptions {
+        hot_entry_threshold: 2,
+        hot_loop_threshold: u32::MAX,
+        min_entry_trace_bytecodes: u32::MAX,
+        llvm_hot_threshold: 0,
+        ..Default::default()
+    }));
+    vm.run_module(entry).unwrap();
+    let value = last_source_variable(&vm);
+    assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value),
+        "[160744, [110, 18, 1210, 312, 108, 18, 1216, 312, 168, err], 606, 90]");
+    let stats = vm.whole_function_jit_stats().unwrap();
+    assert!(stats.v2_inlined_calls >= 1, "{stats:?}");
+    assert!(vm.native_shadow_top.is_null());
+}
+
+#[test]
 fn napalm_whole_function_recursion_replays_guards_and_depth_limit() {
     let (program, entry, manifest) = whole_function_program(r#"
         function chain(depth, value) {

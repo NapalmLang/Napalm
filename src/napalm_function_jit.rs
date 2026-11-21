@@ -54,6 +54,8 @@ pub(crate) struct WholeFunctionJitStats {
     pub deoptimized_functions: u64,
     /// Functions compiled by the typed-SSA v2 tier (the rest use v1).
     pub v2_compiled_functions: u64,
+    /// Calls inlined by the v2 tier.
+    pub v2_inlined_calls: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -415,6 +417,7 @@ impl WholeFunctionJit {
         native_plain_store_classes: &crate::napalm_collections::HashMap<usize, u64>,
         native_shape_read_pics: &crate::napalm_collections::HashMap<usize, NativeMapPropertyPic>,
         native_shape_write_pics: &crate::napalm_collections::HashMap<usize, NativeMapPropertyPic>,
+        inline_callees: &crate::napalm_collections::HashMap<u32, wf_ir::WfFunctionData<'_>>,
     ) -> Result<(), String> {
         self.stats.compile_attempts = self.stats.compile_attempts.saturating_add(1);
         // Methods and constructors (`uses_this`) are eligible: their frame is
@@ -482,14 +485,23 @@ impl WholeFunctionJit {
         // Prefer the typed-SSA v2 tier; functions it does not cover yet (or whose
         // speculation failed too often) keep the v1 code generator below.
         if wfjit_v2_enabled() && !self.slots[function_index as usize].speculation_disabled {
-            let source = wf_ir::WfSource {
+            let root = wf_ir::WfFunctionData {
                 function_index, function, bytecode, constants,
-                reachable: &reachable, identity_sites, expected_method_epoch,
-                plain_store_classes: native_plain_store_classes,
+                reachable: reachable.clone(),
+                identity_sites: identity_sites.to_vec(),
+                plain_store_classes: native_plain_store_classes.clone(),
+            };
+            let source = wf_ir::WfSource {
+                root: &root,
+                callees: inline_callees,
+                expected_method_epoch,
+                class_slots: native_direct_method_class_slots,
+                method_targets: native_direct_method_targets,
             };
             let events = std::env::var_os("NAPALM_JIT_EVENTS").is_some();
-            match wf_ir::build(&source).and_then(|ir| self.compile_v2(&ir, function)) {
-                Ok(entry) => {
+            match wf_ir::build(&source).and_then(|ir| self.compile_v2(&ir, function).map(|entry| (entry, ir.inlined_calls))) {
+                Ok((entry, inlined_calls)) => {
+                    self.stats.v2_inlined_calls = self.stats.v2_inlined_calls.saturating_add(u64::from(inlined_calls));
                     let slot = &mut self.slots[function_index as usize];
                     slot.state = FunctionState::Compiled;
                     slot.entry = Some(entry);
@@ -1313,6 +1325,7 @@ impl WholeFunctionJit {
 
 
 
+#[derive(Clone)]
 struct NativeIdentitySite {
     classes: smallvec::SmallVec<[ReceiverClass; 4]>,
     negate: bool,
@@ -3389,6 +3402,92 @@ pub(super) unsafe fn try_run_pushed_call(
     unsafe { run_pushed_frame(vm, caller_fiber, caller_depth, target, entry) };
 }
 
+/// Exact-class SetFieldClass sites of `target` whose store needs no contract
+/// check (untyped field, or proven by the compiler).
+fn plain_store_classes_for(vm: &Interpreter<'_>, target: u32) -> crate::napalm_collections::HashMap<usize, u64> {
+    let mut classes = crate::napalm_collections::HashMap::default();
+    let prepared = &vm.prepared.functions[target as usize];
+    let bytecode = &vm.program.functions[target as usize];
+    for (index, op) in prepared.ops.iter().enumerate() {
+        if bytecode.chunk.code[prepared.raw_pcs[index] as usize].opcode() != Some(Opcode::SetFieldClass) { continue; }
+        let Some(crate::napalm_bytecode::SpecializedDescriptor::FieldClass { class, unchecked_store, .. }) =
+            bytecode.chunk.specializations.get(prepared.original_ops[index].x as usize)
+        else { continue; };
+        let Some(&class_slot) = vm.prepared.class_by_id.get(class) else { continue; };
+        let Some(info) = vm.classes.get(class_slot as usize) else { continue; };
+        if !*unchecked_store
+            && (info.instance_field_types.get(op.x as usize) != Some(&Type::Top)
+                || info.generic_fields.get(op.x as usize) != Some(&false))
+        { continue; }
+        classes.insert(index, CLASS_KIND_INSTANCE | class_slot as u64);
+    }
+    classes
+}
+
+/// Builder view of one function (borrowed from the VM for one compilation).
+///
+/// # Safety
+/// The VM's prepared functions, programs and constants must not change while
+/// the result is alive (true for the duration of a synchronous compile).
+unsafe fn wf_function_data(vm: &Interpreter<'_>, index: u32) -> wf_ir::WfFunctionData<'static> {
+    let function: &'static PreparedFunction = unsafe { &*vm.prepared.functions.as_ptr().add(index as usize) };
+    let bytecode: &'static BytecodeFunction = unsafe { &*(&vm.program.functions[index as usize] as *const BytecodeFunction) };
+    let constants: &'static [RegisterWord] = unsafe { &*(vm.resolved_constants[index as usize].as_slice() as *const [RegisterWord]) };
+    wf_ir::WfFunctionData {
+        function_index: index,
+        function,
+        bytecode,
+        constants,
+        reachable: reachable_ops(function, bytecode),
+        identity_sites: native_identity_sites(vm, index),
+        plain_store_classes: plain_store_classes_for(vm, index),
+    }
+}
+
+/// Functions `target` may inline: direct calls, resolvable direct methods and
+/// profiled monomorphic Invokes, transitively up to the inlining depth.
+///
+/// # Safety
+/// Same contract as `wf_function_data`.
+unsafe fn collect_inline_callees(
+    vm: &Interpreter<'_>,
+    target: u32,
+    class_slots: &crate::napalm_collections::HashMap<ClassId, u32>,
+    method_targets: &crate::napalm_collections::HashMap<(ReceiverClass, MethodSymbol), CallTarget>,
+) -> crate::napalm_collections::HashMap<u32, wf_ir::WfFunctionData<'static>> {
+    let mut callees = crate::napalm_collections::HashMap::default();
+    let mut frontier = vec![target];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for function_index in frontier {
+            let prepared = &vm.prepared.functions[function_index as usize];
+            let bytecode = &vm.program.functions[function_index as usize];
+            for (index, op) in prepared.ops.iter().enumerate() {
+                let candidate = match bytecode.chunk.code[prepared.raw_pcs[index] as usize].opcode() {
+                    Some(Opcode::CallDirect) => Some(op.x),
+                    Some(Opcode::InvokeMethodDirect) => match bytecode.chunk.specializations.get(op.x as usize) {
+                        Some(crate::napalm_bytecode::SpecializedDescriptor::DirectMethod { owner, symbol, .. }) =>
+                            class_slots.get(owner).and_then(|&slot| {
+                                let key = ReceiverClass(CLASS_KIND_INSTANCE | slot as u64);
+                                (method_targets.get(&(key, *symbol)) == Some(&CallTarget::Bytecode(op.y))).then_some(op.y)
+                            }),
+                        _ => None,
+                    },
+                    Some(Opcode::Invoke) => profiled_direct_invoke_site(prepared, index).map(|(_, callee)| callee),
+                    _ => None,
+                };
+                let Some(callee) = candidate else { continue; };
+                if callee == target || callees.contains_key(&callee) || callees.len() >= 24 { continue; }
+                if (callee as usize) >= vm.prepared.functions.len() { continue; }
+                callees.insert(callee, unsafe { wf_function_data(vm, callee) });
+                next.push(callee);
+            }
+        }
+        frontier = next;
+    }
+    callees
+}
+
 /// Count a call to `target`, compiling it once it becomes hot, and return its
 /// native entry if one is installed. Auto-memoized targets never compile.
 unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeFunctionEntry> {
@@ -3482,6 +3581,8 @@ unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeF
         }
         let small_map_fast_alloc = vm.heap.inline_map_fast_allocation_info();
         let identity_sites = native_identity_sites(vm, target);
+        let inline_callees = unsafe { collect_inline_callees(vm, target,
+            &native_direct_method_class_slots, &native_direct_method_targets) };
         let prepared = vm.prepared.functions.as_ptr().add(target as usize);
         let bytecode = &vm.program.functions[target as usize] as *const BytecodeFunction;
         let constants = &vm.resolved_constants[target as usize] as *const Vec<RegisterWord>;
@@ -3499,6 +3600,7 @@ unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeF
                 &native_plain_store_classes,
                 &native_shape_read_pics,
                 &native_shape_write_pics,
+                &inline_callees,
             )
         } {
             unsafe { (*jit_ptr).reject(target); }

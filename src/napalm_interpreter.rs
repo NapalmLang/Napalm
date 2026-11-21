@@ -6375,6 +6375,29 @@ impl HostContext<'_> {
         Ok(())
     }
 
+    /// Copy of a clamped element range (`range.end` is clipped to the length).
+    pub fn list_values(&self, value: Value, range: std::ops::Range<usize>) -> Option<Vec<Value>> {
+        match self.heap.get(value) {
+            Some(HeapObject::List(list)) => {
+                let end = range.end.min(list.len());
+                Some(list[range.start.min(end)..end].to_vec())
+            }
+            _ => None,
+        }
+    }
+
+    /// Permute a List's elements in place. The closure must only reorder the
+    /// existing elements: they stay owned by the same List, so neither the
+    /// element contract nor the generational write barrier is affected.
+    pub fn list_reorder(&mut self, value: Value, reorder: impl FnOnce(&mut [Value])) -> Result<(), RuntimeError> {
+        match self.heap.get_mut(value) {
+            Some(HeapObject::List(list)) => reorder(list.as_mut_slice()),
+            _ => return Err(RuntimeError::new("receiver is not a List")),
+        }
+        self.heap.refresh_jit_view(value);
+        Ok(())
+    }
+
     fn map_key(&self, value: Value) -> Result<MapKey, RuntimeError> {
         self.heap.map_key(value)
     }

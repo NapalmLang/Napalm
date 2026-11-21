@@ -343,6 +343,28 @@ each function, whether v2 compiled it or why it declined.
   specialized parameters (with guards) and canonicalizes the result.
 - **Deopt policy.** Repeated speculative failures, but not depth-limit bailouts,
   drop the function back to the non-speculative v1 tier.
+- **Inliner.** Callees are translated into the caller's IR (call-site arguments
+  become the callee's SSA registers; returns join at a block parameter). Three
+  kinds of call can be inlined:
+  - static `CallDirect`;
+  - `InvokeMethodDirect`, whose method descriptor resolves to a class slot;
+  - VM-profiled monomorphic `Invoke`, which gets a `GuardClass` on the receiver.
+
+  The callee bodies are collected up front: a breadth-first search, 3 levels
+  deep, of at most 24 callees. Limits: depth 3, 96 ops per callee and 480
+  inlined ops per root. A guard that fails inside an inlined body deoptimizes
+  to the caller's call op, so the interpreter replays the whole call. This is
+  why there is no guard after an effect: once an inlined body has stored
+  anything, a later guard would replay the store, and the inline is declined
+  instead. The rule also applies to the enclosing inline frames. Other
+  declines:
+  - stores inside inlines when the root has self-calls (nested frames replay
+    the outermost self-call);
+  - host helper calls inside an inlined body;
+  - memoized callees that make calls.
+
+  A declined site stays a `RuntimeOp`. `NAPALM_JIT_EVENTS=1` prints each
+  `v2 inlined` and `v2 inline declined` decision.
 
 ### Bounded language-call inlining
 

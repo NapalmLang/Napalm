@@ -7,7 +7,7 @@
 use crate::napalm_interpreter::{
     fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, FileNative, PathNative, UriNative, ProcessNative, InputStreamNative, OutputStreamNative, PackageNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
-use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
+use crate::napalm_ir::{BlockId, Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, ModuleId, PrimitiveId, Program, Type, ValueId};
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -261,6 +261,10 @@ enum BuiltinPrimitive {
     ListIterate,
     ListIteratorValue,
     ListToString,
+    ListSlice,
+    ListReverse,
+    ListSortNatural,
+    ListSortAfter,
     ListFilled,
     ListNew,
     ListNewNumber,
@@ -855,6 +859,12 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("iterate", MethodKind::Method, 1, BuiltinPrimitive::ListIterate),
         ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::ListIteratorValue),
         ("toString", MethodKind::Getter, 0, BuiltinPrimitive::ListToString),
+        ("concat", MethodKind::Method, 1, BuiltinPrimitive::ListConcat),
+        ("slice", MethodKind::Method, 0, BuiltinPrimitive::ListSlice),
+        ("slice", MethodKind::Method, 1, BuiltinPrimitive::ListSlice),
+        ("slice", MethodKind::Method, 2, BuiltinPrimitive::ListSlice),
+        ("reverse", MethodKind::Method, 0, BuiltinPrimitive::ListReverse),
+        ("sort", MethodKind::Method, 0, BuiltinPrimitive::ListSortNatural),
     ] {
         manifest.register(program, list, name, kind, arity, op);
     }
@@ -1069,6 +1079,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     b.position_at(done);
     b.ret(result);
     manifest.list_functions.push((reduce_method, b.finish()));
+
+    install_list_search_functions(program, &mut manifest, module, call1, equals);
+    install_list_sort_function(program, &mut manifest, module, call2);
 
     // Collections share the API and key equality; their storage is distinct.
     manifest.register(program, static_(BuiltinId::ConcurrentMap), "new", MethodKind::Method, 0, BuiltinPrimitive::ConcurrentMapNew);
@@ -1710,6 +1723,253 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register(program, static_(BuiltinId::Print), "call", MethodKind::Method, 1, BuiltinPrimitive::SystemPrint);
 
     manifest
+}
+
+/// Head of a List scan loop. The length is snapshotted (elements appended by a
+/// callback are not visited) and the live length is re-checked before every
+/// read, so a callback that shrinks the List ends the scan instead of reading
+/// out of bounds. Both exits jump to `exit` without arguments. Returns the loop
+/// header, the Int32 index and the element; the caller closes the loop with
+/// [`list_scan_advance`].
+fn list_scan_begin(
+    b: &mut Builder<'_>,
+    list: ValueId,
+    len: ValueId,
+    exit: BlockId,
+) -> (BlockId, ValueId, ValueId) {
+    let header = b.new_block(&[]);
+    let index = b.add_block_param(header, Type::Int32);
+    let live = b.new_block(&[]);
+    let body = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(header, vec![zero]);
+    b.position_at(header);
+    let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+    b.branch(more, live, vec![], exit, vec![]);
+    b.position_at(live);
+    let current = b.emit1(Inst::ListLen { list }, Type::Int32);
+    let inside = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: current }, Type::Bool);
+    b.branch(inside, body, vec![], exit, vec![]);
+    b.position_at(body);
+    let item = b.emit1(Inst::ListGet { list, index }, Type::Top);
+    (header, index, item)
+}
+
+fn list_scan_advance(b: &mut Builder<'_>, header: BlockId, index: ValueId) {
+    let one = b.const_i32(1);
+    let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+    b.jump(header, vec![next]);
+}
+
+fn int32_min(b: &mut Builder<'_>, left: ValueId, right: ValueId) -> ValueId {
+    let pick_left = b.new_block(&[]);
+    let pick_right = b.new_block(&[]);
+    let join = b.new_block(&[]);
+    let result = b.add_block_param(join, Type::Int32);
+    let less = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left, right }, Type::Bool);
+    b.branch(less, pick_left, vec![], pick_right, vec![]);
+    b.position_at(pick_left);
+    b.jump(join, vec![left]);
+    b.position_at(pick_right);
+    b.jump(join, vec![right]);
+    b.position_at(join);
+    result
+}
+
+/// indexOf/lastIndexOf/includes (`==` dispatch, like `remove`) and the
+/// callback scans forEach/find/findIndex/some/every. Like map/filter, the
+/// callbacks receive only the element.
+fn install_list_search_functions(
+    program: &mut Program,
+    manifest: &mut BuiltinManifest,
+    module: ModuleId,
+    call1: MethodSymbol,
+    equals: MethodSymbol,
+) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Scan { IndexOf, Includes, ForEach, Find, FindIndex, Some, Every }
+    for (name, scan, ret) in [
+        ("indexOf", Scan::IndexOf, Type::Num),
+        ("includes", Scan::Includes, Type::Bool),
+        ("forEach", Scan::ForEach, Type::Null),
+        ("find", Scan::Find, Type::Top),
+        ("findIndex", Scan::FindIndex, Type::Num),
+        ("some", Scan::Some, Type::Bool),
+        ("every", Scan::Every, Type::Bool),
+    ] {
+        let method = program.intern_method(name, MethodKind::Method, 1);
+        let mut b = Builder::new(program, module, &format!("List.{name}"), FunctionKind::Method,
+            vec![Type::List(None), Type::Top], ret);
+        let list = b.param(0);
+        let operand = b.param(1);
+        let len = b.emit1(Inst::ListLen { list }, Type::Int32);
+        let exhausted = b.new_block(&[]);
+        let (header, index, item) = list_scan_begin(&mut b, list, len, exhausted);
+        let test = match scan {
+            Scan::IndexOf | Scan::Includes => b.invoke(item, equals, vec![operand]),
+            _ => b.invoke(operand, call1, vec![item]),
+        };
+        if scan == Scan::ForEach {
+            list_scan_advance(&mut b, header, index);
+        } else {
+            let hit = b.new_block(&[]);
+            let miss = b.new_block(&[]);
+            if scan == Scan::Every {
+                // `every` stops on the first falsy result.
+                b.branch(test, miss, vec![], hit, vec![]);
+            } else {
+                b.branch(test, hit, vec![], miss, vec![]);
+            }
+            b.position_at(miss);
+            list_scan_advance(&mut b, header, index);
+            b.position_at(hit);
+            let found = match scan {
+                Scan::IndexOf | Scan::FindIndex => b.emit1(Inst::Int32ToNum { value: index }, Type::Num),
+                Scan::Includes | Scan::Some => b.const_bool(true),
+                Scan::Every => b.const_bool(false),
+                Scan::Find => item,
+                Scan::ForEach => unreachable!(),
+            };
+            b.ret(found);
+        }
+        b.position_at(exhausted);
+        let missing = match scan {
+            Scan::IndexOf | Scan::FindIndex => b.const_num(-1.0),
+            Scan::Includes | Scan::Some => b.const_bool(false),
+            Scan::Every => b.const_bool(true),
+            Scan::Find | Scan::ForEach => b.const_null(),
+        };
+        b.ret(missing);
+        manifest.list_functions.push((method, b.finish()));
+    }
+}
+
+/// `sort(compare)`: a stable bottom-up merge sort written in WIR, so the
+/// comparator runs with ordinary Napalm call semantics. Runs are merged into
+/// private scratch Lists; the result is written back to the receiver at the
+/// end (as far as the receiver still reaches) and the receiver is returned.
+fn install_list_sort_function(
+    program: &mut Program,
+    manifest: &mut BuiltinManifest,
+    module: ModuleId,
+    call2: MethodSymbol,
+) {
+    manifest.register(program, BuiltinTarget::Instance(BuiltinClass::List), "__sortAfter",
+        MethodKind::Method, 1, BuiltinPrimitive::ListSortAfter);
+    let sort_after = manifest.bindings.last().unwrap().primitive;
+    let method = program.intern_method("sort", MethodKind::Method, 1);
+    let mut b = Builder::new(program, module, "List.sort", FunctionKind::Method,
+        vec![Type::List(None), Type::Top], Type::List(None));
+    let source = b.param(0);
+    let compare = b.param(1);
+    let n = b.emit1(Inst::ListLen { list: source }, Type::Int32);
+    let one = b.const_i32(1);
+
+    // Private copy: the comparator cannot observe or disturb the scratch Lists.
+    let copy = b.emit1(Inst::AllocList { capacity: Some(n) }, Type::List(None));
+    let copied = b.new_block(&[]);
+    let (copy_header, copy_index, copy_item) = list_scan_begin(&mut b, source, n, copied);
+    b.emit0(Inst::ListAppend { list: copy, value: copy_item });
+    list_scan_advance(&mut b, copy_header, copy_index);
+
+    let outer = b.new_block(&[]);
+    let src = b.add_block_param(outer, Type::List(None));
+    let width = b.add_block_param(outer, Type::Int32);
+    let pass = b.new_block(&[]);
+    let write_back = b.new_block(&[]);
+    let sorted = b.add_block_param(write_back, Type::List(None));
+    b.position_at(copied);
+    b.jump(outer, vec![copy, one]);
+
+    b.position_at(outer);
+    let more_passes = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: width, right: n }, Type::Bool);
+    b.branch(more_passes, pass, vec![], write_back, vec![src]);
+
+    // One pass merges adjacent runs of `width` elements from src into tmp.
+    b.position_at(pass);
+    let tmp = b.emit1(Inst::AllocList { capacity: Some(n) }, Type::List(None));
+    let run_header = b.new_block(&[]);
+    let run = b.add_block_param(run_header, Type::Int32);
+    let run_start = b.new_block(&[]);
+    let pass_end = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(run_header, vec![zero]);
+    b.position_at(run_header);
+    let more_runs = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: run, right: n }, Type::Bool);
+    b.branch(more_runs, run_start, vec![], pass_end, vec![]);
+
+    b.position_at(run_start);
+    let mid_raw = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: run, right: width }, Type::Int32);
+    let mid = int32_min(&mut b, mid_raw, n);
+    let hi_raw = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: mid, right: width }, Type::Int32);
+    let hi = int32_min(&mut b, hi_raw, n);
+    let merge = b.new_block(&[]);
+    let left = b.add_block_param(merge, Type::Int32);
+    let right = b.add_block_param(merge, Type::Int32);
+    let check_right = b.new_block(&[]);
+    let compare_block = b.new_block(&[]);
+    let take_right = b.new_block(&[]);
+    let take_left = b.new_block(&[]);
+    let drain_left = b.new_block(&[]);
+    let drain_left_index = b.add_block_param(drain_left, Type::Int32);
+    let drain_left_body = b.new_block(&[]);
+    let drain_right = b.new_block(&[]);
+    let drain_right_index = b.add_block_param(drain_right, Type::Int32);
+    let drain_right_body = b.new_block(&[]);
+    let run_next = b.new_block(&[]);
+    b.jump(merge, vec![run, mid]);
+
+    b.position_at(merge);
+    let left_more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left, right: mid }, Type::Bool);
+    b.branch(left_more, check_right, vec![], drain_right, vec![right]);
+    b.position_at(check_right);
+    let right_more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: right, right: hi }, Type::Bool);
+    b.branch(right_more, compare_block, vec![], drain_left, vec![left]);
+    b.position_at(compare_block);
+    let a = b.emit1(Inst::ListGet { list: src, index: left }, Type::Top);
+    let c = b.emit1(Inst::ListGet { list: src, index: right }, Type::Top);
+    let order = b.invoke(compare, call2, vec![a, c]);
+    let after = b.emit1(Inst::CallPrimitive { primitive: sort_after, args: vec![src, order] }, Type::Bool);
+    b.branch(after, take_right, vec![], take_left, vec![]);
+    b.position_at(take_right);
+    b.emit0(Inst::ListAppend { list: tmp, value: c });
+    let right_next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: right, right: one }, Type::Int32);
+    b.jump(merge, vec![left, right_next]);
+    b.position_at(take_left);
+    b.emit0(Inst::ListAppend { list: tmp, value: a });
+    let left_next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left, right: one }, Type::Int32);
+    b.jump(merge, vec![left_next, right]);
+
+    for (header, index, body, bound) in [
+        (drain_left, drain_left_index, drain_left_body, mid),
+        (drain_right, drain_right_index, drain_right_body, hi),
+    ] {
+        b.position_at(header);
+        let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: bound }, Type::Bool);
+        b.branch(more, body, vec![], run_next, vec![]);
+        b.position_at(body);
+        let item = b.emit1(Inst::ListGet { list: src, index }, Type::Top);
+        b.emit0(Inst::ListAppend { list: tmp, value: item });
+        let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+        b.jump(header, vec![next]);
+    }
+    b.position_at(run_next);
+    b.jump(run_header, vec![hi]);
+
+    b.position_at(pass_end);
+    let doubled = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: width, right: width }, Type::Int32);
+    b.jump(outer, vec![tmp, doubled]);
+
+    // Write back (bounded by the receiver's live length) and return it.
+    b.position_at(write_back);
+    let done = b.new_block(&[]);
+    let (write_header, write_index, _) = list_scan_begin(&mut b, source, n, done);
+    let value = b.emit1(Inst::ListGet { list: sorted, index: write_index }, Type::Top);
+    b.emit0(Inst::ListSet { list: source, index: write_index, value });
+    list_scan_advance(&mut b, write_header, write_index);
+    b.position_at(done);
+    b.ret(source);
+    manifest.list_functions.push((method, b.finish()));
 }
 
 /// Native decorators (`@memoize`, `@debounce(100)`, ...). Applying one returns a
@@ -3274,6 +3534,56 @@ fn execute_primitive(
             context.list_remove_at(this, index)
         }
         ListClear => { context.list_clear(this)?; Ok(Value::NULL) }
+        ListSlice => {
+            let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            let start = if args.len() > 1 {
+                string_relative_index(integer(argument(args, 0)?, "slice start")?, len)
+            } else {
+                0
+            };
+            let end = if args.len() > 2 {
+                string_relative_index(integer(argument(args, 1)?, "slice end")?, len)
+            } else {
+                len
+            };
+            let values = context.list_values(this, start..end.max(start))
+                .ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            Ok(context.allocate_list(values))
+        }
+        ListReverse => {
+            context.list_reorder(this, |items| items.reverse())?;
+            Ok(this)
+        }
+        ListSortNatural => {
+            let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            let mut values = context.list_values(this, 0..len)
+                .ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            if values.iter().all(|value| value.is_num()) {
+                // total_cmp orders -0 before +0 and puts NaN last, so the
+                // result is deterministic for every Number input.
+                values.sort_by(|a, b| a.as_num().unwrap().total_cmp(&b.as_num().unwrap()));
+            } else if values.iter().all(|value| context.string_utf8(*value).is_some()) {
+                values.sort_by(|a, b| {
+                    context.string_utf8(*a).unwrap().cmp(context.string_utf8(*b).unwrap())
+                });
+            } else {
+                return Err(RuntimeError::new(
+                    "sort() without a comparator requires all Numbers or all Strings; pass sort((a, b) => ...)",
+                ));
+            }
+            context.list_reorder(this, |items| {
+                if items.len() == values.len() { items.copy_from_slice(&values); }
+            })?;
+            Ok(this)
+        }
+        ListSortAfter => {
+            // Comparator protocol of sort(compare): a positive Number places
+            // `a` after `b`; zero, negative and NaN keep the original order.
+            let order = argument(args, 0)?;
+            let order = order.as_num()
+                .ok_or_else(|| RuntimeError::new("sort comparator must return a Number"))?;
+            Ok(Value::from_bool(order > 0.0))
+        }
         ListSubscript | MapSubscript => {
             let (container, subscript) = nested_subscript_target(context, this, &args[1..])?;
             if context.map_len(container).is_some() {

@@ -315,6 +315,21 @@ impl Lowering<'_, '_> {
                     *slot as i32 * std::mem::size_of::<RegisterWord>() as i32);
                 self.b.ins().iconst(types::I8, 0)
             }
+            WfInst::GuardClass { value, class, deopt } => {
+                let value = self.value(*value);
+                let is_heap = self.is_heap(value);
+                self.guard(is_heap, *deopt);
+                let entry = self.heap_entry(value);
+                let address = self.b.ins().load(types::I64, flags, entry,
+                    offset_of!(TraceHeapEntry, address) as i32);
+                let live = self.b.ins().icmp_imm(IntCC::NotEqual, address, 0);
+                self.guard(live, *deopt);
+                let actual = self.b.ins().load(types::I64, flags, entry,
+                    offset_of!(TraceHeapEntry, receiver_class) as i32);
+                let matches = self.b.ins().icmp_imm(IntCC::Equal, actual, *class as i64);
+                self.guard(matches, *deopt);
+                self.b.ins().iconst(types::I8, 0)
+            }
             WfInst::GuardEpoch { expected, deopt } => {
                 let epoch = self.b.ins().load(types::I64, flags, self.vm,
                     offset_of!(Interpreter<'static>, method_epoch) as i32);

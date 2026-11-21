@@ -19,7 +19,7 @@ const GLOBAL_VALUES = stringSet(
     "System Date Random Promise Timer FFI fetch Set Proxy memoize once memoizeExpiring " +
     "delay debounce throttle http get getJSON postJSON setTimeout print Event Emitter " +
     "Channel Receiver ConcurrentMap ConcurrentSet Generator Bytes ByteBuffer JSON Fs Path " +
-    "Uri FileInfo File Process InputStream OutputStream FileWatcher"
+    "Uri FileInfo File Process InputStream OutputStream FileWatcher NaN Infinity"
 );
 const GLOBAL_TYPES = stringSet(
     "any unknown never null boolean bool number num string object void true false " +

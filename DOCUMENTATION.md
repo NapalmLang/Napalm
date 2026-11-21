@@ -1382,9 +1382,20 @@ that operation introduces null; `length` is read-only. Use
 | `clear()` | Empties the list and returns null. |
 | `setLength(n)` | Truncates or grows with null; returns n. |
 | `fill(value)` | Replaces all elements and returns the list. |
+| `slice(start = 0, end = length)` | New shallow list with `[start, end)`; negative indices count from the end, bounds are clamped, `end <= start` gives `[]`. |
+| `concat(otherList)` | New shallow concatenation, same as `+`. |
+| `reverse()` | Reverses in place and returns the list. |
+| `sort()` | Sorts in place and returns the list: all Numbers ascending (NaN last) or all Strings by code point; anything else is an error. |
+| `sort(compare)` | Stable in-place sort; `compare(a, b)` must return a Number, and a positive result places `a` after `b`. |
+| `indexOf(value)` | First index whose element is `==` to value, or -1. |
+| `includes(value)` | Bool; whether some element is `==` to value. |
 | `map(callback)` | New list; calls `callback(element)` once per element. |
 | `filter(callback)` | New list with elements whose condition is truthy. |
 | `reduce(callback, initial)` | Accumulates through `callback(accumulator, element)`. |
+| `forEach(callback)` | Calls `callback(element)` for each element; returns null. |
+| `find(callback)` | First element whose condition is truthy, or null. |
+| `findIndex(callback)` | Index of that element, or -1. |
+| `some(callback)`, `every(callback)` | Bool; stop at the first truthy (`some`) or falsy (`every`) result. `[].every(f)` is true. |
 | `join(separator = ",")` | String containing each element's text separated by `separator`; does not modify the list. |
 | `+ otherList` | New shallow concatenation. |
 | `[range]` | New list with the selected segment. |
@@ -1392,8 +1403,10 @@ that operation introduces null; `length` is read-only. Use
 | `toString`, `toString()` | Text representation. |
 
 `push`, `add`, and `unshift` accept **a single element**, not a variable
-number of elements. map/filter callbacks do not automatically receive an
-index or collection. `reduce` requires an initial value.
+number of elements. Callbacks (map, filter, forEach, find, findIndex, some,
+every) do not automatically receive an index or collection. `reduce` requires
+an initial value. Unlike JavaScript, `sort()` without a comparator does not
+convert Numbers to text: `[10, 9, 1].sort()` is `[1, 9, 10]`.
 
 ```napalm
 const source = [1, 2, 3, 4];
@@ -1415,10 +1428,22 @@ The initial length is captured before conversion; elements are then read in
 order, so changes made by a `toString()` method to later elements are visible,
 and newly appended elements are ignored.
 
-`forEach`, `find`, `findIndex`, `sort`, `splice`, and the complete JS Array
-catalog are not installed. Use a loop or compose the available operations.
-Do not modify the source list inside callbacks while assuming ECMAScript's
-exact rules.
+```napalm
+const xs = [5, 3, 8, 1];
+System.print(xs.slice(1, -1));                 // [3, 8]
+System.print(xs.slice().sort());               // [1, 3, 5, 8]; xs is unchanged
+System.print(xs.find(x => x > 4));             // 5
+System.print([xs.indexOf(8), xs.includes(2)]); // [2, false]
+System.print(["b", "a"].sort().reverse());     // [b, a]
+System.print([[2, "x"], [1, "y"]].sort((a, b) => a[0] - b[0])); // [[1, y], [2, x]]
+```
+
+The scanning methods (forEach, find, findIndex, some, every, indexOf,
+includes) capture the length when they start: elements appended by a callback
+are not visited, and the scan stops early if a callback shortens the list.
+`sort(compare)` sorts a private copy and writes the result back at the end.
+`splice`, `lastIndexOf`, `flat`, and the rest of the JS Array catalog are not
+installed; use a loop or compose the available operations.
 
 ### 9.4 Shallow Copies and Limits
 
@@ -3228,6 +3253,8 @@ System.print((1 / 0).isInfinity);     // true
 ```
 
 Num static API: `fromString(text)`, `pi`, `tau`, `infinity`, `nan`.
+The globals `NaN` and `Infinity` are the same values as `Num.nan` and
+`Num.infinity`; a local or module binding with either name shadows them.
 `fromString` uses textual numeric conversion; it is not a radix-based
 `parseInt`.
 There is no standard `Math` namespace, `parseInt`, `parseFloat`, `BigInt`, or

@@ -20,6 +20,55 @@ fn napalm_collections_join_separators_values_and_empty_slots() {
 }
 
 #[test]
+fn napalm_collections_list_slice_search_and_reorder() {
+    run_napalm(r#"
+        const xs = [5, 3, 8, 1, 9, 2];
+        const result = [xs.slice(), xs.slice(2), xs.slice(-2), xs.slice(1, -1),
+            xs.slice(4, 1), xs.slice(-100, 100), xs.concat([7]),
+            [1, 2, 3].reverse(), xs.indexOf(8), xs.indexOf(42), xs.includes(9),
+            xs.includes(0), xs.find(x => x > 5), xs.find(x => x > 50),
+            xs.findIndex(x => x > 5), xs.findIndex(x => x > 50),
+            xs.some(x => x > 8), xs.every(x => x > 0), xs.every(x => x > 1),
+            [].every(x => false), [].some(x => true), xs];
+    "#, "[[5, 3, 8, 1, 9, 2], [8, 1, 9, 2], [9, 2], [3, 8, 1, 9], [], [5, 3, 8, 1, 9, 2], \
+         [5, 3, 8, 1, 9, 2, 7], [3, 2, 1], 2, -1, true, false, 8, null, 2, -1, true, true, false, \
+         true, false, [5, 3, 8, 1, 9, 2]]");
+}
+
+#[test]
+fn napalm_collections_list_sort_and_callback_scans() {
+    run_napalm(r#"
+        let total = 0;
+        [1, 2, 3].forEach(x => { total += x; });
+        const shrink = [1, 2, 3, 4, 5];
+        shrink.forEach(x => { shrink.pop(); });
+        const grow = [1, 2];
+        grow.forEach(x => { grow.push(x); });
+        const people = [['ana', 30], ['bo', 25], ['cy', 30], ['di', 25], ['ed', 40]];
+        const stable = people.sort((a, b) => a[1] - b[1]).map(p => p[0]).join(',');
+        const big = [];
+        for (let i = 0; i < 1000; i++) big.push((i * 7919) % 1000);
+        const byCompare = big.slice().sort((a, b) => a - b);
+        const natural = big.slice().sort();
+        let ordered = true;
+        for (let i = 0; i < 1000; i++) {
+            if (byCompare[i] !== i || natural[i] !== i) ordered = false;
+        }
+        let badMixed = false;
+        try { [1, 'a'].sort(); } catch (e) { badMixed = true; }
+        let badCompare = false;
+        try { [2, 1].sort((a, b) => 'x'); } catch (e) { badCompare = true; }
+        const typed = new Array<Number>(3);
+        typed[0] = 3; typed[1] = 1; typed[2] = 2;
+        const result = [total, shrink, grow, stable, ordered, badMixed, badCompare,
+            [10, 9, 1].sort(), ['pear', 'apple', 'Banana'].sort(),
+            [NaN, 3, -Infinity, 0].sort().map(x => x.isNan ? 'nan' : x),
+            [3, 1, 2].sort((a, b) => b - a), typed.sort(), big.length];
+    "#, "[6, [1, 2], [1, 2, 1, 2], bo,di,ana,cy,ed, true, true, true, [1, 9, 10], \
+         [Banana, apple, pear], [-inf, 0, 3, nan], [3, 2, 1], [1, 2, 3], 1000]");
+}
+
+#[test]
 fn napalm_collections_join_virtual_conversion_mutation_and_gc() {
     run_napalm(r#"
         let log = '';

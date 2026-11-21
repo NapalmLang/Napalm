@@ -4925,6 +4925,13 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 );
             }
         }
+        // JS-style global numeric constants (aliases of Num.nan/Num.infinity);
+        // any user binding with the same name shadows them above.
+        match name.value.as_str() {
+            "NaN" => return self.builder.const_num(f64::NAN),
+            "Infinity" => return self.builder.const_num(f64::INFINITY),
+            _ => {}
+        }
         self.error(
             "NAPALM-L018",
             format!("undefined variable '{}'", name.value),

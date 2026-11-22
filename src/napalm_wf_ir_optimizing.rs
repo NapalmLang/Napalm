@@ -1531,6 +1531,8 @@ mod wf_opt_tests {
             nested_banks: false,
             param_types: params.to_vec(),
             inlined_calls: 0,
+            frame: WfFrameInfo::default(),
+            alloc_sites: Vec::new(),
         }
     }
     fn state(pc: u32, regs: &[(u8, WfValue)]) -> WfDeoptState {

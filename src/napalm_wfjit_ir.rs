@@ -303,6 +303,41 @@ pub(super) struct WfFunction {
     pub(super) param_types: Vec<WfTy>,
     /// Calls inlined into this body (statistics).
     pub(super) inlined_calls: u32,
+    /// Frame layout of the function, so code generation (possibly on a
+    /// background thread) never reads live VM metadata.
+    pub(super) frame: WfFrameInfo,
+    /// Allocation sites of the `AllocObject` ops, captured with the IR.
+    pub(super) alloc_sites: Vec<(u32, WfAllocSite)>,
+}
+
+/// The parts of a prepared function's frame layout the lowering needs.
+#[derive(Clone, Debug, Default)]
+pub(super) struct WfFrameInfo {
+    pub(super) reg_count: u16,
+    pub(super) entry_arg_dsts: Vec<u16>,
+    pub(super) entry_this_dst: u16,
+    pub(super) entry_gc_map: u32,
+    pub(super) gc_map_by_op: Vec<u32>,
+}
+
+impl WfFrameInfo {
+    fn of(function: &PreparedFunction) -> Self {
+        Self {
+            reg_count: function.frame.general_register_count,
+            entry_arg_dsts: function.entry_arg_dsts.to_vec(),
+            entry_this_dst: function.entry_this_dst,
+            entry_gc_map: function.entry_gc_map,
+            gc_map_by_op: function.gc_map_by_op.clone(),
+        }
+    }
+}
+
+/// Profiled shape of an allocation op, taken when the IR was built.
+#[derive(Clone, Debug)]
+pub(super) enum WfAllocSite {
+    /// Small literal or specialized object: the profiled inline path, if any.
+    Object(Option<NativeProfiledSmallMapSite>),
+    TypedArray(TypedArraySite),
 }
 
 impl WfFunction {
@@ -1193,6 +1228,22 @@ pub(super) fn build(source: &WfSource<'_>) -> Result<WfFunction, String> {
     if *OPTIMIZE.get_or_init(|| std::env::var("NAPALM_WFJIT_OPT").ok().as_deref() != Some("0")) {
         wf_optimizing::optimize(&mut ir).map_err(|error| format!("WF IR optimization: {error}"))?;
     }
+    // Everything code generation reads from the VM is captured now, on the
+    // VM thread: the lowering itself may run on the background compiler.
+    let root = source.root;
+    ir.frame = WfFrameInfo::of(root.function);
+    for block in &ir.blocks {
+        for (_, inst) in &block.insts {
+            if let WfInst::AllocObject { op_index, kind, .. } = inst {
+                let index = *op_index as usize;
+                let site = match kind {
+                    WfAllocKind::TypedArray => WfAllocSite::TypedArray(typed_array_site(root.function, root.bytecode, index)),
+                    _ => WfAllocSite::Object(native_profiled_small_map_site(root.function, root.bytecode, index)),
+                };
+                ir.alloc_sites.push((*op_index, site));
+            }
+        }
+    }
     Ok(ir)
 }
 
@@ -1324,6 +1375,8 @@ fn build_with(
                 && kinds.iter().flatten().any(|(kind, _)| matches!(kind, OpKind::Alloc { .. })),
             param_types: param_types.to_vec(),
             inlined_calls: 0,
+            frame: WfFrameInfo::default(),
+            alloc_sites: Vec::new(),
         },
         state: vec![None; 256],
         current: None,

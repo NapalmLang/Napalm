@@ -173,8 +173,6 @@ fn wf_edges(terminator: &WfTerminator) -> impl Iterator<Item = &WfEdge> {
 struct Lowering<'a, 'b> {
     b: &'a mut FunctionBuilder<'b>,
     ir: &'a WfFunction,
-    function: &'a PreparedFunction,
-    bytecode: &'a BytecodeFunction,
     fast_alloc: Option<GcFastAllocationInfo>,
     values: Vec<Option<ClValue>>,
     /// Mutable Cranelift SSA variables for Tagged words that can carry heap
@@ -499,22 +497,22 @@ impl Lowering<'_, '_> {
                     let registers = self.ir.deopts[deopt.0 as usize].registers.clone();
                     self.materialize(frame, &registers);
                     emit_native_root_map_update(self.b, self.vm, frame,
-                        self.function.gc_map_by_op[*op_index as usize], *op_index);
-                    let count = self.function.frame.general_register_count;
+                        self.ir.frame.gc_map_by_op[*op_index as usize], *op_index);
+                    let count = self.ir.frame.reg_count;
                     let storage = self.b.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot, u32::from(count.max(1)) * 8, 3));
                     let child = self.b.ins().stack_addr(types::I64, storage, 0);
                     // Arguments sit in their entry registers too, so the entry
                     // root map describes the bank until the child publishes.
                     for (argument, arg) in args.iter().enumerate().take(self.ir.arity) {
-                        let destination = self.function.entry_arg_dsts[argument];
+                        let destination = self.ir.frame.entry_arg_dsts[argument];
                         if destination == u16::MAX { continue; }
                         let word = self.tagged(*arg);
                         self.b.ins().store(flags, word, child, destination as i32 * 8);
                     }
-                    if self.ir.has_this && self.function.entry_this_dst != u16::MAX {
+                    if self.ir.has_this && self.ir.frame.entry_this_dst != u16::MAX {
                         let this = self.tagged(*args.last().expect("method self-call receiver"));
-                        self.b.ins().store(flags, this, child, self.function.entry_this_dst as i32 * 8);
+                        self.b.ins().store(flags, this, child, self.ir.frame.entry_this_dst as i32 * 8);
                     }
                     let shadow_slot = self.b.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot, std::mem::size_of::<NativeShadowFrame>() as u32, 3));
@@ -525,7 +523,7 @@ impl Lowering<'_, '_> {
                     self.b.ins().store(flags, child, shadow, offset_of!(NativeShadowFrame, registers) as i32);
                     let function_id = self.b.ins().iconst(types::I32, self.ir.function_index as i64);
                     self.b.ins().store(flags, function_id, shadow, offset_of!(NativeShadowFrame, function) as i32);
-                    let entry_map = self.b.ins().iconst(types::I32, self.function.entry_gc_map as i64);
+                    let entry_map = self.b.ins().iconst(types::I32, self.ir.frame.entry_gc_map as i64);
                     self.b.ins().store(flags, entry_map, shadow, offset_of!(NativeShadowFrame, root_map) as i32);
                     let register_count = self.b.ins().iconst(types::I16, count as i64);
                     self.b.ins().store(flags, register_count, shadow, offset_of!(NativeShadowFrame, reg_count) as i32);
@@ -739,19 +737,18 @@ impl Lowering<'_, '_> {
                 let (profiled_small_map, commit, bind, small_map_regs, factory, reserved) = (
                     h.profiled_small_map, h.profiled_small_map_commit, h.bind_factory_contract,
                     h.small_map_literal_regs, h.specialized_factory, h.reserved_typed_array);
-                let value = match kind {
-                    WfAllocKind::SmallMapLiteral | WfAllocKind::SpecializedObject => {
-                        match native_profiled_small_map_site(self.function, self.bytecode, index) {
-                            Some(site) => emit_profiled_small_map_alloc(self.b, profiled_small_map, commit, bind,
-                                self.vm, frame, self.function, function_index, index, &site, self.fast_alloc, abort),
-                            None => {
-                                let helper = if *kind == WfAllocKind::SmallMapLiteral { small_map_regs } else { factory };
-                                call_native_value_helper(self.b, helper, self.vm, function_index, *op_index, frame, abort)
-                            }
-                        }
+                let site = self.ir.alloc_sites.iter().find(|(op, _)| op == op_index).map(|(_, site)| site.clone());
+                let root_map = self.ir.frame.gc_map_by_op[index];
+                let value = match (kind, site) {
+                    (WfAllocKind::TypedArray, Some(WfAllocSite::TypedArray(site))) => emit_native_typed_array_alloc(
+                        self.b, factory, reserved, self.vm, frame, site, function_index, index, self.fast_alloc, abort),
+                    (_, Some(WfAllocSite::Object(Some(site)))) => emit_profiled_small_map_alloc(self.b,
+                        profiled_small_map, commit, bind, self.vm, frame, root_map, function_index, index, &site,
+                        self.fast_alloc, abort),
+                    _ => {
+                        let helper = if *kind == WfAllocKind::SmallMapLiteral { small_map_regs } else { factory };
+                        call_native_value_helper(self.b, helper, self.vm, function_index, *op_index, frame, abort)
                     }
-                    WfAllocKind::TypedArray => emit_native_typed_array_alloc(self.b, factory, reserved,
-                        self.vm, frame, self.function, self.bytecode, function_index, index, self.fast_alloc, abort),
                 };
                 let resume = self.b.current_block().expect("allocation continues in a block");
                 self.b.switch_to_block(abort);
@@ -1109,7 +1106,7 @@ impl Lowering<'_, '_> {
         self.bank_known = self.deopt_known[deopt.0 as usize].clone().unwrap_or_else(|| vec![None; 256]);
         self.materialize(frame, &registers);
         let root_map = self.b.ins().iconst(types::I32,
-            self.function.gc_map_by_op[state.op_index as usize] as i64);
+            self.ir.frame.gc_map_by_op[state.op_index as usize] as i64);
         let pc = self.b.ins().iconst(types::I32, state.op_index as i64);
         if state.frames.is_empty() {
             let tail = self.deopt_tail(speculative);
@@ -1162,8 +1159,6 @@ impl Lowering<'_, '_> {
 pub(super) fn lower_body(
     b: &mut FunctionBuilder<'_>,
     ir: &WfFunction,
-    function: &PreparedFunction,
-    bytecode: &BytecodeFunction,
     fast_alloc: Option<GcFastAllocationInfo>,
     helpers: WfHelperRefs,
 ) {
@@ -1190,8 +1185,6 @@ pub(super) fn lower_body(
     let mut lowering = Lowering {
         b,
         ir,
-        function,
-        bytecode,
         fast_alloc,
         values: vec![None; ir.value_types.len()],
         relocated,
@@ -1291,6 +1284,8 @@ mod bank_dataflow_tests {
             nested_banks: false,
             param_types: vec![],
             inlined_calls: 0,
+            frame: WfFrameInfo::default(),
+            alloc_sites: Vec::new(),
         };
         let states = bank_entry_facts(&ir);
         assert_eq!(states[1][2], None);
@@ -1349,6 +1344,8 @@ mod bank_dataflow_tests {
             nested_banks: false,
             param_types: vec![],
             inlined_calls: 0,
+            frame: WfFrameInfo::default(),
+            alloc_sites: Vec::new(),
         };
         let states = bank_entry_facts(&ir);
         assert_eq!(states[3][2], Some(WfValue(3)));

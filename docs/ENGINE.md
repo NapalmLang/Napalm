@@ -323,6 +323,16 @@ function, whether v2 compiled it (with a summary: return type, parameter types,
 native self-calls, helpers, allocations, back edges, inlined calls) or why it
 declined.
 
+- **Background compilation.** When a function becomes hot, its IR is built
+  on the VM thread, the only phase that reads live profiles and quickening
+  state. Everything code generation needs is captured with it: frame layout,
+  GC maps and allocation sites. Lowering and Cranelift then run on a worker
+  thread (`napalm-wfjit`) with a `JITModule` of its own. Meanwhile the
+  function keeps running in the interpreter or the tracer, and the entry is
+  installed at the next call that finds the result ready. A code generation
+  failure falls back to v1 on the next tier-up. `NAPALM_WFJIT_SYNC=1` (and
+  unit tests) wait for each compilation, for deterministic tiering. The
+  synchronous v1 generator is unchanged.
 - **IR** (`src/napalm_wfjit_ir.rs`). A backend-neutral IR with blocks, typed block
   parameters (`Tagged`, `F64`, `Bool`), one value per instruction and explicit
   deoptimization states. Basic blocks are translated in reverse postorder, with

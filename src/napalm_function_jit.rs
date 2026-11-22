@@ -61,6 +61,8 @@ pub(crate) struct WholeFunctionJitStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FunctionState {
     Cold,
+    /// v2 code generation is in flight on the background compiler.
+    Compiling,
     Compiled,
     Rejected,
 }
@@ -84,6 +86,8 @@ struct FunctionSlot {
     speculation_failures: u32,
     /// Speculative recompilations so far (each re-reads the profiles).
     recompiles: u8,
+    /// v2 code generation failed: later compilations use v1.
+    v2_failed: bool,
 }
 
 /// Speculative recompilations before falling back to non-speculative code.
@@ -94,7 +98,7 @@ impl Default for FunctionSlot {
         Self {
             hotness: 0, profile_retries: 0, state: FunctionState::Cold, entry: None,
             native_entries: 0, bailouts: 0, speculative: false, speculation_disabled: false,
-            speculation_failures: 0, recompiles: 0,
+            speculation_failures: 0, recompiles: 0, v2_failed: false,
         }
     }
 }
@@ -132,12 +136,40 @@ pub(super) struct WholeFunctionJit {
     /// recompilations, so the tracer handoff happens once per loop).
     wf_loop_counters: crate::napalm_collections::HashMap<u32,
         std::rc::Rc<std::cell::RefCell<crate::napalm_collections::HashMap<usize, usize>>>>,
-    /// Cranelift instructions of the last v2 body (diagnostics).
-    last_clif_insts: usize,
+    /// v2 background compiler (started on the first v2 compilation).
+    background: Option<WfBackground>,
 }
 
-impl WholeFunctionJit {
-    pub(super) fn new(function_count: usize, entry_threshold: u32) -> Result<Self, String> {
+/// Every runtime helper declared in a whole-function `JITModule`.
+#[derive(Clone, Copy)]
+struct JitHelpers {
+    runtime_op: cranelift::module::FuncId,
+    direct_call: cranelift::module::FuncId,
+    direct_method: cranelift::module::FuncId,
+    profiled_method: cranelift::module::FuncId,
+    call_to_return: cranelift::module::FuncId,
+    reconstruct_frames: cranelift::module::FuncId,
+    string_eq: cranelift::module::FuncId,
+    string_code_point_at: cranelift::module::FuncId,
+    bytes_index: cranelift::module::FuncId,
+    call_explicit: cranelift::module::FuncId,
+    small_map_literal: cranelift::module::FuncId,
+    native_self_call: cranelift::module::FuncId,
+    small_map_literal_regs: cranelift::module::FuncId,
+    profiled_small_map: cranelift::module::FuncId,
+    profiled_small_map_commit: cranelift::module::FuncId,
+    specialized_factory: cranelift::module::FuncId,
+    bind_factory_contract: cranelift::module::FuncId,
+    reserved_typed_array: cranelift::module::FuncId,
+    class_factory_probe: cranelift::module::FuncId,
+    class_factory_commit: cranelift::module::FuncId,
+    speculation_failed: cranelift::module::FuncId,
+}
+
+/// A Cranelift module for whole-function code with every runtime helper
+/// registered and declared. The synchronous v1 generator owns one; the v2
+/// background compiler owns another on its worker thread.
+fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").map_err(|e| e.to_string())?;
         flags.set("enable_alias_analysis", "true").map_err(|e| e.to_string())?;
@@ -362,12 +394,7 @@ impl WholeFunctionJit {
             .declare_function("napalm_wfjit_speculation_failed", Linkage::Import, &speculation_sig)
             .map_err(|e| format!("cannot declare speculation feedback helper: {e}"))?;
 
-        let context = module.make_context();
-        let function_context = FunctionBuilderContext::new();
-        let result = Self {
-            module,
-            context,
-            function_context,
+        Ok((module, JitHelpers {
             runtime_op: runtime_id,
             direct_call: direct_id,
             direct_method: direct_method_id,
@@ -389,6 +416,40 @@ impl WholeFunctionJit {
             class_factory_probe: class_factory_probe_id,
             class_factory_commit: class_factory_commit_id,
             speculation_failed: speculation_failed_id,
+        }))
+}
+
+impl WholeFunctionJit {
+    pub(super) fn new(function_count: usize, entry_threshold: u32) -> Result<Self, String> {
+        let (module, h) = new_jit_module()?;
+        let context = module.make_context();
+        let function_context = FunctionBuilderContext::new();
+        let result = Self {
+            module,
+            context,
+            function_context,
+            runtime_op: h.runtime_op,
+            direct_call: h.direct_call,
+            direct_method: h.direct_method,
+            profiled_method: h.profiled_method,
+            call_to_return: h.call_to_return,
+            reconstruct_frames: h.reconstruct_frames,
+            string_eq: h.string_eq,
+            string_code_point_at: h.string_code_point_at,
+            bytes_index: h.bytes_index,
+            call_explicit: h.call_explicit,
+            small_map_literal: h.small_map_literal,
+            native_self_call: h.native_self_call,
+            small_map_literal_regs: h.small_map_literal_regs,
+            profiled_small_map: h.profiled_small_map,
+            profiled_small_map_commit: h.profiled_small_map_commit,
+            specialized_factory: h.specialized_factory,
+            bind_factory_contract: h.bind_factory_contract,
+            reserved_typed_array: h.reserved_typed_array,
+            class_factory_probe: h.class_factory_probe,
+            class_factory_commit: h.class_factory_commit,
+            speculation_failed: h.speculation_failed,
+            background: None,
             slots: (0..function_count).map(|_| FunctionSlot::default()).collect(),
             // Direct-call tiering runs before the callee's entry hook. Matching
             // its threshold avoids compiling an entry trace just before a whole
@@ -397,7 +458,6 @@ impl WholeFunctionJit {
             active_depth: 0,
             stats: WholeFunctionJitStats::default(),
             wf_loop_counters: Default::default(),
-            last_clif_insts: 0,
         };
         Ok(result)
     }
@@ -579,29 +639,26 @@ impl WholeFunctionJit {
             };
             let events = std::env::var_os("NAPALM_JIT_EVENTS").is_some();
             let started = std::time::Instant::now();
-            match wf_ir::build(&source).and_then(|ir| {
-                let built = started.elapsed();
-                self.compile_v2(&ir, function, bytecode, small_map_fast_alloc)
-                    .map(|entry| (entry, ir.inlined_calls, format!("{} ops={} insts={} build={:?} time={:?} clif={}",
-                        ir.summary(), function.ops.len(), ir.blocks.iter().map(|block| block.insts.len()).sum::<usize>(),
-                        built, started.elapsed(), self.last_clif_insts)))
-            }) {
-                Ok((entry, inlined_calls, summary)) => {
-                    self.stats.v2_inlined_calls = self.stats.v2_inlined_calls.saturating_add(u64::from(inlined_calls));
-                    let slot = &mut self.slots[function_index as usize];
-                    slot.state = FunctionState::Compiled;
-                    slot.entry = Some(entry);
-                    slot.speculative = true;
-                    slot.native_entries = 0;
-                    slot.bailouts = 0;
-                    slot.speculation_failures = 0;
-                    self.stats.compiled_functions = self.stats.compiled_functions.saturating_add(1);
-                    self.stats.v2_compiled_functions = self.stats.v2_compiled_functions.saturating_add(1);
-                    if events { eprintln!("[napalm-wfjit] v2 compiled {:?}: {summary}", function.id); }
-                    return Ok(());
-                }
-                Err(reason) => {
-                    if events { eprintln!("[napalm-wfjit] v2 declined {:?}: {reason}", function.id); }
+            if self.slots[function_index as usize].v2_failed {
+                // Code generation failed before: v1 below.
+            } else {
+                match wf_ir::build(&source) {
+                    Ok(ir) => {
+                        // IR built on the VM thread; Cranelift runs on the
+                        // background compiler and the entry is installed later.
+                        let summary = format!("{:?}: {} ops={} insts={} build={:?}", function.id, ir.summary(),
+                            function.ops.len(), ir.blocks.iter().map(|block| block.insts.len()).sum::<usize>(),
+                            started.elapsed());
+                        match self.submit_v2(function_index, ir, small_map_fast_alloc, summary) {
+                            Ok(()) => return Ok(()),
+                            Err(reason) => {
+                                if events { eprintln!("[napalm-wfjit] v2 background compiler unavailable: {reason}"); }
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        if events { eprintln!("[napalm-wfjit] v2 declined {:?}: {reason}", function.id); }
+                    }
                 }
             }
         }
@@ -1016,7 +1073,7 @@ impl WholeFunctionJit {
                             if let Some(site) = native_profiled_small_map_site(function, bytecode, index) {
                                 emit_profiled_small_map_alloc(
                                     &mut b, profiled_small_map_ref, profiled_small_map_commit_ref,
-                                    bind_factory_contract_ref, vm, regs, function,
+                                    bind_factory_contract_ref, vm, regs, function.gc_map_by_op[index],
                                     function_index, index, &site, small_map_fast_alloc, abort,
                                 )
                             } else {
@@ -1040,7 +1097,7 @@ impl WholeFunctionJit {
                             if let Some(site) = native_profiled_small_map_site(function, bytecode, index) {
                                 emit_profiled_small_map_alloc(
                                     &mut b, profiled_small_map_ref, profiled_small_map_commit_ref,
-                                    bind_factory_contract_ref, vm, regs, function,
+                                    bind_factory_contract_ref, vm, regs, function.gc_map_by_op[index],
                                     function_index, index, &site, small_map_fast_alloc, abort,
                                 )
                             } else {
@@ -1071,7 +1128,7 @@ impl WholeFunctionJit {
                     Opcode::DefineArrayWithGenerics => {
                         let value = emit_native_typed_array_alloc(
                             &mut b, specialized_factory_ref, reserved_typed_array_ref,
-                            vm, regs, function, bytecode, function_index, index,
+                            vm, regs, typed_array_site(function, bytecode, index), function_index, index,
                             small_map_fast_alloc, abort,
                         );
                         store_reg(&mut b, regs, op.a, value);
@@ -1305,16 +1362,30 @@ impl WholeFunctionJit {
         self.stats.compiled_functions = self.stats.compiled_functions.saturating_add(1);
         Ok(())
     }
+}
 
-    /// Compile a v2 IR function: the typed-SSA body (tail convention, see
-    /// `napalm_wfjit_lower.rs`) plus the host-ABI entry trampoline.
-    fn compile_v2(
-        &mut self,
-        ir: &wf_ir::WfFunction,
-        function: &PreparedFunction,
-        bytecode: &BytecodeFunction,
-        fast_alloc: Option<GcFastAllocationInfo>,
-    ) -> Result<WholeFunctionEntry, String> {
+
+
+/// v2 code generation: a `JITModule` of its own with every helper declared.
+/// It lives on the background compiler thread and reads nothing but its job
+/// (the IR carries the frame layout and allocation sites it needs).
+struct WfCodegen {
+    module: JITModule,
+    context: cranelift::codegen::Context,
+    function_context: FunctionBuilderContext,
+    helpers: JitHelpers,
+    /// Cranelift instructions of the last body (diagnostics).
+    last_clif_insts: usize,
+}
+
+impl WfCodegen {
+    fn new() -> Result<Self, String> {
+        let (module, helpers) = new_jit_module()?;
+        let context = module.make_context();
+        Ok(Self { module, context, function_context: FunctionBuilderContext::new(), helpers, last_clif_insts: 0 })
+    }
+
+    fn compile(&mut self, ir: &wf_ir::WfFunction, fast_alloc: Option<GcFastAllocationInfo>) -> Result<WholeFunctionEntry, String> {
         let pointer = self.module.target_config().pointer_type();
         let mut entry_signature = self.module.make_signature();
         entry_signature.params.push(AbiParam::new(pointer));
@@ -1339,36 +1410,36 @@ impl WholeFunctionJit {
             let func = &mut self.context.func;
             let helpers = wf_lower::WfHelperRefs {
                 self_ref: self.module.declare_func_in_func(body_id, func),
-                speculation_failed: self.module.declare_func_in_func(self.speculation_failed, func),
-                runtime_op: self.module.declare_func_in_func(self.runtime_op, func),
-                direct_call: self.module.declare_func_in_func(self.direct_call, func),
-                direct_method: self.module.declare_func_in_func(self.direct_method, func),
-                profiled_method: self.module.declare_func_in_func(self.profiled_method, func),
-                call_to_return: self.module.declare_func_in_func(self.call_to_return, func),
-                profiled_small_map: self.module.declare_func_in_func(self.profiled_small_map, func),
-                profiled_small_map_commit: self.module.declare_func_in_func(self.profiled_small_map_commit, func),
-                bind_factory_contract: self.module.declare_func_in_func(self.bind_factory_contract, func),
-                small_map_literal_regs: self.module.declare_func_in_func(self.small_map_literal_regs, func),
-                specialized_factory: self.module.declare_func_in_func(self.specialized_factory, func),
-                reserved_typed_array: self.module.declare_func_in_func(self.reserved_typed_array, func),
-                reconstruct: self.module.declare_func_in_func(self.reconstruct_frames, func),
-                string_eq: self.module.declare_func_in_func(self.string_eq, func),
-                string_code_point_at: self.module.declare_func_in_func(self.string_code_point_at, func),
-                bytes_index: self.module.declare_func_in_func(self.bytes_index, func),
-                call_explicit: self.module.declare_func_in_func(self.call_explicit, func),
+                speculation_failed: self.module.declare_func_in_func(self.helpers.speculation_failed, func),
+                runtime_op: self.module.declare_func_in_func(self.helpers.runtime_op, func),
+                direct_call: self.module.declare_func_in_func(self.helpers.direct_call, func),
+                direct_method: self.module.declare_func_in_func(self.helpers.direct_method, func),
+                profiled_method: self.module.declare_func_in_func(self.helpers.profiled_method, func),
+                call_to_return: self.module.declare_func_in_func(self.helpers.call_to_return, func),
+                profiled_small_map: self.module.declare_func_in_func(self.helpers.profiled_small_map, func),
+                profiled_small_map_commit: self.module.declare_func_in_func(self.helpers.profiled_small_map_commit, func),
+                bind_factory_contract: self.module.declare_func_in_func(self.helpers.bind_factory_contract, func),
+                small_map_literal_regs: self.module.declare_func_in_func(self.helpers.small_map_literal_regs, func),
+                specialized_factory: self.module.declare_func_in_func(self.helpers.specialized_factory, func),
+                reserved_typed_array: self.module.declare_func_in_func(self.helpers.reserved_typed_array, func),
+                reconstruct: self.module.declare_func_in_func(self.helpers.reconstruct_frames, func),
+                string_eq: self.module.declare_func_in_func(self.helpers.string_eq, func),
+                string_code_point_at: self.module.declare_func_in_func(self.helpers.string_code_point_at, func),
+                bytes_index: self.module.declare_func_in_func(self.helpers.bytes_index, func),
+                call_explicit: self.module.declare_func_in_func(self.helpers.call_explicit, func),
             };
             let mut b = FunctionBuilder::new(&mut self.context.func, &mut self.function_context);
-            wf_lower::lower_body(&mut b, ir, function, bytecode, fast_alloc, helpers);
+            wf_lower::lower_body(&mut b, ir, fast_alloc, helpers);
             b.finalize(target_config);
         }
         self.last_clif_insts = self.context.func.dfg.num_insts();
         let disasm = std::env::var_os("NAPALM_CRANELIFT_DISASM").is_some();
         self.context.set_disasm(disasm);
         self.module.define_function(body_id, &mut self.context)
-            .map_err(|e| format!("cannot define v2 body {:?}: {e:?}", function.id))?;
+            .map_err(|e| format!("cannot define v2 body {:?}: {e:?}", ir.function_index))?;
         if disasm {
             if let Some(vcode) = self.context.compiled_code().and_then(|code| code.vcode.as_ref()) {
-                eprintln!("[napalm-wfjit] v2 disassembly {:?}:\n{vcode}", function.id);
+                eprintln!("[napalm-wfjit] v2 disassembly {:?}:\n{vcode}", ir.function_index);
             }
         }
 
@@ -1407,7 +1478,7 @@ impl WholeFunctionJit {
                 b.switch_to_block(next);
             }
             for argument in 0..ir.arity {
-                let destination = function.entry_arg_dsts[argument];
+                let destination = ir.frame.entry_arg_dsts[argument];
                 let word = if destination == u16::MAX {
                     b.ins().iconst(types::I64, TAG_NULL as i64)
                 } else {
@@ -1425,7 +1496,7 @@ impl WholeFunctionJit {
                 }
             }
             if ir.has_this {
-                arguments.push(b.ins().load(types::I64, flags, regs, function.entry_this_dst as i32 * 8));
+                arguments.push(b.ins().load(types::I64, flags, regs, ir.frame.entry_this_dst as i32 * 8));
             }
             let call = b.ins().call(body_ref, &arguments);
             let mut result = b.inst_results(call)[0];
@@ -1451,11 +1522,11 @@ impl WholeFunctionJit {
             }
             b.ins().return_(&[result]);
             b.switch_to_block(deopt);
-            let speculation_ref = self.module.declare_func_in_func(self.speculation_failed, b.func);
+            let speculation_ref = self.module.declare_func_in_func(self.helpers.speculation_failed, b.func);
             let function_arg = b.ins().iconst(types::I32, ir.function_index as i64);
             b.ins().call(speculation_ref, &[vm, function_arg]);
             let hot_frame = b.ins().load(types::I64, flags, vm, offset_of!(Interpreter<'static>, hot_frame) as i32);
-            let root_map = b.ins().iconst(types::I32, function.gc_map_by_op[0] as i64);
+            let root_map = b.ins().iconst(types::I32, ir.frame.gc_map_by_op[0] as i64);
             b.ins().store(flags, root_map, hot_frame, offset_of!(Frame, root_map) as i32);
             let pc = b.ins().iconst(types::I32, 0);
             b.ins().store(flags, pc, vm, offset_of!(Interpreter<'static>, hot_pc) as i32);
@@ -1466,16 +1537,158 @@ impl WholeFunctionJit {
         }
         self.context.set_disasm(false);
         self.module.define_function(entry_id, &mut self.context)
-            .map_err(|e| format!("cannot define v2 entry {:?}: {e:?}", function.id))?;
+            .map_err(|e| format!("cannot define v2 entry {:?}: {e:?}", ir.function_index))?;
         self.module.finalize_definitions()
-            .map_err(|e| format!("cannot finalize v2 function {:?}: {e}", function.id))?;
+            .map_err(|e| format!("cannot finalize v2 function {:?}: {e}", ir.function_index))?;
         let code = self.module.get_finalized_function(entry_id);
         Ok(unsafe { std::mem::transmute::<*const u8, WholeFunctionEntry>(code) })
     }
 }
 
+/// A v2 compilation handed to the background compiler.
+struct WfJob {
+    function_index: u32,
+    ir: wf_ir::WfFunction,
+    fast_alloc: Option<GcFastAllocationInfo>,
+}
 
+// SAFETY: the IR is owned data; the TLAB description only holds addresses
+// that generated code embeds as constants (never dereferenced by the worker).
+unsafe impl Send for WfJob {}
 
+/// Result of a background compilation: entry address and Cranelift size.
+struct WfDone {
+    function_index: u32,
+    result: Result<(usize, usize), String>,
+}
+
+/// The v2 background compiler: one worker thread owning a `WfCodegen`.
+/// Generated code lives in the worker's module, which outlives every entry
+/// handed out: the worker only exits once the VM side drops the job sender.
+struct WfBackground {
+    jobs: Option<std::sync::mpsc::Sender<WfJob>>,
+    done: std::sync::mpsc::Receiver<WfDone>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Submitted, not yet installed: function index -> (summary, inlined calls).
+    pending: crate::napalm_collections::HashMap<u32, (String, u32)>,
+}
+
+impl WfBackground {
+    fn start() -> Result<Self, String> {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<WfJob>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<WfDone>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let thread = std::thread::Builder::new()
+            .name("napalm-wfjit".into())
+            .spawn(move || {
+                let mut codegen = match WfCodegen::new() {
+                    Ok(codegen) => { let _ = ready_tx.send(Ok(())); codegen }
+                    Err(error) => { let _ = ready_tx.send(Err(error)); return; }
+                };
+                while let Ok(job) = job_rx.recv() {
+                    let result = codegen.compile(&job.ir, job.fast_alloc)
+                        .map(|entry| (entry as usize, codegen.last_clif_insts));
+                    if done_tx.send(WfDone { function_index: job.function_index, result }).is_err() { break; }
+                }
+            })
+            .map_err(|error| format!("cannot start the v2 background compiler: {error}"))?;
+        ready_rx.recv().map_err(|error| error.to_string())??;
+        Ok(Self { jobs: Some(job_tx), done: done_rx, thread: Some(thread), pending: Default::default() })
+    }
+}
+
+impl Drop for WfBackground {
+    fn drop(&mut self) {
+        // Closing the job channel ends the worker after its current job.
+        self.jobs.take();
+        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
+}
+
+/// Wait for each v2 compilation to finish before running on (deterministic
+/// tiering for tests): `cfg(test)` or `NAPALM_WFJIT_SYNC=1`.
+fn wfjit_blocking() -> bool {
+    static BLOCKING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BLOCKING.get_or_init(|| cfg!(test) || std::env::var_os("NAPALM_WFJIT_SYNC").is_some())
+}
+
+impl WholeFunctionJit {
+    /// Hand a built v2 IR to the background compiler; the function keeps
+    /// running in baseline until the entry is installed.
+    fn submit_v2(
+        &mut self,
+        function_index: u32,
+        ir: wf_ir::WfFunction,
+        fast_alloc: Option<GcFastAllocationInfo>,
+        summary: String,
+    ) -> Result<(), String> {
+        if self.background.is_none() {
+            self.background = Some(WfBackground::start()?);
+        }
+        let background = self.background.as_mut().expect("background compiler");
+        let inlined = ir.inlined_calls;
+        background.jobs.as_ref().ok_or("background compiler stopped")?
+            .send(WfJob { function_index, ir, fast_alloc })
+            .map_err(|_| "background compiler stopped".to_string())?;
+        background.pending.insert(function_index, (summary, inlined));
+        self.slots[function_index as usize].state = FunctionState::Compiling;
+        if wfjit_blocking() {
+            while self.slots[function_index as usize].state == FunctionState::Compiling {
+                if !self.poll_background(true) { break; }
+            }
+        }
+        Ok(())
+    }
+
+    /// Install finished background compilations (all available ones, or the
+    /// next one when `block`). False when nothing is pending.
+    #[inline]
+    fn poll_background(&mut self, block: bool) -> bool {
+        let Some(background) = self.background.as_mut() else { return false; };
+        if background.pending.is_empty() { return false; }
+        let mut finished = Vec::new();
+        if block {
+            match background.done.recv() {
+                Ok(done) => finished.push(done),
+                Err(_) => return false,
+            }
+        }
+        while let Ok(done) = background.done.try_recv() { finished.push(done); }
+        for done in finished {
+            let Some((summary, inlined)) = self.background.as_mut().unwrap().pending.remove(&done.function_index) else { continue; };
+            self.install_v2(done, summary, inlined);
+        }
+        true
+    }
+
+    fn install_v2(&mut self, done: WfDone, summary: String, inlined: u32) {
+        let events = std::env::var_os("NAPALM_JIT_EVENTS").is_some();
+        let index = done.function_index as usize;
+        let Some(slot) = self.slots.get_mut(index) else { return; };
+        if slot.state != FunctionState::Compiling { return; }
+        match done.result {
+            Ok((entry, clif)) => {
+                slot.state = FunctionState::Compiled;
+                slot.entry = Some(unsafe { std::mem::transmute::<usize, WholeFunctionEntry>(entry) });
+                slot.speculative = true;
+                slot.native_entries = 0;
+                slot.bailouts = 0;
+                slot.speculation_failures = 0;
+                self.stats.compiled_functions = self.stats.compiled_functions.saturating_add(1);
+                self.stats.v2_compiled_functions = self.stats.v2_compiled_functions.saturating_add(1);
+                self.stats.v2_inlined_calls = self.stats.v2_inlined_calls.saturating_add(u64::from(inlined));
+                if events { eprintln!("[napalm-wfjit] v2 compiled {summary} clif={clif}"); }
+            }
+            Err(reason) => {
+                // Retry with the v1 generator once the function is hot again.
+                slot.state = FunctionState::Cold;
+                slot.hotness = 0;
+                slot.v2_failed = true;
+                if events { eprintln!("[napalm-wfjit] v2 code generation failed for function {index}: {reason}"); }
+            }
+        }
+    }
+}
 #[derive(Clone)]
 struct NativeIdentitySite {
     classes: smallvec::SmallVec<[ReceiverClass; 4]>,
@@ -3030,7 +3243,7 @@ fn emit_native_self_call(
 }
 
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct NativeProfiledSmallMapSite {
     shape: u32,
     value_count: u8,
@@ -3246,14 +3459,34 @@ fn emit_native_class_instance_alloc(
     result
 }
 
+/// What `emit_native_typed_array_alloc` needs to know about its op, captured
+/// up front so code generation never reads live VM metadata (it can run on a
+/// background thread).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TypedArraySite {
+    capacity_reg: u8,
+    /// `ArrayType::with_capacity`; None when the descriptor is not an array
+    /// type (the helper then handles the op).
+    with_capacity: Option<bool>,
+    root_map: u32,
+}
+
+fn typed_array_site(function: &PreparedFunction, bytecode: &BytecodeFunction, index: usize) -> TypedArraySite {
+    let op = function.ops[index];
+    let with_capacity = match bytecode.chunk.specializations.get(op.x as usize) {
+        Some(crate::napalm_bytecode::SpecializedDescriptor::ArrayType { with_capacity, .. }) => Some(*with_capacity),
+        _ => None,
+    };
+    TypedArraySite { capacity_reg: op.b, with_capacity, root_map: function.gc_map_by_op[index] }
+}
+
 fn emit_native_typed_array_alloc(
     b: &mut FunctionBuilder<'_>,
     slow_helper: cranelift::codegen::ir::FuncRef,
     commit_helper: cranelift::codegen::ir::FuncRef,
     vm: cranelift::prelude::Value,
     regs: cranelift::prelude::Value,
-    function: &PreparedFunction,
-    bytecode: &BytecodeFunction,
+    site: TypedArraySite,
     function_index: u32,
     index: usize,
     fast: Option<GcFastAllocationInfo>,
@@ -3262,16 +3495,14 @@ fn emit_native_typed_array_alloc(
     let Some(fast) = fast else {
         return call_native_value_helper(b, slow_helper, vm, function_index, index as u32, regs, abort);
     };
-    let op = function.ops[index];
-    let with_capacity = match bytecode.chunk.specializations.get(op.x as usize) {
-        Some(crate::napalm_bytecode::SpecializedDescriptor::ArrayType { with_capacity, .. }) => *with_capacity,
-        _ => return call_native_value_helper(b, slow_helper, vm, function_index, index as u32, regs, abort),
+    let Some(with_capacity) = site.with_capacity else {
+        return call_native_value_helper(b, slow_helper, vm, function_index, index as u32, regs, abort);
     };
     if !fast.alignment.is_power_of_two() || fast.bytes == 0 {
         return call_native_value_helper(b, slow_helper, vm, function_index, index as u32, regs, abort);
     }
 
-    emit_native_root_map_update(b, vm, regs, function.gc_map_by_op[index], index as u32);
+    emit_native_root_map_update(b, vm, regs, site.root_map, index as u32);
     let flags = MemFlagsData::trusted();
     let try_fast = b.create_block();
     let slow = b.create_block();
@@ -3280,7 +3511,7 @@ fn emit_native_typed_array_alloc(
     b.append_block_param(commit, types::I64);
     b.append_block_param(done, types::I64);
     if with_capacity {
-        let capacity = load_reg(b, regs, op.b);
+        let capacity = load_reg(b, regs, site.capacity_reg);
         let empty = b.ins().icmp_imm(IntCC::Equal, capacity, 0);
         b.ins().brif(empty, try_fast, &[], slow, &[]);
     } else {
@@ -3342,7 +3573,7 @@ fn emit_profiled_small_map_alloc(
     bind_contract_helper: cranelift::codegen::ir::FuncRef,
     vm: cranelift::prelude::Value,
     regs: cranelift::prelude::Value,
-    function: &PreparedFunction,
+    root_map: u32,
     function_index: u32,
     index: usize,
     site: &NativeProfiledSmallMapSite,
@@ -3368,7 +3599,7 @@ fn emit_profiled_small_map_alloc(
         b,
         vm,
         regs,
-        function.gc_map_by_op[index],
+        root_map,
         index as u32,
     );
 
@@ -3643,11 +3874,13 @@ unsafe fn collect_inline_callees(
 /// native entry if one is installed. Auto-memoized targets never compile.
 unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeFunctionEntry> {
     let jit_ptr = vm.whole_function_jit.as_mut().map(|jit| &mut **jit as *mut WholeFunctionJit)?;
+    // Install whatever the background compiler finished (no-op when idle).
+    unsafe { (*jit_ptr).poll_background(false); }
     // Settled functions (the common case on hot paths) need one state check:
     // rejected ones never compile again, compiled ones just return their entry.
     let settled = unsafe { (*jit_ptr).slots.get(target as usize).map(|slot| (slot.state, slot.entry)) };
     match settled {
-        None | Some((FunctionState::Rejected, _)) => return None,
+        None | Some((FunctionState::Rejected, _)) | Some((FunctionState::Compiling, _)) => return None,
         Some((FunctionState::Compiled, entry)) => {
             return if unsafe { (*jit_ptr).active_depth } < MAX_NATIVE_CALL_DEPTH { entry } else { None };
         }

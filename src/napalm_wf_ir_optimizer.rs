@@ -72,6 +72,10 @@ macro_rules! operands {
                 InstanceFieldSet {object:lhs,value:rhs,..} => { visit(lhs); visit(rhs); }
                 SelfCall {args,..} => args.into_iter().for_each(visit),
                 Primitive {receiver, arg, ..} => { visit(receiver); if let Some(arg) = arg { visit(arg); } }
+                CallExplicit {receiver, args, ..} => {
+                    if let Some(receiver) = receiver { visit(receiver); }
+                    args.into_iter().for_each(visit);
+                }
                 Param(_) | ConstTagged(_) | ConstBool(_) | ConstF64(_) | LoadAbsolute(_) | AllocObject {..} |
                 RuntimeOp {..} | FrameLoad(_) | GuardEpoch {..} | LoopBackedge {..} => {}
             }
@@ -88,6 +92,7 @@ macro_rules! snapshots {
                 UnboxNumber {deopt,..} | GuardClass {deopt,..} | InstanceFieldGet {deopt,..} |
                 MapPropertyGet {deopt,..} | IdentityCompare {deopt,..} | InstanceFieldSet {deopt,..} |
                 SelfCall {deopt,..} | GuardEpoch {deopt,..} | LoopBackedge {deopt,..} | Primitive {deopt,..} |
+                CallExplicit {state:deopt,..} |
                 AllocObject {state:deopt,..} | RuntimeOp {state:deopt,..} => Some(deopt),
                 Param(_) | ConstTagged(_) | ConstF64(_) | ConstBool(_) | LoadAbsolute(_) |
                 AssumeNumber(_) | AssumeBool(_) | BoxF64(_) | BoxBool(_) | Truthy(_) |
@@ -355,6 +360,10 @@ fn verify_with_cfg(f: &WfFunction, cfg: &Cfg) -> Result<(), String> {
                             .all(|(n, v)| ty(v) == *f.param_types.get(n).unwrap_or(&Tagged)),
                 ),
                 RuntimeOp { dest, .. } => (if dest.is_some() { Tagged } else { Bool }, true),
+                CallExplicit { receiver, args, .. } => (
+                    Tagged,
+                    receiver.as_ref().is_none_or(|v| ty(v) == Tagged) && args.iter().all(|v| ty(v) == Tagged),
+                ),
                 Primitive { kind, receiver, arg, .. } => (
                     kind.result_ty(),
                     ty(receiver) == Tagged && match arg {

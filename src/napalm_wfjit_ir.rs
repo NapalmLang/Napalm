@@ -77,15 +77,15 @@ pub(super) enum WfPrimitive {
 
 impl WfPrimitive {
     /// Arguments after the receiver.
-    fn arity(self) -> usize {
+    pub(super) fn arity(self) -> usize {
         match self { WfPrimitive::ListCount | WfPrimitive::BoolNot => 0, _ => 1 }
     }
     /// The argument is used as an unboxed Number.
-    fn numeric_arg(self) -> bool {
+    pub(super) fn numeric_arg(self) -> bool {
         matches!(self, WfPrimitive::ListSubscript | WfPrimitive::ListIteratorValue
             | WfPrimitive::StringCodePointAt | WfPrimitive::BytesIndex)
     }
-    fn result_ty(self) -> WfTy {
+    pub(super) fn result_ty(self) -> WfTy {
         match self {
             WfPrimitive::ListCount => WfTy::F64,
             WfPrimitive::BoolNot | WfPrimitive::StringEq => WfTy::Bool,
@@ -200,6 +200,16 @@ pub(super) enum WfInst {
     GuardClass { value: WfValue, class: u64, deopt: WfDeopt },
     /// Bool from a native self-call result that the body returned raw.
     AssumeBool(WfValue),
+    /// A call made from inside an inlined body, whose own frame does not exist:
+    /// the runtime enters `target` with explicit arguments as if the root
+    /// frame were executing its call op `state.op_index` (the root's
+    /// destination register of that op, dead until the inlined call returns,
+    /// receives the result). While it runs, the root's live GPRs
+    /// (`state.registers`) are in its bank and every inlined frame
+    /// (`state.frames`) is published as a GC shadow frame. Tagged result; on
+    /// failure (exception, the interpreter took over) the body bails out
+    /// without touching the bank.
+    CallExplicit { target: u32, receiver: Option<WfValue>, args: Vec<WfValue>, state: WfDeopt },
     /// A builtin method on a receiver whose class was already guarded
     /// (Tagged receiver; the argument is F64 when `kind.numeric_arg()`).
     /// Deoptimizes at `deopt` on any case it does not handle.
@@ -252,6 +262,10 @@ pub(super) struct WfInlineDeoptFrame {
     pub(super) call_op: u32,
     pub(super) resume_op: u32,
     pub(super) registers: Vec<(u8, WfValue)>,
+    /// The callee's GPR count and its GC root map at `resume_op`, used when
+    /// the frame is published as a native shadow frame (`CallExplicit`).
+    pub(super) reg_count: u16,
+    pub(super) root_map: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -370,10 +384,11 @@ fn native_primitive_site(
             P::ListIterate => WfPrimitive::ListIterate,
             P::ListIteratorValue => WfPrimitive::ListIteratorValue,
             P::BoolNot => WfPrimitive::BoolNot,
-            // StringEq / StringCodePointAt / BytesIndex need leaf helpers
-            // (not wired yet).
+            P::StringEq => WfPrimitive::StringEq,
+            P::StringCodePointAt => WfPrimitive::StringCodePointAt,
             _ => return None,
         },
+        CallTarget::NativeBuiltin(NativeBuiltin::Bytes(BytesNative::BytesIndex)) => WfPrimitive::BytesIndex,
         _ => return None,
     };
     (prepared.c as usize == kind.arity()).then_some((site.class.0, kind))
@@ -959,23 +974,42 @@ impl Builder<'_> {
             }
             // After an effect the call cannot be replayed: rebuild the
             // inlined frames and resume at this very op of the innermost one.
-            let chain = &self.inline_chain;
-            let mut frames = Vec::with_capacity(chain.len());
-            for (level, (callee, call_op, _, _)) in chain.iter().enumerate() {
-                let (resume_op, registers) = match chain.get(level + 1) {
-                    Some((_, inner_call, parent_state, parent_live)) =>
-                        (*inner_call as u32, registers_of(parent_state, parent_live)),
-                    None => (op_index as u32, registers_of(&self.state, live)),
-                };
-                frames.push(WfInlineDeoptFrame { callee: *callee, call_op: *call_op as u32, resume_op, registers });
-            }
-            let (_, root_call, root_state, root_live) = &chain[0];
-            let registers = registers_of(root_state, root_live);
-            self.out.deopts.push(WfDeoptState { op_index: *root_call as u32, speculative, registers, frames });
-            return Ok(WfDeopt(self.out.deopts.len() as u32 - 1));
+            return self.chain_state(op_index, speculative, live);
         }
         let registers = registers_of(&self.state, live);
         self.out.deopts.push(WfDeoptState { op_index: op_index as u32, speculative, registers, frames: Vec::new() });
+        Ok(WfDeopt(self.out.deopts.len() as u32 - 1))
+    }
+
+    /// Inside an inlined body: the root's state at its outermost call op plus
+    /// every inlined frame (outermost first) stopped at its current op, the
+    /// innermost at `op_index` with `live`. Used to rebuild the frames on a
+    /// deopt and to publish them as GC shadow frames around `CallExplicit`.
+    fn chain_state(&mut self, op_index: usize, speculative: bool, live: &RegSet) -> Result<WfDeopt, String> {
+        let registers_of = |state: &[Option<WfValue>], live: &RegSet| -> Vec<(u8, WfValue)> {
+            (0..=255u8)
+                .filter(|&reg| set_has(live, reg))
+                .filter_map(|reg| state[reg as usize].map(|value| (reg, value)))
+                .collect()
+        };
+        let chain = &self.inline_chain;
+        let mut frames = Vec::with_capacity(chain.len());
+        for (level, (callee, call_op, _, _)) in chain.iter().enumerate() {
+            let (resume_op, registers) = match chain.get(level + 1) {
+                Some((_, inner_call, parent_state, parent_live)) =>
+                    (*inner_call as u32, registers_of(parent_state, parent_live)),
+                None => (op_index as u32, registers_of(&self.state, live)),
+            };
+            let data = self.source.callees.get(callee)
+                .ok_or_else(|| format!("op {op_index}: inlined callee without data"))?;
+            let reg_count = data.function.frame.general_register_count;
+            let root_map = *data.function.gc_map_by_op.get(resume_op as usize)
+                .ok_or_else(|| format!("op {op_index}: no GC map at inlined op {resume_op}"))?;
+            frames.push(WfInlineDeoptFrame { callee: *callee, call_op: *call_op as u32, resume_op, registers, reg_count, root_map });
+        }
+        let (_, root_call, root_state, root_live) = &chain[0];
+        let registers = registers_of(root_state, root_live);
+        self.out.deopts.push(WfDeoptState { op_index: *root_call as u32, speculative, registers, frames });
         Ok(WfDeopt(self.out.deopts.len() as u32 - 1))
     }
 
@@ -1724,9 +1758,47 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 if let Some(value) = inlined {
                     if let Some(dst) = write { builder.state[dst as usize] = Some(value); }
                 } else {
+                    let mut continue_after_runtime = false;
                     if builder.inline.is_some() {
-                        return Err(format!("op {index}: host helper call inside an inlined body"));
+                        // A call with a statically known target runs from the
+                        // inlined body with explicit arguments; the inlined
+                        // frames are published as GC shadow frames meanwhile.
+                        let explicit = matches!(helper, WfRuntimeHelper::DirectCall
+                            | WfRuntimeHelper::ProfiledMethod(_) | WfRuntimeHelper::DirectMethod)
+                            && !builder.root_self_calls;
+                        let Some(target) = inline.as_ref().filter(|_| explicit) else {
+                            let opcode = data.bytecode.chunk.code.get(data.function.raw_pcs[index] as usize)
+                                .and_then(|word| word.opcode());
+                            return Err(format!("op {index}: host helper call ({helper:?} {opcode:?}) inside an inlined body"));
+                        };
+                        let receiver = match target.receiver {
+                            Some(reg) => { let value = builder.read(reg, index)?; Some(builder.tagged(value)?) }
+                            None => None,
+                        };
+                        if let (Some((_, class)), Some(value)) = (guard, receiver) {
+                            let deopt = builder.deopt(index, true, &live)?;
+                            builder.emit(WfTy::Bool, WfInst::GuardClass { value, class, deopt });
+                        }
+                        let mut args = Vec::with_capacity(target.args.len());
+                        for &reg in &target.args {
+                            let value = builder.read(reg, index)?;
+                            args.push(builder.tagged(value)?);
+                        }
+                        let state = builder.chain_state(index, false, &live)?;
+                        let snapshot = &builder.out.deopts[state.0 as usize];
+                        if snapshot.frames.iter().any(|frame| frame.root_map == u32::MAX) {
+                            return Err(format!("op {index}: inlined frame without a GC map"));
+                        }
+                        let result = builder.emit(WfTy::Tagged, WfInst::CallExplicit { target: target.callee, receiver, args, state });
+                        if let Some(dst) = write { builder.state[dst as usize] = Some(result); }
+                        // A call is an effect: later guards rebuild the frames.
+                        if let Some(frame) = builder.inline.as_mut() { frame.effect_done = true; }
+                        builder.epoch_dirty = true;
+                        continue_after_runtime = true;
                     }
+                    if continue_after_runtime {
+                        // Handled above.
+                    } else {
                     if builder.root_self_calls {
                         // A nested native frame has no bank for a host helper.
                         return Err(format!("op {index}: host helper call in a natively recursive function"));
@@ -1761,6 +1833,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                     // The helper may have run code that rebinds methods: the
                     // next epoch-dependent op checks again.
                     builder.epoch_dirty = true;
+                    }
                 }
             }
             OpKind::Jump { target } => {

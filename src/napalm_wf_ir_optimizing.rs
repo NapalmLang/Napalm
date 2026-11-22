@@ -336,7 +336,9 @@ impl WfOptimization for Values {
                                 bank.insert(*r, *result);
                             }
                         }
-                        WfInst::SelfCall { .. } | WfInst::AllocObject { .. } => {
+                        // CallExplicit runs code and writes the root's call
+                        // destination slot in the bank.
+                        WfInst::SelfCall { .. } | WfInst::AllocObject { .. } | WfInst::CallExplicit { .. } => {
                             bank.clear();
                             guards.clear();
                             globals.clear();
@@ -858,7 +860,8 @@ impl WfOptimization for HeapForward {
                         state.fresh_local.push(*result);
                     }
                     WfInst::RuntimeOp { .. }
-                    | WfInst::SelfCall { .. } => state.kill_effects(),
+                    | WfInst::SelfCall { .. }
+                    | WfInst::CallExplicit { .. } => state.kill_effects(),
                     _ => {}
                 }
                 true
@@ -1900,6 +1903,8 @@ mod wf_opt_tests {
             call_op: 3,
             resume_op: 4,
             registers: vec![(1, v(1))],
+            reg_count: 4,
+            root_map: 0,
         });
         optimize(&mut f).unwrap();
         assert_eq!(f.deopts.len(), 1);
@@ -2061,6 +2066,8 @@ mod wf_opt_tests {
             call_op: 4,
             resume_op: 7,
             registers: vec![],
+            reg_count: 4,
+            root_map: 0,
         });
         f.entry_epoch_guard = Some((7, WfDeopt(0)));
         optimize(&mut f).unwrap();

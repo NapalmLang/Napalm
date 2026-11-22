@@ -3105,6 +3105,11 @@ fn execute_primitive(
         }
         StringCodePointAt => {
             let index = integer(argument(args, 0)?, "code point index")?;
+            // One-byte code points (the common ASCII case): O(1) instead of
+            // counting and walking the whole text on every call.
+            if let Some(code) = context.string_code_point_fast(this, index) {
+                return Ok(code);
+            }
             let text = context.string_utf8(this)
                 .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
             let length = string_char_len(text) as i64;

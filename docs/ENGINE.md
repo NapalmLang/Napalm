@@ -389,11 +389,26 @@ declined.
   call. After an effect (a store) replaying is wrong, so the deopt rebuilds the
   inlined frames instead. The runtime enters each inlined call as the
   interpreter would, fills the callee registers and resumes the innermost frame
-  at the failed op. Declines:
+  at the failed op.
+
+  An inlined body may itself make calls whose target is statically known
+  (`CallDirect`, profiled or resolved method calls): `CallExplicit` enters the
+  target with explicit arguments, as if the root frame were executing its
+  outermost call op. The root's live GPRs are in its bank. Every inlined frame
+  is published as a GC shadow frame (zeroed native stack bank, callee GC map
+  at the current op) for the duration of the call. The result lands in the
+  root op's destination register, which stays dead until the inlined call
+  returns. An exception unwinds from the root's call site (inlined bodies have
+  no handlers). Async and concurrent targets are declined before any effect;
+  the body then deoptimizes with rebuilt frames and the interpreter makes the
+  call. A call is an effect, so later guards rebuild frames too.
+
+  Declines:
   - recursive inlining (a callee already being translated);
-  - stores inside inlines when the root recurses natively (nested frames replay
-    the outermost self-call);
-  - host helper calls, allocations and loops inside an inlined body;
+  - stores, or calls from inlined bodies, when the root recurses natively
+    (nested frames replay the outermost self-call);
+  - other helpers (polymorphic `Invoke`, generic ops), allocations and loops
+    inside an inlined body;
   - memoized callees that make calls.
 
   A declined site stays a `RuntimeOp`. `NAPALM_JIT_EVENTS=1` prints each

@@ -54,30 +54,45 @@ fn build_writes_beside_entry_without_executing_any_module() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(result.stdout.is_empty());
+    // Format 2 (docs/BURNING.md): magic, version, compression id (1 = zstd)
+    // and the uncompressed payload length, then one zstd frame holding the
+    // section count and the CODE/META/BOOT sections.
     let bytes = std::fs::read(folder.join("fib.burning")).unwrap();
     assert_eq!(&bytes[..8], b"NAPBURN\0");
-    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
-    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
-    let mut cursor = 16;
+    assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+    assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 1);
+    let payload_len = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+    let payload = zstd::stream::decode_all(&bytes[24..]).unwrap();
+    assert_eq!(payload.len(), payload_len);
+    assert_eq!(u32::from_le_bytes(payload[..4].try_into().unwrap()), 3);
+    let mut cursor = 4;
     for tag in [b"CODE", b"META", b"BOOT"] {
-        assert_eq!(&bytes[cursor..cursor + 4], tag);
-        let len = u64::from_le_bytes(bytes[cursor + 4..cursor + 12].try_into().unwrap()) as usize;
-        let payload = &bytes[cursor + 12..cursor + 12 + len];
-        if tag == b"META" {
-            let metadata: serde_json::Value = serde_json::from_slice(payload).unwrap();
-            let modules = metadata["metadata"]["modules"].as_array().unwrap();
-            let strings = metadata["metadata"]["strings"].as_array().unwrap();
-            for expected in ["fib.napalm", "dependency.napalm"] {
-                assert!(modules.iter().any(|module| {
-                    let name = module["name"].as_u64().unwrap() as usize;
-                    strings[name].as_str().unwrap().ends_with(expected)
-                }));
+        assert_eq!(&payload[cursor..cursor + 4], tag);
+        let len = u64::from_le_bytes(payload[cursor + 4..cursor + 12].try_into().unwrap()) as usize;
+        let section = &payload[cursor + 12..cursor + 12 + len];
+        match tag {
+            b"CODE" => {
+                // Function count, then (id, word count, little-endian u32 words).
+                let count = u32::from_le_bytes(section[..4].try_into().unwrap());
+                let mut offset = 4;
+                for _ in 0..count {
+                    let words = u64::from_le_bytes(section[offset + 4..offset + 12].try_into().unwrap()) as usize;
+                    offset += 12 + words * 4;
+                }
+                assert_eq!(offset, section.len());
             }
-            assert!(metadata["functions"][0]["chunk"].get("code").is_none());
+            b"META" => {
+                // Postcard keeps strings as raw UTF-8: both module paths are
+                // recorded, the dependency without having been executed.
+                for expected in ["fib.napalm", "dependency.napalm"] {
+                    assert!(section.windows(expected.len()).any(|window| window == expected.as_bytes()));
+                }
+            }
+            _ => {}
         }
         cursor += 12 + len;
     }
-    assert_eq!(cursor, bytes.len());
+    assert_eq!(cursor, payload.len());
     assert_eq!(
         std::fs::read_to_string(folder.join("fib.napalm")).unwrap(),
         source
@@ -184,7 +199,8 @@ fn artifact_loading_reports_errors_and_rejects_rebuilding() {
     let mut version = valid.clone();
     version[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
     let mut code = valid.clone();
-    // CODE's function count starts at 28 and first function ID at 32.
+    // Bytes 32..36 lie inside the compressed zstd frame (which starts at 24):
+    // the frame checksum must reject the corruption.
     code[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
     for bytes in [
         b"not an artifact".to_vec(),

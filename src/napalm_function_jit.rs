@@ -109,6 +109,10 @@ pub(super) struct WholeFunctionJit {
     profiled_method: cranelift::module::FuncId,
     call_to_return: cranelift::module::FuncId,
     reconstruct_frames: cranelift::module::FuncId,
+    string_eq: cranelift::module::FuncId,
+    string_code_point_at: cranelift::module::FuncId,
+    bytes_index: cranelift::module::FuncId,
+    call_explicit: cranelift::module::FuncId,
     small_map_literal: cranelift::module::FuncId,
     native_self_call: cranelift::module::FuncId,
     small_map_literal_regs: cranelift::module::FuncId,
@@ -152,6 +156,10 @@ impl WholeFunctionJit {
         builder.symbol("napalm_wfjit_profiled_method", napalm_wfjit_profiled_method as *const u8);
         builder.symbol("napalm_wfjit_call_to_return", napalm_wfjit_call_to_return as *const u8);
         builder.symbol("napalm_wfjit_reconstruct_frames", napalm_wfjit_reconstruct_frames as *const u8);
+        builder.symbol("napalm_wfjit_string_eq", napalm_wfjit_string_eq as *const u8);
+        builder.symbol("napalm_wfjit_string_code_point_at", napalm_wfjit_string_code_point_at as *const u8);
+        builder.symbol("napalm_wfjit_bytes_index", napalm_wfjit_bytes_index as *const u8);
+        builder.symbol("napalm_wfjit_call_explicit", napalm_wfjit_call_explicit as *const u8);
         builder.symbol("napalm_wfjit_small_map_literal", napalm_wfjit_small_map_literal as *const u8);
         builder.symbol("napalm_wfjit_native_self_call", napalm_wfjit_native_self_call as *const u8);
         builder.symbol(
@@ -216,6 +224,30 @@ impl WholeFunctionJit {
         let reconstruct_id = module
             .declare_function("napalm_wfjit_reconstruct_frames", Linkage::Import, &reconstruct_sig)
             .map_err(|e| format!("cannot declare whole-function frame reconstruction helper: {e}"))?;
+        // Pure leaf helpers: (vm, receiver word, argument word) -> word.
+        let mut leaf_sig = module.make_signature();
+        leaf_sig.params.push(AbiParam::new(pointer));
+        leaf_sig.params.push(AbiParam::new(types::I64));
+        leaf_sig.params.push(AbiParam::new(types::I64));
+        leaf_sig.returns.push(AbiParam::new(types::I64));
+        let mut declare_leaf = |name: &str| module.declare_function(name, Linkage::Import, &leaf_sig)
+            .map_err(|e| format!("cannot declare whole-function leaf helper {name}: {e}"));
+        let string_eq_id = declare_leaf("napalm_wfjit_string_eq")?;
+        let string_code_point_id = declare_leaf("napalm_wfjit_string_code_point_at")?;
+        let bytes_index_id = declare_leaf("napalm_wfjit_bytes_index")?;
+        let mut explicit_sig = module.make_signature();
+        explicit_sig.params.push(AbiParam::new(pointer)); // vm
+        explicit_sig.params.push(AbiParam::new(types::I32)); // root call op
+        explicit_sig.params.push(AbiParam::new(types::I32)); // target
+        explicit_sig.params.push(AbiParam::new(types::I64)); // receiver
+        explicit_sig.params.push(AbiParam::new(types::I32)); // has receiver
+        explicit_sig.params.push(AbiParam::new(pointer)); // arguments
+        explicit_sig.params.push(AbiParam::new(types::I32)); // argument count
+        explicit_sig.params.push(AbiParam::new(pointer)); // result slot
+        explicit_sig.returns.push(AbiParam::new(types::I32));
+        let call_explicit_id = module
+            .declare_function("napalm_wfjit_call_explicit", Linkage::Import, &explicit_sig)
+            .map_err(|e| format!("cannot declare whole-function explicit call helper: {e}"))?;
         let small_map_id = module
             .declare_function("napalm_wfjit_small_map_literal", Linkage::Import, &helper_sig)
             .map_err(|e| format!("cannot declare whole-function small-map helper: {e}"))?;
@@ -342,6 +374,10 @@ impl WholeFunctionJit {
             profiled_method: profiled_method_id,
             call_to_return: call_to_return_id,
             reconstruct_frames: reconstruct_id,
+            string_eq: string_eq_id,
+            string_code_point_at: string_code_point_id,
+            bytes_index: bytes_index_id,
+            call_explicit: call_explicit_id,
             small_map_literal: small_map_id,
             native_self_call: native_self_call_id,
             small_map_literal_regs: small_map_regs_id,
@@ -1316,6 +1352,10 @@ impl WholeFunctionJit {
                 specialized_factory: self.module.declare_func_in_func(self.specialized_factory, func),
                 reserved_typed_array: self.module.declare_func_in_func(self.reserved_typed_array, func),
                 reconstruct: self.module.declare_func_in_func(self.reconstruct_frames, func),
+                string_eq: self.module.declare_func_in_func(self.string_eq, func),
+                string_code_point_at: self.module.declare_func_in_func(self.string_code_point_at, func),
+                bytes_index: self.module.declare_func_in_func(self.bytes_index, func),
+                call_explicit: self.module.declare_func_in_func(self.call_explicit, func),
             };
             let mut b = FunctionBuilder::new(&mut self.context.func, &mut self.function_context);
             wf_lower::lower_body(&mut b, ir, function, bytecode, fast_alloc, helpers);
@@ -4586,8 +4626,14 @@ unsafe extern "C" fn napalm_wfjit_small_map_literal(
 
 /// `NAPALM_WFJIT_HELPERS=1`: count helper executions per (helper, opcode)
 /// and print the histogram when the process exits (diagnostics).
+#[inline(always)]
 fn count_helper(vm: &Interpreter<'_>, helper: &'static str, op_index: u32) {
-    if !helper_counts_enabled() { return; }
+    if helper_counts_enabled() { count_helper_slow(vm, helper, op_index); }
+}
+
+#[cold]
+#[inline(never)]
+fn count_helper_slow(vm: &Interpreter<'_>, helper: &'static str, op_index: u32) {
     let function = vm.hot_function_index as usize;
     let opcode = vm.prepared.functions.get(function)
         .and_then(|prepared| prepared.raw_pcs.get(op_index as usize).copied())
@@ -4609,6 +4655,7 @@ fn count_helper(vm: &Interpreter<'_>, helper: &'static str, op_index: u32) {
 static HELPER_COUNTS: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> =
     std::sync::Mutex::new(None);
 
+#[inline(always)]
 fn helper_counts_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NAPALM_WFJIT_HELPERS").is_some())
@@ -4642,6 +4689,134 @@ fn trace_bailout(vm: &Interpreter<'_>, target: u32) {
         .and_then(|raw| vm.program.functions[function].chunk.code.get(raw as usize))
         .and_then(|word| word.opcode());
     eprintln!("[napalm-wfjit] bailout F{target} -> F{function}:{pc} {opcode:?}");
+}
+
+/// v2 `CallExplicit`: a call made from an inlined body. The root frame stands
+/// at its outermost call op `root_op` (its live GPRs are in the bank, the
+/// inlined frames are GC shadow frames). Enter `target` as that op would,
+/// with explicit arguments, so the result lands in the op's destination
+/// register (dead until the inlined call returns), run it to completion
+/// (natively when compiled), and hand the result back through `out`.
+/// Status: 0 done, 1 the interpreter took over (exception unwound into or
+/// past the root frame...), 2 declined before doing anything.
+unsafe extern "C" fn napalm_wfjit_call_explicit(
+    vm: *mut c_void,
+    root_op: u32,
+    target: u32,
+    receiver: u64,
+    has_receiver: u32,
+    args: *const u64,
+    argc: u32,
+    out: *mut u64,
+) -> u32 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return 2; }
+    count_helper(vm, "explicit", root_op);
+    // Async and concurrent targets take paths that can collect before the
+    // arguments are copied into a frame: leave those calls to the interpreter.
+    let Some(callee) = vm.prepared.functions.get(target as usize) else { return 2; };
+    if callee.is_async || callee.is_concurrent || argc as usize > 16 { return 2; }
+    let caller_fiber = vm.current_fiber;
+    let caller_depth = vm.fiber(caller_fiber).frames.len();
+    let caller_function = vm.hot_function_index;
+    unsafe { vm.set_pc(root_op); }
+    let op = unsafe { *vm.current_prepared().ops.get_unchecked(root_op as usize) };
+    let mut words = [RegisterWord(0); 16];
+    for index in 0..argc as usize {
+        words[index] = RegisterWord(unsafe { *args.add(index) });
+    }
+    if has_receiver != 0 {
+        vm.enter_bytecode_call(&op, target, Some(RegisterWord(receiver)), &words[..argc as usize], None);
+    } else {
+        // Like CallDirect: a method target takes `this` from the first source.
+        vm.enter_direct_bytecode_call(&op, target, &words[..argc as usize], None);
+    }
+    if vm.run_state == RunState::Running && vm.current_fiber == caller_fiber
+        && vm.fiber(caller_fiber).frames.len() > caller_depth
+    {
+        match unsafe { compiled_entry(vm, target) } {
+            Some(entry) => {
+                if let Some(jit) = vm.whole_function_jit.as_mut() {
+                    jit.stats.native_entries = jit.stats.native_entries.saturating_add(1);
+                    jit.active_depth = jit.active_depth.saturating_add(1);
+                }
+                let result = unsafe { entry(vm as *mut _ as *mut c_void, vm.hot_registers) };
+                if let Some(jit) = vm.whole_function_jit.as_mut() {
+                    jit.active_depth = jit.active_depth.saturating_sub(1);
+                    jit.note_native_result(target, result == WFJIT_BAILOUT);
+                }
+                if result != WFJIT_BAILOUT {
+                    if vm.run_state == RunState::Running && vm.current_fiber == caller_fiber
+                        && vm.fiber(caller_fiber).frames.len() == caller_depth + 1
+                        && vm.hot_function_index == target
+                    {
+                        vm.return_from_frame(RegisterWord(result), None);
+                    }
+                } else {
+                    trace_bailout(vm, target);
+                }
+            }
+            None => {}
+        }
+        // Finish whatever remains of the callee in baseline.
+        while vm.run_state == RunState::Running && vm.current_fiber == caller_fiber
+            && vm.fiber(caller_fiber).frames.len() > caller_depth
+        {
+            let pc = vm.hot_pc as usize;
+            let handler = unsafe { *vm.hot_handlers.add(pc) };
+            let prepared_op = unsafe { vm.hot_ops.add(pc) };
+            unsafe { handler(vm, prepared_op); }
+        }
+    }
+    if vm.run_state == RunState::Running && vm.current_fiber == caller_fiber
+        && vm.fiber(caller_fiber).frames.len() == caller_depth
+        && vm.hot_function_index == caller_function
+        && vm.hot_pc == op.next
+    {
+        unsafe { *out = vm.hot_registers.add(op.a as usize).read().0; }
+        0
+    } else {
+        1
+    }
+}
+
+/// v2 pure leaf helpers for native builtin methods (`WfInst::Primitive`).
+/// They never allocate, collect or run Napalm code, so the caller keeps its
+/// values in registers (no materialization). They return the result as a
+/// tagged word (0/1 for `string_eq`), or `WFJIT_BAILOUT` for any case they
+/// leave to the interpreter (errors), which re-executes the op after a deopt.
+unsafe extern "C" fn napalm_wfjit_string_eq(vm: *mut c_void, receiver: u64, other: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    let context = HostContext { heap: &mut vm.heap };
+    let equal = context.strings_equal(Value::from_word(RegisterWord(receiver)), Value::from_word(RegisterWord(other)));
+    u64::from(equal.unwrap_or(false))
+}
+
+unsafe extern "C" fn napalm_wfjit_string_code_point_at(vm: *mut c_void, receiver: u64, index_bits: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    let index = f64::from_bits(index_bits);
+    if !index.is_finite() || index.fract() != 0.0 { return WFJIT_BAILOUT; }
+    let index = index as i64;
+    let receiver = Value::from_word(RegisterWord(receiver));
+    let context = HostContext { heap: &mut vm.heap };
+    if let Some(code) = context.string_code_point_fast(receiver, index) {
+        return code.raw_bits();
+    }
+    // Same semantics as the interpreter's general path.
+    let Some(text) = context.string_utf8(receiver) else { return WFJIT_BAILOUT; };
+    let length = text.chars().count() as i64;
+    let index = if index < 0 { length.saturating_add(index) } else { index };
+    if index < 0 || index >= length { return Value::NULL.raw_bits(); }
+    Value::from_num(text.chars().nth(index as usize).map_or(0, |c| c as u32) as f64).raw_bits()
+}
+
+unsafe extern "C" fn napalm_wfjit_bytes_index(vm: *mut c_void, receiver: u64, index_bits: u64) -> u64 {
+    let vm = unsafe { &*(vm as *const Interpreter<'static>) };
+    let Some(HeapObject::Bytes(bytes)) = vm.heap.get(Value::from_word(RegisterWord(receiver))) else {
+        return WFJIT_BAILOUT;
+    };
+    let Ok(index) = crate::napalm_bytes::number_to_length(f64::from_bits(index_bits)) else { return WFJIT_BAILOUT; };
+    bytes.at(index).map_or(WFJIT_BAILOUT, |byte| Value::from_num(byte as f64).raw_bits())
 }
 
 /// Inlined frames a v2 deopt rebuilds (outermost first); see

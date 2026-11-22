@@ -6088,6 +6088,25 @@ impl HostContext<'_> {
         }
     }
 
+    /// `string.codePointAt(index)` in O(1) when every code point of the
+    /// String is one byte (the cached code-point count equals the byte
+    /// length) and the addressed byte is ASCII; `None` defers to the general
+    /// path (multi-byte text, or a stray byte that must keep its UTF-8 error).
+    pub fn string_code_point_fast(&self, value: Value, index: i64) -> Option<Value> {
+        let Some(HeapObject::String(string)) = self.heap.get(value) else { return None; };
+        let bytes = string.as_ref();
+        if string.code_points != bytes.len() { return None; }
+        let len = bytes.len() as i64;
+        let index = if index < 0 { len.saturating_add(index) } else { index };
+        if index < 0 || index >= len {
+            // Out of range is null on the general path too, unless the text is
+            // not valid UTF-8 (which only the general path diagnoses).
+            return bytes.is_ascii().then_some(Value::NULL);
+        }
+        let byte = bytes[index as usize];
+        (byte < 0x80).then(|| Value::from_num(byte as f64))
+    }
+
     pub fn string_utf8(&self, value: Value) -> Option<&str> {
         std::str::from_utf8(self.string_bytes(value)?).ok()
     }

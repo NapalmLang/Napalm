@@ -39,6 +39,12 @@ pub(super) struct WfHelperRefs {
     pub(super) reserved_typed_array: FuncRef,
     /// Rebuilds inlined frames on a deopt after an effect.
     pub(super) reconstruct: FuncRef,
+    /// Calls from inlined bodies (`CallExplicit`).
+    pub(super) call_explicit: FuncRef,
+    /// Pure leaf helpers of native builtin methods.
+    pub(super) string_eq: FuncRef,
+    pub(super) string_code_point_at: FuncRef,
+    pub(super) bytes_index: FuncRef,
 }
 
 /// Only heap-independent words can retain their *bank equality* fact after
@@ -128,6 +134,8 @@ fn bank_entry_facts(ir: &WfFunction) -> Vec<Vec<Option<WfValue>>> {
                         // A later guard must be able to reconstruct every root.
                         retain_gc_independent(&independent, &mut known);
                     }
+                    // Runs code and writes the root's call destination slot.
+                    WfInst::CallExplicit { .. } => known.fill(None),
                     WfInst::RuntimeOp { state, dest, clobbers, .. } => {
                         for &(reg, v) in &ir.deopts[state.0 as usize].registers {
                             known[reg as usize] = Some(v);
@@ -766,6 +774,91 @@ impl Lowering<'_, '_> {
                 self.local_objects.push(result);
                 value
             }
+            WfInst::CallExplicit { target, receiver, args, state } => {
+                self.field_written.clear();
+                self.local_objects.clear();
+                let snapshot = self.ir.deopts[state.0 as usize].clone();
+                // The root frame: live GPRs into its bank (the runtime sets its
+                // root map and PC to the outermost call op).
+                let frame = self.b.use_var(self.frame);
+                self.materialize(frame, &snapshot.registers);
+                // Every inlined frame becomes a GC shadow frame on the native
+                // stack for the duration of the call.
+                let mut first_previous = None;
+                for level in &snapshot.frames {
+                    let count = u32::from(level.reg_count.max(1));
+                    let bank_slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot, count * 8, 3));
+                    let bank = self.b.ins().stack_addr(types::I64, bank_slot, 0);
+                    // Slots not tracked by the IR must not hold stale words.
+                    let null = self.b.ins().iconst(types::I64, TAG_NULL as i64);
+                    for reg in 0..level.reg_count {
+                        self.b.ins().store(flags, null, bank, i32::from(reg) * 8);
+                    }
+                    for &(reg, value) in &level.registers {
+                        let word = self.tagged(value);
+                        self.b.ins().store(flags, word, bank, reg as i32 * 8);
+                    }
+                    let shadow_slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot, std::mem::size_of::<NativeShadowFrame>() as u32, 3));
+                    let shadow = self.b.ins().stack_addr(types::I64, shadow_slot, 0);
+                    let previous = self.b.ins().load(types::I64, flags, self.vm,
+                        offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+                    first_previous.get_or_insert(previous);
+                    self.b.ins().store(flags, previous, shadow, offset_of!(NativeShadowFrame, previous) as i32);
+                    self.b.ins().store(flags, bank, shadow, offset_of!(NativeShadowFrame, registers) as i32);
+                    let function_id = self.b.ins().iconst(types::I32, level.callee as i64);
+                    self.b.ins().store(flags, function_id, shadow, offset_of!(NativeShadowFrame, function) as i32);
+                    let root_map = self.b.ins().iconst(types::I32, level.root_map as i64);
+                    self.b.ins().store(flags, root_map, shadow, offset_of!(NativeShadowFrame, root_map) as i32);
+                    let register_count = self.b.ins().iconst(types::I16, level.reg_count as i64);
+                    self.b.ins().store(flags, register_count, shadow, offset_of!(NativeShadowFrame, reg_count) as i32);
+                    self.b.ins().store(flags, shadow, self.vm, offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+                }
+                let args_slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot, (args.len().max(1) * 8) as u32, 3));
+                let args_ptr = self.b.ins().stack_addr(types::I64, args_slot, 0);
+                for (index, arg) in args.iter().enumerate() {
+                    let word = self.tagged(*arg);
+                    self.b.ins().store(flags, word, args_ptr, index as i32 * 8);
+                }
+                let out_slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+                let out = self.b.ins().stack_addr(types::I64, out_slot, 0);
+                let root_op = self.b.ins().iconst(types::I32, snapshot.op_index as i64);
+                let callee = self.b.ins().iconst(types::I32, *target as i64);
+                let receiver_word = match receiver {
+                    Some(value) => self.tagged(*value),
+                    None => self.b.ins().iconst(types::I64, 0),
+                };
+                let has_receiver = self.b.ins().iconst(types::I32, receiver.is_some() as i64);
+                let argc = self.b.ins().iconst(types::I32, args.len() as i64);
+                let call = self.b.ins().call(self.helpers.call_explicit,
+                    &[self.vm, root_op, callee, receiver_word, has_receiver, args_ptr, argc, out]);
+                let status = self.b.inst_results(call)[0];
+                if let Some(previous) = first_previous {
+                    self.b.ins().store(flags, previous, self.vm,
+                        offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+                }
+                // 2: declined before doing anything: rebuild the inlined frames
+                // and let the interpreter make this call. 1: the interpreter
+                // took over (exception...): leave without touching the bank.
+                let declined = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
+                let deopt_target = self.deopt_block(*state);
+                let decided = self.b.create_block();
+                self.b.ins().brif(declined, deopt_target, &[BlockArg::Value(frame)], decided, &[]);
+                self.b.switch_to_block(decided);
+                let ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+                let bail = self.bail_block();
+                let done = self.b.create_block();
+                self.b.ins().brif(ok, done, &[], bail, &[]);
+                self.b.switch_to_block(done);
+                // Entering the callee may have grown (moved) the register stack.
+                let hot = self.b.ins().load(types::I64, flags, self.vm,
+                    offset_of!(Interpreter<'static>, hot_registers) as i32);
+                self.b.def_var(self.frame, hot);
+                self.bank_known.fill(None);
+                self.b.ins().load(types::I64, flags, out, 0)
+            }
             WfInst::FrameLoad(reg) => {
                 self.bank_known[*reg as usize] = Some(result);
                 let frame = self.b.use_var(self.frame);
@@ -838,7 +931,21 @@ impl Lowering<'_, '_> {
                         self.b.ins().select(more, bits, done)
                     }
                     WfPrimitive::StringEq | WfPrimitive::StringCodePointAt | WfPrimitive::BytesIndex => {
-                        unreachable!("string/bytes primitives are not classified as native yet")
+                        // Pure leaf call: no bank, no root map, no reloads.
+                        let argument = self.value(arg.expect("leaf argument"));
+                        let argument = if kind.numeric_arg() {
+                            self.b.ins().bitcast(types::I64, MemFlagsData::new(), argument)
+                        } else { argument };
+                        let helper = match kind {
+                            WfPrimitive::StringEq => self.helpers.string_eq,
+                            WfPrimitive::StringCodePointAt => self.helpers.string_code_point_at,
+                            _ => self.helpers.bytes_index,
+                        };
+                        let call = self.b.ins().call(helper, &[self.vm, receiver, argument]);
+                        let word = self.b.inst_results(call)[0];
+                        let decided = self.b.ins().icmp_imm(IntCC::NotEqual, word, WFJIT_BAILOUT as i64);
+                        self.guard(decided, *deopt);
+                        if *kind == WfPrimitive::StringEq { self.b.ins().ireduce(types::I8, word) } else { word }
                     }
                 }
             }

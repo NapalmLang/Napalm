@@ -364,6 +364,86 @@ fn napalm_whole_function_v2_closures_handlers_and_dispatch() {
 }
 
 #[test]
+fn napalm_whole_function_v2_inlines_callees_that_make_calls() {
+    // `mid` makes calls, yet it is inlined into `top`: its calls run with
+    // explicit arguments while its live values sit in a GC shadow frame. The
+    // callees allocate (and collect), throw (caught by the root's handler),
+    // and a guard fails after a call (the inlined frame is rebuilt).
+    let stats = whole_function_only_run(r#"
+        let one = 0;
+        one = 1;
+        class Box { constructor(v) { this.v = v; } get() { return this.v; } }
+        function churn(n) { const xs = []; for (let i = 0; i < n; i += one) xs.push({k: i}); return xs.length; }
+        function check(x) { if (x == 7) throw 'seven'; return x + one; }
+        function mid(b, x) {
+            const before = b.get();
+            const r = check(x) + churn(40);
+            return before + r + b.get();
+        }
+        function top(b, x) { try { return mid(b, x); } catch (e) { return -1; } }
+        function midGuard(b, x) { const r = check(x); return r + b.v; }
+        function topGuard(b, x) { try { return midGuard(b, x) * 2; } catch (e) { return -5; } }
+        function main() {
+            let sum = 0;
+            for (let i = 0; i < 600; i++) sum += top(new Box(i), i % 10);
+            let guarded = 0;
+            for (let i = 0; i < 400; i++) guarded += topGuard(new Box(3), i % 9);
+            const shapes = [topGuard({v: 10}, 1), topGuard(new Box(4), 7), topGuard({v: 2}, 3)];
+            return [sum, guarded, shapes];
+        }
+        const result = main();
+    "#);
+    assert!(stats.v2_inlined_calls >= 2, "{stats:?}");
+}
+
+#[test]
+fn napalm_whole_function_v2_native_builtin_methods() {
+    // List length/subscript/iteration, Boolean not, String equality and
+    // codePointAt, and Bytes subscript run natively (or through pure leaf
+    // helpers) once their sites are monomorphic. Every case they do not handle
+    // natively (negative or fractional indices, out of range, non-ASCII text,
+    // lists changed while iterating) must deopt and match the interpreter.
+    let stats = whole_function_only_run(r#"
+        function listWork(xs, i) {
+            let s = 0;
+            for (const x of xs) s += x;
+            return s + xs.length + (xs[i] ?? -1);
+        }
+        function textWork(text, word, i) {
+            let s = 0;
+            if (text == word) s += 1000;
+            const c = text.codePointAt(i);
+            return s + (c == null ? -1 : c);
+        }
+        function notWork(flag) { return !flag; }
+        function bytesWork(bytes, i) { return bytes[i]; }
+        function shrinking(xs) { let s = 0; for (const x of xs) { s += x; if (x == 2) xs.pop(); } return s; }
+        function main() {
+            const xs = [1, 2, 3, 4];
+            let total = 0;
+            for (let i = 0; i < 400; i++) total += listWork(xs, i % 4);
+            let fractional: any = 0;
+            try { fractional = listWork(xs, 1.5); } catch (e) { fractional = 'err'; }
+            const edges = [listWork(xs, -1), listWork(xs, 9), fractional, listWork([], 0)];
+            let text = 0;
+            for (let i = 0; i < 400; i++) text += textWork("hello", i % 2 == 0 ? "hello" : "help", i % 5);
+            const textEdges = [textWork("héllo", "héllo", 1), textWork("abc", "abc", -1),
+                textWork("abc", "x", 7), textWork("😀a", "", 0)];
+            let flips = 0;
+            for (let i = 0; i < 400; i++) if (notWork(i % 3 == 0)) flips++;
+            const bytes = Bytes.fromUtf8("napalm");
+            let byteSum = 0;
+            for (let i = 0; i < 400; i++) byteSum += bytesWork(bytes, i % 6);
+            let shrinkSum = 0;
+            for (let i = 0; i < 100; i++) shrinkSum += shrinking([1, 2, 3, 4]);
+            return [total, edges, text, textEdges, flips, byteSum, shrinkSum];
+        }
+        const result = main();
+    "#);
+    assert!(stats.v2_compiled_functions >= 4, "{stats:?}");
+}
+
+#[test]
 fn napalm_whole_function_v2_rebuilds_inlined_frames_after_effects() {
     // `touch` stores before a guard that fails for Map arguments. Inlined
     // into `drive` (and through `mid`, two levels deep), the failing guard

@@ -82,14 +82,19 @@ struct FunctionSlot {
     /// Failed speculative guards since compilation (other bailouts, such as
     /// the native depth limit, do not count against speculation).
     speculation_failures: u32,
+    /// Speculative recompilations so far (each re-reads the profiles).
+    recompiles: u8,
 }
+
+/// Speculative recompilations before falling back to non-speculative code.
+const MAX_SPECULATIVE_RECOMPILES: u8 = 3;
 
 impl Default for FunctionSlot {
     fn default() -> Self {
         Self {
             hotness: 0, profile_retries: 0, state: FunctionState::Cold, entry: None,
             native_entries: 0, bailouts: 0, speculative: false, speculation_disabled: false,
-            speculation_failures: 0,
+            speculation_failures: 0, recompiles: 0,
         }
     }
 }
@@ -123,6 +128,8 @@ pub(super) struct WholeFunctionJit {
     /// recompilations, so the tracer handoff happens once per loop).
     wf_loop_counters: crate::napalm_collections::HashMap<u32,
         std::rc::Rc<std::cell::RefCell<crate::napalm_collections::HashMap<usize, usize>>>>,
+    /// Cranelift instructions of the last v2 body (diagnostics).
+    last_clif_insts: usize,
 }
 
 impl WholeFunctionJit {
@@ -354,6 +361,7 @@ impl WholeFunctionJit {
             active_depth: 0,
             stats: WholeFunctionJitStats::default(),
             wf_loop_counters: Default::default(),
+            last_clif_insts: 0,
         };
         Ok(result)
     }
@@ -374,12 +382,16 @@ impl WholeFunctionJit {
     }
 
     #[inline]
-    fn note_call(&mut self, function: u32) -> bool {
+    fn note_call(&mut self, function: u32, ops: usize) -> bool {
         self.stats.hot_calls = self.stats.hot_calls.saturating_add(1);
         let Some(slot) = self.slots.get_mut(function as usize) else { return false; };
         if slot.state != FunctionState::Cold { return false; }
         slot.hotness = slot.hotness.saturating_add(1);
-        slot.hotness >= self.threshold
+        // Compile cost grows with the body: larger functions must be called
+        // proportionally more often before compiling them pays off (their
+        // loops are the loop tracer's in the meantime).
+        let factor = (ops / 32).clamp(1, 32) as u32;
+        slot.hotness >= self.threshold.saturating_mul(factor)
     }
 
     /// Bailout feedback for one native entry of `function`.
@@ -390,12 +402,17 @@ impl WholeFunctionJit {
         slot.native_entries = slot.native_entries.saturating_add(1);
         if bailed_out { slot.bailouts = slot.bailouts.saturating_add(1); }
         // A speculative body whose guards keep failing replays work in the
-        // interpreter on every bailout: drop it and recompile it with the
-        // generic (rejoining) helper fallbacks once it is hot again.
+        // interpreter on every bailout: drop it and recompile once it is hot
+        // again. The first recompilations speculate anew on the current
+        // profiles (sites that turned polymorphic become generic calls);
+        // after that only the generic (rejoining) helper fallbacks remain.
         if bailed_out && slot.speculative && slot.speculation_failures >= 8
             && u64::from(slot.speculation_failures) * 64 >= u64::from(slot.native_entries)
         {
-            slot.speculation_disabled = true;
+            slot.recompiles = slot.recompiles.saturating_add(1);
+            if slot.recompiles > MAX_SPECULATIVE_RECOMPILES {
+                slot.speculation_disabled = true;
+            }
             slot.speculative = false;
             slot.state = FunctionState::Cold;
             slot.entry = None;
@@ -404,6 +421,15 @@ impl WholeFunctionJit {
             slot.bailouts = 0;
             slot.speculation_failures = 0;
             self.stats.deoptimized_functions = self.stats.deoptimized_functions.saturating_add(1);
+        } else if bailed_out && slot.bailouts >= 256
+            && u64::from(slot.bailouts) * 2 >= u64::from(slot.native_entries)
+        {
+            // Native code that leaves on most entries for other reasons
+            // (helpers declining, exceptions caught in the frame) costs more
+            // than it saves: leave the function to the interpreter and tracer.
+            slot.state = FunctionState::Rejected;
+            slot.entry = None;
+            self.stats.rejected_functions = self.stats.rejected_functions.saturating_add(1);
         }
     }
 
@@ -437,6 +463,7 @@ impl WholeFunctionJit {
         native_shape_read_pics: &crate::napalm_collections::HashMap<usize, NativeMapPropertyPic>,
         native_shape_write_pics: &crate::napalm_collections::HashMap<usize, NativeMapPropertyPic>,
         inline_callees: &crate::napalm_collections::HashMap<u32, wf_ir::WfFunctionData<'_>>,
+        manifest: Option<&crate::napalm_builtin::BuiltinManifest>,
     ) -> Result<(), String> {
         self.stats.compile_attempts = self.stats.compile_attempts.saturating_add(1);
         // Methods and constructors (`uses_this`) are eligible: their frame is
@@ -512,11 +539,17 @@ impl WholeFunctionJit {
                 trace_headers: function.jit_trace_headers.as_ptr() as usize,
                 shared_flag: offset_of!(Interpreter<'static>, heap) + offset_of!(Heap, shared_mode),
                 loop_counters: &counters,
+                manifest,
             };
             let events = std::env::var_os("NAPALM_JIT_EVENTS").is_some();
-            match wf_ir::build(&source).and_then(|ir| self.compile_v2(&ir, function, bytecode, small_map_fast_alloc)
-                .map(|entry| (entry, ir.inlined_calls, ir.summary())))
-            {
+            let started = std::time::Instant::now();
+            match wf_ir::build(&source).and_then(|ir| {
+                let built = started.elapsed();
+                self.compile_v2(&ir, function, bytecode, small_map_fast_alloc)
+                    .map(|entry| (entry, ir.inlined_calls, format!("{} ops={} insts={} build={:?} time={:?} clif={}",
+                        ir.summary(), function.ops.len(), ir.blocks.iter().map(|block| block.insts.len()).sum::<usize>(),
+                        built, started.elapsed(), self.last_clif_insts)))
+            }) {
                 Ok((entry, inlined_calls, summary)) => {
                     self.stats.v2_inlined_calls = self.stats.v2_inlined_calls.saturating_add(u64::from(inlined_calls));
                     let slot = &mut self.slots[function_index as usize];
@@ -1288,6 +1321,7 @@ impl WholeFunctionJit {
             wf_lower::lower_body(&mut b, ir, function, bytecode, fast_alloc, helpers);
             b.finalize(target_config);
         }
+        self.last_clif_insts = self.context.func.dfg.num_insts();
         let disasm = std::env::var_os("NAPALM_CRANELIFT_DISASM").is_some();
         self.context.set_disasm(disasm);
         self.module.define_function(body_id, &mut self.context)
@@ -3588,7 +3622,8 @@ unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeF
         return None;
     }
 
-    if unsafe { (*jit_ptr).note_call(target) } {
+    let ops = vm.prepared.functions[target as usize].ops.len();
+    if unsafe { (*jit_ptr).note_call(target, ops) } {
         let native_direct_method_class_slots: crate::napalm_collections::HashMap<ClassId, u32> =
             vm.prepared.class_by_id.iter().map(|(id, slot)| (*id, *slot)).collect();
         let mut native_direct_method_targets = crate::napalm_collections::HashMap::default();
@@ -3660,6 +3695,7 @@ unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeF
         let identity_sites = native_identity_sites(vm, target);
         let inline_callees = unsafe { collect_inline_callees(vm, target,
             &native_direct_method_class_slots, &native_direct_method_targets) };
+        let manifest = vm.concurrent_manifest.as_ref().map(|manifest| manifest as *const crate::napalm_builtin::BuiltinManifest);
         let prepared = vm.prepared.functions.as_ptr().add(target as usize);
         let bytecode = &vm.program.functions[target as usize] as *const BytecodeFunction;
         let constants = &vm.resolved_constants[target as usize] as *const Vec<RegisterWord>;
@@ -3678,6 +3714,7 @@ unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeF
                 &native_shape_read_pics,
                 &native_shape_write_pics,
                 &inline_callees,
+                manifest.map(|manifest| unsafe { &*manifest }),
             )
         } {
             unsafe { (*jit_ptr).reject(target); }
@@ -3738,6 +3775,7 @@ unsafe fn run_pushed_frame(
         jit.active_depth = jit.active_depth.saturating_sub(1);
         jit.note_native_result(target, result == WFJIT_BAILOUT);
     }
+    if result == WFJIT_BAILOUT { trace_bailout(vm, target); }
     if result == WFJIT_BAILOUT {
         // The native body deliberately handed control back to the interpreter at
         // the current bytecode PC. Leave the callee frame intact; the outer
@@ -4313,6 +4351,7 @@ unsafe extern "C" fn napalm_wfjit_native_self_call(
 
 unsafe extern "C" fn napalm_wfjit_direct_call(vm: *mut c_void, op_index: u32) -> *mut RegisterWord {
     let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    count_helper(vm, "direct", op_index);
     if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return std::ptr::null_mut(); }
     let caller_fiber = vm.current_fiber;
     let caller_depth = vm.fiber(caller_fiber).frames.len();
@@ -4358,6 +4397,7 @@ unsafe extern "C" fn napalm_wfjit_direct_call(vm: *mut c_void, op_index: u32) ->
             jit.active_depth = jit.active_depth.saturating_sub(1);
             jit.note_native_result(target, result == WFJIT_BAILOUT);
         }
+        if result == WFJIT_BAILOUT { trace_bailout(vm, target); }
         if result == WFJIT_BAILOUT {
             // Finish this callee in baseline so the native caller can resume with
             // the same direct-call ABI and a freshly relocated register base.
@@ -4421,6 +4461,7 @@ unsafe extern "C" fn napalm_wfjit_profiled_method(vm: *mut c_void, op_index: u32
 
 unsafe fn wfjit_direct_method_call(vm: *mut c_void, op_index: u32, target: u32) -> *mut RegisterWord {
     let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    count_helper(vm, "method", op_index);
     if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return std::ptr::null_mut(); }
     let caller_fiber = vm.current_fiber;
     let caller_depth = vm.fiber(caller_fiber).frames.len();
@@ -4466,6 +4507,7 @@ unsafe fn wfjit_direct_method_call(vm: *mut c_void, op_index: u32, target: u32) 
             jit.active_depth = jit.active_depth.saturating_sub(1);
             jit.note_native_result(target, result == WFJIT_BAILOUT);
         }
+        if result == WFJIT_BAILOUT { trace_bailout(vm, target); }
         if result == WFJIT_BAILOUT {
             // Finish this callee in baseline so the native caller can resume with
             // the same direct-call ABI and a freshly relocated register base.
@@ -4540,6 +4582,66 @@ unsafe extern "C" fn napalm_wfjit_small_map_literal(
     } else {
         std::ptr::null_mut()
     }
+}
+
+/// `NAPALM_WFJIT_HELPERS=1`: count helper executions per (helper, opcode)
+/// and print the histogram when the process exits (diagnostics).
+fn count_helper(vm: &Interpreter<'_>, helper: &'static str, op_index: u32) {
+    if !helper_counts_enabled() { return; }
+    let function = vm.hot_function_index as usize;
+    let opcode = vm.prepared.functions.get(function)
+        .and_then(|prepared| prepared.raw_pcs.get(op_index as usize).copied())
+        .and_then(|raw| vm.program.functions[function].chunk.code.get(raw as usize))
+        .and_then(|word| word.opcode());
+    let label = match (opcode, vm.prepared.functions.get(function).and_then(|p| p.quick_invokes.get(op_index as usize))) {
+        (Some(Opcode::Invoke), Some(site)) => match site.target {
+            CallTarget::Primitive(id) => format!("Invoke->{:?}",
+                vm.concurrent_manifest.as_ref().and_then(|manifest| manifest.primitive_kind(id))),
+            target => format!("Invoke->{target:?}").chars().take(60).collect(),
+        },
+        (opcode, _) => format!("{opcode:?}"),
+    };
+    if let Ok(mut guard) = HELPER_COUNTS.lock() {
+        *guard.get_or_insert_with(Default::default).entry((helper, label)).or_insert(0) += 1;
+    }
+}
+
+static HELPER_COUNTS: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, String), u64>>> =
+    std::sync::Mutex::new(None);
+
+fn helper_counts_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NAPALM_WFJIT_HELPERS").is_some())
+}
+
+impl Drop for WholeFunctionJit {
+    fn drop(&mut self) {
+        if !helper_counts_enabled() { return; }
+        if let Ok(guard) = HELPER_COUNTS.lock() {
+            if let Some(counts) = guard.as_ref() {
+                let mut rows: Vec<_> = counts.iter().collect();
+                rows.sort_by(|a, b| b.1.cmp(a.1));
+                for ((helper, opcode), count) in rows.into_iter().take(30) {
+                    eprintln!("[napalm-wfjit] helper {count:>9} {helper} {opcode}");
+                }
+            }
+        }
+    }
+}
+
+/// `NAPALM_WFJIT_BAILOUTS=1`: report where each native bailout resumes
+/// (diagnostics for deopt storms).
+#[cold]
+fn trace_bailout(vm: &Interpreter<'_>, target: u32) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("NAPALM_WFJIT_BAILOUTS").is_some()) { return; }
+    let function = vm.hot_function_index as usize;
+    let pc = vm.hot_pc as usize;
+    let opcode = vm.prepared.functions.get(function)
+        .and_then(|prepared| prepared.raw_pcs.get(pc).copied())
+        .and_then(|raw| vm.program.functions[function].chunk.code.get(raw as usize))
+        .and_then(|word| word.opcode());
+    eprintln!("[napalm-wfjit] bailout F{target} -> F{function}:{pc} {opcode:?}");
 }
 
 /// Inlined frames a v2 deopt rebuilds (outermost first); see
@@ -4622,6 +4724,7 @@ unsafe extern "C" fn napalm_wfjit_reconstruct_frames(
 /// interpreter state is authoritative and the native caller bails out).
 unsafe extern "C" fn napalm_wfjit_call_to_return(vm: *mut c_void, op_index: u32) -> *mut RegisterWord {
     let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    count_helper(vm, "call", op_index);
     if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return std::ptr::null_mut(); }
     let caller_fiber = vm.current_fiber;
     let caller_depth = vm.fiber(caller_fiber).frames.len();
@@ -4646,6 +4749,7 @@ unsafe extern "C" fn napalm_wfjit_call_to_return(vm: *mut c_void, op_index: u32)
 
 unsafe extern "C" fn napalm_wfjit_runtime_op(vm: *mut c_void, op_index: u32) -> *mut RegisterWord {
     let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    count_helper(vm, "op", op_index);
     if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return std::ptr::null_mut(); }
     let caller_fiber = vm.current_fiber;
     let caller_depth = vm.fiber(caller_fiber).frames.len();

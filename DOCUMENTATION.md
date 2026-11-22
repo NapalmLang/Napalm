@@ -1644,7 +1644,7 @@ There is no step parameter.
 | `count` | Count for traversal in steps of one. |
 | `toString` / `toString()` | Range representation. |
 
-Use finite endpoints to ensure iteration terminates. Wren operators
+Use finite endpoints to ensure iteration terminates. Napalm operators
 `1..5` and `1...5` **are not part of the current public syntax**.
 
 ### 11.2 List Slices
@@ -3877,7 +3877,7 @@ Do not use the following as though they were available features:
 - The general comma operator and `matrix[x, y]` subscripts.
 - Namespace imports, export-star, dynamic import, and require.
 - `#private` fields, object descriptors, and the JS prototype API.
-- Wren syntax `construct`, `is`, `..`/`...` ranges, trailing block closures
+- Napalm syntax `construct`, `is`, `..`/`...` ranges, trailing block closures
   on calls, and imports such as `import "x" for Name`.
 - `fn` declarations and Deferred APIs from old scripts.
 

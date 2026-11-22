@@ -64,6 +64,11 @@ impl BuiltinManifest {
         &self.bindings
     }
 
+    /// The builtin behind a primitive id (JIT specialization, diagnostics).
+    pub fn primitive_kind(&self, primitive: PrimitiveId) -> Option<BuiltinPrimitive> {
+        self.primitives.get(primitive.0 as usize).copied().flatten()
+    }
+
     fn register(
         &mut self,
         program: &mut Program,
@@ -152,7 +157,7 @@ enum DateStringFormat {
 
 #[derive(Clone, Copy, Debug)]
 #[derive(serde::Serialize, serde::Deserialize)]
-enum BuiltinPrimitive {
+pub(crate) enum BuiltinPrimitive {
     RandomNew,
     RandomInt,
     RangeCount,

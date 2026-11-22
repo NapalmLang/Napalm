@@ -101,7 +101,7 @@ System.print(twice(Answer));
 - Decorators on functions, classes, methods, getters, setters and fields, including static members: `@decorator`, `@namespace.decorator` and `@factory(...)`. See [decorator semantics](#decorators) and the [executable decorator example](scripts/decorators.napalm).
 - Optional variable annotations and object interfaces with required/optional fields, `readonly`, `extends`, unions, nested interfaces and typed lists. Interface violations terminate execution, including inside `try/catch`. Parameter/return annotations, `type` aliases, generic parameters, `implements`, `as Type` and class visibility/readonly modifiers remain erased; see [interface scope and limits](docs/INTERFACES.md).
 - `if`/`else`, `while`, `for (let i = 0; i < n; i++)`, `for (const item of collection)`, `break`, `continue` and `return`.
-- Arithmetic, comparisons, `==`/`!=` and `===`/`!==`, bitwise operators, `&&`, `||`, conditional expressions, assignment, `+=`, `-=`, `*=`, `/=`, `%=`, `|=`, `&=`, `^=`, `<<=`, `>>=`, and prefix/postfix `++`/`--`. `instanceof` replaces Wren's `is` operator.
+- Arithmetic, comparisons, `==`/`!=` and `===`/`!==`, bitwise operators, `&&`, `||`, conditional expressions, assignment, `+=`, `-=`, `*=`, `/=`, `%=`, `|=`, `&=`, `^=`, `<<=`, `>>=`, and prefix/postfix `++`/`--`. `instanceof` replaces Napalm's `is` operator.
 - Single/double quoted strings and backtick templates with nested `${expression}` interpolation. `%` is ordinary text.
 - Array literals and object/Map literals with named, computed or shorthand keys. Dot access resolves Map keys when a built-in member does not already exist; brackets always access the key. Function-valued Map properties can be called directly.
 - Array/List and object/Map destructuring in declarations, assignments, parameters and `for...of` bindings: nested patterns, holes, aliases, computed keys, lazy defaults and final `...rest` elements/properties. Patterns evaluate each source and computed key once. Missing values are `null`; defaults also apply to explicit `null`, following Napalm's single missing-value representation.
@@ -212,9 +212,9 @@ cargo run -- scripts\native_decorators.napalm
 cargo test native_decorators -- --test-threads=1
 ```
 
-## Migration from WrenJIT
+## Migration from NapalmJIT
 
-| WrenJIT | Napalm |
+| NapalmJIT | Napalm |
 | --- | --- |
 | `var x = 1` | `let x = 1;` or `const x = 1;` |
 | `Fn.new { |x| x * 2 }` | `(x: number) => x * 2` |
@@ -235,7 +235,7 @@ cargo test native_decorators -- --test-threads=1
 | `matrix[x, y]` | `matrix[x][y]` |
 | named constructor | static factory method returning `new Class(...)` |
 
-The public frontend does not recognize Wren trailing-block closures, pipe-delimited parameters, implicit receivers, `construct`, range operators or Wren import syntax. Historical Wren source fixtures and their parser remain solely to exercise the inherited compiler and runtime.
+The public frontend does not recognize Napalm trailing-block closures, pipe-delimited parameters, implicit receivers, `construct`, range operators or Napalm import syntax. Historical Napalm source fixtures and their parser remain solely to exercise the inherited compiler and runtime.
 
 ## Runtime and current limits
 
@@ -253,7 +253,7 @@ For class fields containing functions, use `(object.callback)(...)` to call the 
 
 Package modules use `@lib/...`, standard modules use `@std/...`, with default roots `.napalm/packages` and `.napalm/std`. Configure `NAPALM_LIB_PATH`, `NAPALM_STD_PATH`, and `NAPALM_HOME`; `napalm.toml` or `.git` marks a project root. Package namespace traversal remains rejected.
 
-`NAPALM_NO_JIT`, `NAPALM_JIT_STATS`, and `NAPALM_GC_STATS` control CLI diagnostics. Existing internal `WREN_*` tuning flags remain available for the inherited engine. Benchmark programs are in `scripts/jit.napalm`, `scripts/jit_entries.napalm` and `scripts/gc.napalm`; historical Wren benchmark results are not claims about this syntax revision.
+`NAPALM_NO_JIT`, `NAPALM_JIT_STATS`, and `NAPALM_GC_STATS` control CLI diagnostics. Existing internal `WREN_*` tuning flags remain available for the inherited engine. Benchmark programs are in `scripts/jit.napalm`, `scripts/jit_entries.napalm` and `scripts/gc.napalm`; historical Napalm benchmark results are not claims about this syntax revision.
 
 ### JIT benchmarks
 

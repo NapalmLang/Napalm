@@ -1,0 +1,9 @@
+import {parse} from "../src/parser";
+const files = ["lsp/src/lexer.napalm", "lsp/src/parser.napalm", "lsp/src/server.napalm", "lsp/src/documents.napalm", "lsp/src/positions.napalm", "lsp/src/transport.napalm", "lsp/src/intelligence.napalm", "lsp/src/semantic.napalm"];
+const sources = files.map(f => Fs.readText(f));
+for (let round = 0; round < 8; round++) {
+    const t0 = System.clock;
+    let nodes = 0;
+    for (const source of sources) { const output = parse(source); nodes += output.ast.body.length; }
+    System.print("round " + round + " " + nodes + " " + ((System.clock - t0) * 1000).floor + "ms");
+}

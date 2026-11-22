@@ -2864,7 +2864,7 @@ impl<'a> TraceRecorder<'a> {
                 builder.emit1(TraceInst::BoxInt32 { value: length }, TraceType::Num, TraceRep::Tagged)
             }
             TraceListMethod::Add => {
-                // Wren-style `add` returns the added element: no length read.
+                // Napalm-style `add` returns the added element: no length read.
                 let value = self.read_gpr(builder, op.args[0].0, TraceType::Any, TraceRep::Tagged)?;
                 builder.emit0(TraceInst::HeapListPush { list, value, exit });
                 value

@@ -4150,7 +4150,7 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Napalm historically allowed Wren-style class methods without a
+            // Napalm historically allowed Napalm-style class methods without a
             // keyword, while the TypeScript-like surface also accepts the explicit
             // `function name(...)` spelling used by ordinary declarations. Treat
             // `function` as a compatibility marker only; it does not change the

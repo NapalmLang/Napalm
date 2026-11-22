@@ -23,6 +23,13 @@
 
 use super::*;
 
+/// Pass scheduling, CFG/dominator analysis and the SSA verifier.
+#[path = "napalm_wf_ir_optimizer.rs"]
+mod wf_optimizer;
+/// Optimization passes over completed IR (run by `build`).
+#[path = "napalm_wf_ir_optimizing.rs"]
+mod wf_optimizing;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WfTy {
     /// A NaN-boxed Napalm value word.
@@ -44,6 +51,48 @@ pub(super) struct WfDeopt(pub(super) u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WfFloatBin { Add, Sub, Mul, Div }
+
+/// Builtin methods lowered natively behind a receiver class guard (see
+/// `WfInst::Primitive`). None of them collects, runs code or throws: the
+/// rare cases (out of range, non-integer index...) deoptimize so the
+/// interpreter re-executes the op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WfPrimitive {
+    /// `list.length` / `list.count` (F64).
+    ListCount,
+    /// `list[i]` for an in-bounds non-negative integer index (Tagged).
+    ListSubscript,
+    /// List iteration protocol: `iterate(cursor)`, `iteratorValue(cursor)`.
+    ListIterate,
+    ListIteratorValue,
+    /// `!bool` (Bool).
+    BoolNot,
+    /// `string == other` (Bool), pure leaf helper.
+    StringEq,
+    /// `string.codePointAt(i)` (Tagged: Number or null), pure leaf helper.
+    StringCodePointAt,
+    /// `bytes[i]` (Tagged Number), pure leaf helper.
+    BytesIndex,
+}
+
+impl WfPrimitive {
+    /// Arguments after the receiver.
+    fn arity(self) -> usize {
+        match self { WfPrimitive::ListCount | WfPrimitive::BoolNot => 0, _ => 1 }
+    }
+    /// The argument is used as an unboxed Number.
+    fn numeric_arg(self) -> bool {
+        matches!(self, WfPrimitive::ListSubscript | WfPrimitive::ListIteratorValue
+            | WfPrimitive::StringCodePointAt | WfPrimitive::BytesIndex)
+    }
+    fn result_ty(self) -> WfTy {
+        match self {
+            WfPrimitive::ListCount => WfTy::F64,
+            WfPrimitive::BoolNot | WfPrimitive::StringEq => WfTy::Bool,
+            _ => WfTy::Tagged,
+        }
+    }
+}
 
 /// Allocation ops lowered natively (see `WfInst::AllocObject`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +130,7 @@ pub(super) enum WfRuntimeHelper {
 /// of one loop (cumulative): hot loops then belong to the loop tracer.
 pub(super) const WF_LOOP_HANDOFF_ITERATIONS: u32 = 1000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum WfInst {
     /// Declared argument `n` (Tagged).
     Param(u16),
@@ -138,7 +187,8 @@ pub(super) enum WfInst {
     /// the reloaded `dest` GPR (Tagged), or a meaningless Bool.
     /// `next_op` is where the interpreter must stand afterwards; in functions
     /// with exception handlers anything else (a caught exception) bails out.
-    RuntimeOp { helper: WfRuntimeHelper, op_index: u32, next_op: u32, state: WfDeopt, dest: Option<u8> },
+    /// `clobbers`: the op is generic and may have written any GPR.
+    RuntimeOp { helper: WfRuntimeHelper, op_index: u32, next_op: u32, state: WfDeopt, dest: Option<u8>, clobbers: bool },
     /// Tagged GPR `reg` read from the top frame's bank. Only valid where the
     /// bank is known to exist and be current: right after a RuntimeOp, or at
     /// entry of a body that never runs as a nested native frame.
@@ -150,6 +200,10 @@ pub(super) enum WfInst {
     GuardClass { value: WfValue, class: u64, deopt: WfDeopt },
     /// Bool from a native self-call result that the body returned raw.
     AssumeBool(WfValue),
+    /// A builtin method on a receiver whose class was already guarded
+    /// (Tagged receiver; the argument is F64 when `kind.numeric_arg()`).
+    /// Deoptimizes at `deopt` on any case it does not handle.
+    Primitive { kind: WfPrimitive, receiver: WfValue, arg: Option<WfValue>, deopt: WfDeopt },
     /// Loop back edge bookkeeping (Bool, meaningless): counts iterations in
     /// the cell at `counter` and deoptimizes to the loop header (`deopt`)
     /// once the loop is hot enough for the tracer, when a loop trace exists
@@ -293,6 +347,36 @@ pub(super) struct WfSource<'a> {
     /// Iteration counter cell per loop header of the root (stable addresses,
     /// kept across recompilations of the same function).
     pub(super) loop_counters: &'a std::cell::RefCell<crate::napalm_collections::HashMap<usize, usize>>,
+    /// Builtin primitive identities (native builtin method lowering).
+    pub(super) manifest: Option<&'a crate::napalm_builtin::BuiltinManifest>,
+}
+
+/// A monomorphic Invoke site whose profiled target is a builtin the v2 tier
+/// lowers natively: (receiver class, primitive).
+fn native_primitive_site(
+    function: &PreparedFunction,
+    index: usize,
+    source: &WfSource<'_>,
+) -> Option<(u64, WfPrimitive)> {
+    use crate::napalm_builtin::BuiltinPrimitive as P;
+    let prepared = function.ops[index];
+    if prepared.flags & QUICK_GENERIC_DISABLED != 0 { return None; }
+    let site = function.quick_invokes.get(index)?;
+    if site.class.0 == 0 { return None; }
+    let kind = match site.target {
+        CallTarget::Primitive(id) => match source.manifest?.primitive_kind(id)? {
+            P::ListCount => WfPrimitive::ListCount,
+            P::ListSubscript => WfPrimitive::ListSubscript,
+            P::ListIterate => WfPrimitive::ListIterate,
+            P::ListIteratorValue => WfPrimitive::ListIteratorValue,
+            P::BoolNot => WfPrimitive::BoolNot,
+            // StringEq / StringCodePointAt / BytesIndex need leaf helpers
+            // (not wired yet).
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (prepared.c as usize == kind.arity()).then_some((site.class.0, kind))
 }
 
 /// Inlining limits: nesting depth, reachable ops per callee, total per root.
@@ -333,6 +417,8 @@ enum OpKind {
     FieldSet { object: u8, value: u8, slot: u32, class_key: u64 },
     /// Native allocation; operands are read from the bank (all GPRs).
     Alloc { dst: u8, kind: WfAllocKind, reads: Vec<u8> },
+    /// Monomorphic builtin method lowered natively.
+    Primitive { dst: u8, receiver: u8, arg: Option<u8>, class: u64, kind: WfPrimitive },
     /// Executed by a host helper unless `inline` is set and inlining succeeds.
     /// `guard`: receiver register and exact class the helper relies on.
     /// `generic`: the op's operands are not modelled; it reads every GPR and
@@ -361,6 +447,7 @@ impl OpKind {
             OpKind::FieldGet { object, .. } => vec![*object],
             OpKind::FieldSet { object, value, .. } => vec![*object, *value],
             OpKind::Runtime { reads, .. } | OpKind::Alloc { reads, .. } => reads.clone(),
+            OpKind::Primitive { receiver, arg, .. } => std::iter::once(*receiver).chain(*arg).collect(),
             _ => Vec::new(),
         }
     }
@@ -373,7 +460,7 @@ impl OpKind {
             | OpKind::LoadAbsolute { dst, .. }
             | OpKind::Numeric { dst, .. } | OpKind::Identity { dst, .. } | OpKind::MapGet { dst, .. }
             | OpKind::SelfCall { dst, .. } | OpKind::FieldGet { dst, .. }
-            | OpKind::Alloc { dst, .. } => Some(*dst),
+            | OpKind::Alloc { dst, .. } | OpKind::Primitive { dst, .. } => Some(*dst),
             OpKind::Runtime { write, .. } => *write,
             _ => None,
         }
@@ -393,6 +480,26 @@ fn call_args(function: &PreparedFunction, prepared: &PreparedOp) -> Result<Vec<u
 fn generic_call_opcode(opcode: Opcode) -> bool {
     matches!(opcode, Opcode::CallClosure | Opcode::InvokeSuper | Opcode::CallPrimitive
         | Opcode::InvokeSpread | Opcode::NewClassInstance)
+}
+
+/// Register operands of ops executed by their handler whose operand use is
+/// known (checked against the interpreter handlers): (written GPR, read
+/// GPRs). Anything else runs in the conservative generic mode.
+fn precise_operands(opcode: Opcode, op: &PreparedOp) -> Option<(Option<u8>, Vec<u8>)> {
+    use Opcode::*;
+    Some(match opcode {
+        ListGet | ListRemoveAt | MapGet | LoadProperty | IsInstance | StringCodePointAt | MakeRange
+        | IAdd | ISub | IMul | IDivS | IRemS | IBitAnd | IBitOr | IBitXor | IShl | IShrU | ISar
+        | FAdd | FSub | FMul | FDiv | FRem | ICmpEq | ICmpNe | ICmpLt | ICmpLe | ICmpGt | ICmpGe
+        | FCmpEq | FCmpNe | FCmpLt | FCmpLe | FCmpGt | FCmpGe | RefEq => (Some(op.a), vec![op.b, op.c]),
+        ListLen | LoadCell | AllocCell | AllocListCap
+        | INeg | IBitNot | FNeg | NumToInt32 | NumToF64 | Int32ToNum | F64ToNum => (Some(op.a), vec![op.b]),
+        StringConcat | StringSlice if op.x < 256 => (Some(op.a), vec![op.b, op.c, op.x as u8]),
+        ListSet | MapSet | StoreProperty => (None, vec![op.a, op.b, op.c]),
+        ListAppend | StoreCell => (None, vec![op.a, op.b]),
+        AllocList => (Some(op.a), Vec::new()),
+        _ => return None,
+    })
 }
 
 /// Every GPR of the frame (the operand set of a generic runtime op).
@@ -487,6 +594,9 @@ fn classify_ops(
                         dst: op.a, object: op.b,
                         entries: pic.entries.iter().map(|entry| (entry.shape, entry.slot as u32)).collect(),
                     }
+                } else if let Some((class, kind)) = native_primitive_site(function, index, source) {
+                    let arg = if kind.arity() == 1 { Some(call_args(function, &prepared)?[0]) } else { None };
+                    OpKind::Primitive { dst: op.a, receiver: op.b, arg, class, kind }
                 } else if let Some((class, target)) = profiled_direct_invoke_site(function, index) {
                     if native_self_calls && target == data.function_index {
                         method_self_call(index, &prepared, op.b, class.0)?
@@ -600,13 +710,21 @@ fn classify_ops(
             // `throw`: the handler unwinds; the helper reports no successor and
             // the body bails out (or a handler of this frame took over).
             Opcode::FiberAbort => generic(WfRuntimeHelper::Op),
+            other if precise_operands(other, &op).is_some() => {
+                let (write, reads) = precise_operands(other, &op).unwrap();
+                OpKind::Runtime { helper: WfRuntimeHelper::Op, reads, write, inline: None, guard: None, generic: false }
+            }
             // Anything else the interpreter can execute as one op against the
             // top frame (allocation, collections, strings, typed registers,
             // cells, properties...) runs through its handler.
             other if eligible_opcode(other)
                 && !matches!(other, Opcode::Switch | Opcode::Return2 | Opcode::Launch
-                    | Opcode::ImportModule | Opcode::ImportVariable | Opcode::Trap) =>
-                generic(WfRuntimeHelper::Op),
+                    | Opcode::ImportModule | Opcode::ImportVariable | Opcode::Trap) => {
+                if std::env::var_os("NAPALM_WFJIT_GENERIC").is_some() {
+                    eprintln!("[napalm-wfjit] generic {other:?}");
+                }
+                generic(WfRuntimeHelper::Op)
+            }
             other => return Err(format!("op {index}: {other:?} is not supported by WFJIT v2")),
         };
         if matches!(kind, OpKind::Jump { .. } | OpKind::JumpIf { .. }) {
@@ -752,6 +870,8 @@ struct PendingEdge {
     /// 0 = Jump / Branch.then, 1 = Branch.otherwise.
     slot: u8,
     state: Vec<Option<WfValue>>,
+    /// A helper ran since the method epoch was last checked on this path.
+    epoch_dirty: bool,
 }
 
 /// Translation mode of the function currently being translated.
@@ -793,6 +913,10 @@ struct Builder<'a> {
     loop_tagged: crate::napalm_collections::HashSet<(usize, u8)>,
     /// Registers this build found disagreeing: rebuild with them Tagged.
     loop_retry: Vec<(usize, u8)>,
+    /// A host helper ran (it may have rebound methods) since the method
+    /// epoch was last checked on the current path; epoch-dependent ops check
+    /// it again first.
+    epoch_dirty: bool,
 }
 
 /// `build_with` failure that asks for a rebuild with `loop_retry` applied.
@@ -853,6 +977,19 @@ impl Builder<'_> {
         let registers = registers_of(&self.state, live);
         self.out.deopts.push(WfDeoptState { op_index: op_index as u32, speculative, registers, frames: Vec::new() });
         Ok(WfDeopt(self.out.deopts.len() as u32 - 1))
+    }
+
+    /// Before an op whose speculation depends on the method epoch: re-check
+    /// it if a helper ran since the last check on this path.
+    fn ensure_epoch(&mut self, index: usize, live: &RegSet) -> Result<(), String> {
+        if self.epoch_dirty {
+            if let Some((expected, _)) = self.out.entry_epoch_guard {
+                let deopt = self.deopt(index, true, live)?;
+                self.emit(WfTy::Bool, WfInst::GuardEpoch { expected, deopt });
+            }
+            self.epoch_dirty = false;
+        }
+        Ok(())
     }
 
     fn read(&self, reg: u8, index: usize) -> Result<WfValue, String> {
@@ -1014,8 +1151,18 @@ impl Builder<'_> {
     }
 }
 
-/// Build the v2 IR, or explain why the function is not supported.
+/// Build and optimize the v2 IR, or explain why the function is not
+/// supported. `NAPALM_WFJIT_OPT=0` skips the optimization passes.
 pub(super) fn build(source: &WfSource<'_>) -> Result<WfFunction, String> {
+    let mut ir = build_unoptimized(source)?;
+    static OPTIMIZE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OPTIMIZE.get_or_init(|| std::env::var("NAPALM_WFJIT_OPT").ok().as_deref() != Some("0")) {
+        wf_optimizing::optimize(&mut ir).map_err(|error| format!("WF IR optimization: {error}"))?;
+    }
+    Ok(ir)
+}
+
+fn build_unoptimized(source: &WfSource<'_>) -> Result<WfFunction, String> {
     let function = source.root.function;
     // Native self-calls run nested frames without a register bank: they need
     // a replay-safe body (no stores, no host helpers, no captures read from
@@ -1157,6 +1304,7 @@ fn build_with(
         inline_chain: Vec::new(),
         loop_tagged: loop_tagged.clone(),
         loop_retry: Vec::new(),
+        epoch_dirty: false,
     };
     let unsupported = BuildError::Unsupported;
 
@@ -1187,7 +1335,7 @@ fn build_with(
     let needs_epoch = kinds.iter().flatten().any(|(kind, _)| matches!(kind,
         OpKind::Numeric { .. } | OpKind::Identity { .. } | OpKind::MapGet { .. }
         | OpKind::Runtime { inline: Some(_), .. } | OpKind::Runtime { guard: Some(_), .. }
-        | OpKind::SelfCall { receiver: Some((_, Some(_))), .. }));
+        | OpKind::SelfCall { receiver: Some((_, Some(_))), .. } | OpKind::Primitive { .. }));
     if needs_epoch {
         let live_in = live_sets(function, kinds);
         let deopt = builder.deopt(0, true, &live_in[0]).map_err(unsupported)?;
@@ -1298,7 +1446,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
             if order.position[target] <= rpo {
                 back_edge(builder, &headers, from, slot, target, state, &live_in[target])?;
             } else {
-                pending[target].push(PendingEdge { from, slot, state });
+                pending[target].push(PendingEdge { from, slot, state, epoch_dirty: builder.epoch_dirty });
             }
         }};
     }
@@ -1311,7 +1459,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 // The entry op heads a loop: the entry block jumps into it.
                 let current = builder.current.expect("entry block");
                 builder.terminate(WfTerminator::Jump(WfEdge { target: placeholder, args: Vec::new() }));
-                pending[0].push(PendingEdge { from: current, slot: 0, state: builder.state.clone() });
+                pending[0].push(PendingEdge { from: current, slot: 0, state: builder.state.clone(), epoch_dirty: builder.epoch_dirty });
             }
             let incoming = std::mem::take(&mut pending[index]);
             if incoming.is_empty() {
@@ -1319,6 +1467,8 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 continue;
             }
             let block = builder.new_block();
+            // Back edges are not known yet: a loop header assumes a helper ran.
+            let dirty = is_header[index] || incoming.iter().any(|edge| edge.epoch_dirty);
             // Merge: a live GPR with the same value on every edge stays; with
             // different values it becomes a block parameter; missing on any
             // edge means it is never read before being written again. At a
@@ -1362,6 +1512,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
             }
             builder.state = merged;
             builder.current = Some(block);
+            builder.epoch_dirty = dirty;
         }
         let mut index = start;
         loop {
@@ -1401,6 +1552,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 builder.state[dst as usize] = Some(value);
             }
             OpKind::Numeric { dst, lhs, rhs, quick } => {
+                builder.ensure_epoch(index, &live)?;
                 let mut deopt = None;
                 let left = builder.number(lhs, index, &mut deopt, &live)?;
                 let right = match rhs { Some(rhs) => Some(builder.number(rhs, index, &mut deopt, &live)?), None => None };
@@ -1432,6 +1584,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 builder.state[dst as usize] = Some(value);
             }
             OpKind::Identity { dst, lhs, rhs, classes, negate } => {
+                builder.ensure_epoch(index, &live)?;
                 let deopt = builder.deopt(index, true, &live)?;
                 let left = builder.read(lhs, index)?;
                 let left = builder.tagged(left)?;
@@ -1441,6 +1594,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 builder.state[dst as usize] = Some(value);
             }
             OpKind::MapGet { dst, object, entries } => {
+                builder.ensure_epoch(index, &live)?;
                 let deopt = builder.deopt(index, true, &live)?;
                 let object = builder.read(object, index)?;
                 let object = builder.tagged(object)?;
@@ -1452,6 +1606,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                     return Err(format!("op {index}: self-call inside an inlined body"));
                 }
                 let deopt = builder.deopt(index, false, &live)?;
+                if matches!(receiver, Some((_, Some(_)))) { builder.ensure_epoch(index, &live)?; }
                 let receiver_value = match receiver {
                     Some((reg, class)) => {
                         let value = builder.read(reg, index)?;
@@ -1514,6 +1669,23 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 });
                 if let Some(frame) = builder.inline.as_mut() { frame.effect_done = true; }
             }
+            OpKind::Primitive { dst, receiver, arg, class, kind } => {
+                builder.ensure_epoch(index, &live)?;
+                let deopt = builder.deopt(index, true, &live)?;
+                let receiver = builder.read(receiver, index)?;
+                let receiver = builder.tagged(receiver)?;
+                // Booleans are immediates: BoolNot checks the tag itself.
+                if kind != WfPrimitive::BoolNot {
+                    builder.emit(WfTy::Bool, WfInst::GuardClass { value: receiver, class, deopt });
+                }
+                let arg = match arg {
+                    Some(reg) if kind.numeric_arg() => { let mut guard = Some(deopt); Some(builder.number(reg, index, &mut guard, &live)?) }
+                    Some(reg) => { let value = builder.read(reg, index)?; Some(builder.tagged(value)?) }
+                    None => None,
+                };
+                let value = builder.emit(kind.result_ty(), WfInst::Primitive { kind, receiver, arg, deopt });
+                builder.state[dst as usize] = Some(value);
+            }
             OpKind::Alloc { dst, kind, .. } => {
                 if builder.inline.is_some() {
                     // Operand registers belong to the callee, not to the bank.
@@ -1524,6 +1696,10 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 builder.state[dst as usize] = Some(value);
             }
             OpKind::Runtime { helper, write, inline, guard, generic, .. } => {
+                // Inlined bodies and guarded direct calls rely on the epoch.
+                if inline.is_some() || guard.is_some() {
+                    builder.ensure_epoch(index, &live)?;
+                }
                 // Prefer inlining the call; on failure restore and call out.
                 let mut inlined = None;
                 if let Some(target) = &inline {
@@ -1566,7 +1742,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                     let dest = if generic { None } else { write };
                     let ty = if dest.is_some() { WfTy::Tagged } else { WfTy::Bool };
                     let result = builder.emit(ty, WfInst::RuntimeOp {
-                        helper, op_index: index as u32, next_op: next as u32, state, dest,
+                        helper, op_index: index as u32, next_op: next as u32, state, dest, clobbers: generic,
                     });
                     if generic {
                         // Unmodelled operands: every GPR live afterwards comes
@@ -1582,11 +1758,9 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                     } else if let Some(dst) = write {
                         builder.state[dst as usize] = Some(result);
                     }
-                    // The helper may have run code that rebinds methods.
-                    if let Some((expected, _)) = builder.out.entry_epoch_guard {
-                        let deopt = builder.deopt(next, true, &live_in[next])?;
-                        builder.emit(WfTy::Bool, WfInst::GuardEpoch { expected, deopt });
-                    }
+                    // The helper may have run code that rebinds methods: the
+                    // next epoch-dependent op checks again.
+                    builder.epoch_dirty = true;
                 }
             }
             OpKind::Jump { target } => {

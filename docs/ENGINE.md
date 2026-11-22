@@ -13,9 +13,9 @@ Napalm's performance does not come from a single optimization. The engine is des
 
 These are mostly compile-time engineering choices, but they keep runtime metadata compact and predictable.
 
-## 2. Wren IR: SSA for a dynamic language
+## 2. Napalm IR: SSA for a dynamic language
 
-The high-level/mid-level IR (WIR) is SSA-based and keeps Wren semantics explicit long enough for safe specialization.
+The high-level/mid-level IR (WIR) is SSA-based and keeps Napalm semantics explicit long enough for safe specialization.
 
 Key properties:
 
@@ -26,7 +26,7 @@ Key properties:
 - fixed instance-field slots;
 - explicit cells for captured mutable variables;
 - immutable captures passed directly by value;
-- internal `Int32`, `F64`, and raw-pointer representations that are not exposed as Wren source types;
+- internal `Int32`, `F64`, and raw-pointer representations that are not exposed as Napalm source types;
 - explicit guards, OSR/resume metadata, and deoptimization snapshots;
 - structured exception regions represented as metadata, not normal-path control opcodes.
 
@@ -139,7 +139,7 @@ around them and preserving exceptions and the native loop watchdog.
 - **2 return-transfer registers**;
 - a small special-register bank for `this`, closure, module, Fiber, error/resume values and scratch state.
 
-General registers are raw 64-bit slots and can contain either NaN-boxed Wren values or internal unboxed representations.
+General registers are raw 64-bit slots and can contain either NaN-boxed Napalm values or internal unboxed representations.
 
 ### Encoding
 
@@ -228,7 +228,7 @@ Repeated generic numeric invokes can be rewritten to direct numeric handlers for
 - shifts;
 - unary numeric operations.
 
-This removes repeated generic Wren method lookup on stable numeric sites.
+This removes repeated generic Napalm method lookup on stable numeric sites.
 
 ### Method dispatch caches
 
@@ -245,7 +245,7 @@ Dense `MethodSymbol`-indexed class method tables avoid hashing on cache misses.
 
 String-key Maps can use a shape/slot representation and their own four-entry PIC. A hit can resolve shape + slot without rehashing the key. Maps can fall back to the general dictionary representation when shape assumptions no longer fit.
 
-This makes repeated object-like Map access substantially cheaper while preserving Wren Map semantics.
+This makes repeated object-like Map access substantially cheaper while preserving Napalm Map semantics.
 
 ## 6. Precise moving StickyImmix GC
 
@@ -255,7 +255,7 @@ Important design choices:
 
 - per-PC reference maps identify exactly which VM registers contain managed references;
 - VM roots, Fiber state, globals, async state and event-loop payloads participate in root discovery;
-- a stable handle table lets a compact NaN-boxed `Value` survive object movement without rewriting every Wren value;
+- a stable handle table lets a compact NaN-boxed `Value` survive object movement without rewriting every Napalm value;
 - moving object addresses are reloaded after safepoints;
 - object descriptors precisely trace Lists, Maps, Cells, closures, instances, Fibers/async state and other managed object layouts;
 - object-remembering write barriers support generational collection;
@@ -292,7 +292,7 @@ The JIT is deliberately split into four layers:
 
 A compiled trace receives one compact activation structure containing pointers to architectural register banks and side-exit storage.
 
-Loop values such as induction variables and accumulators can remain in native registers for the entire native loop. Wren architectural registers do **not** need to be written back on every iteration.
+Loop values such as induction variables and accumulators can remain in native registers for the entire native loop. Napalm architectural registers do **not** need to be written back on every iteration.
 
 ### Sparse side exits
 
@@ -401,7 +401,7 @@ declined.
 
 ### Bounded language-call inlining
 
-The recorder can inline bounded Wren calls when it can prove the call target and safely reproduce the call/return path. Method-table epoch guards protect inlined dynamic dispatch assumptions.
+The recorder can inline bounded Napalm calls when it can prove the call target and safely reproduce the call/return path. Method-table epoch guards protect inlined dynamic dispatch assumptions.
 
 Every inlined guard exits to the caller's call instruction and replays it, so no exit may follow a callee effect. Within that rule:
 
@@ -488,7 +488,7 @@ Napalm's `try`/`catch` implementation uses protected ranges and handler metadata
 
 - catch blocks are cold handler entries;
 - exact error state is materialized at the catch safepoint;
-- call frames retain enough call-site information to unwind across Wren calls;
+- call frames retain enough call-site information to unwind across Napalm calls;
 - hot code inside a protected region remains traceable/JIT-able;
 - an actual exceptional edge returns to the baseline interpreter when required;
 - escape/SROA conservatively preserves objects whose exceptional state must remain observable.
@@ -506,9 +506,9 @@ The engine contains verifier/test infrastructure for:
 - exception handler ranges;
 - trace SSA and side-exit state;
 - interpreter/JIT differential execution;
-- original Wren checksum compatibility for core benchmark kernels.
+- original Napalm checksum compatibility for core benchmark kernels.
 
-For the existing `jit.wren`, the test suite already checks known Wren-compatible results for `integratePi`, `xorshift` and Mandelbrot with the JIT both disabled and enabled.
+For the existing `jit.Napalm`, the test suite already checks known Napalm-compatible results for `integratePi`, `xorshift` and Mandelbrot with the JIT both disabled and enabled.
 
 ---
 

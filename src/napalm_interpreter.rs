@@ -11925,7 +11925,15 @@ impl<'p> Interpreter<'p> {
         // No GC-capable operation occurs before push_frame_with_capture_words()
         // copies these immutable closure words into the callee register stack.
         let captures = std::slice::from_raw_parts(captures_ptr, capture_len);
+        if !self.whole_function_jit.as_ref().is_some_and(|jit| jit.may_enter(function)) {
+            self.enter_bytecode_call_with_capture_words(op, function, args, closure, captures);
+            return;
+        }
+        // Hot closures run in the whole-function tier like other callees.
+        let caller_fiber = self.current_fiber;
+        let caller_depth = self.fiber(caller_fiber).frames.len();
         self.enter_bytecode_call_with_capture_words(op, function, args, closure, captures);
+        function_jit::try_run_pushed_call(self, function, caller_fiber, caller_depth);
     }
 
     fn resume_promise_waiter(

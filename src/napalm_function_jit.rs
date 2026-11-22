@@ -102,6 +102,8 @@ pub(super) struct WholeFunctionJit {
     direct_call: cranelift::module::FuncId,
     direct_method: cranelift::module::FuncId,
     profiled_method: cranelift::module::FuncId,
+    call_to_return: cranelift::module::FuncId,
+    reconstruct_frames: cranelift::module::FuncId,
     small_map_literal: cranelift::module::FuncId,
     native_self_call: cranelift::module::FuncId,
     small_map_literal_regs: cranelift::module::FuncId,
@@ -117,6 +119,10 @@ pub(super) struct WholeFunctionJit {
     threshold: u32,
     active_depth: u32,
     stats: WholeFunctionJitStats,
+    /// v2 loop iteration counter cells per function (stable across
+    /// recompilations, so the tracer handoff happens once per loop).
+    wf_loop_counters: crate::napalm_collections::HashMap<u32,
+        std::rc::Rc<std::cell::RefCell<crate::napalm_collections::HashMap<usize, usize>>>>,
 }
 
 impl WholeFunctionJit {
@@ -137,6 +143,8 @@ impl WholeFunctionJit {
         builder.symbol("napalm_wfjit_direct_call", napalm_wfjit_direct_call as *const u8);
         builder.symbol("napalm_wfjit_direct_method", napalm_wfjit_direct_method as *const u8);
         builder.symbol("napalm_wfjit_profiled_method", napalm_wfjit_profiled_method as *const u8);
+        builder.symbol("napalm_wfjit_call_to_return", napalm_wfjit_call_to_return as *const u8);
+        builder.symbol("napalm_wfjit_reconstruct_frames", napalm_wfjit_reconstruct_frames as *const u8);
         builder.symbol("napalm_wfjit_small_map_literal", napalm_wfjit_small_map_literal as *const u8);
         builder.symbol("napalm_wfjit_native_self_call", napalm_wfjit_native_self_call as *const u8);
         builder.symbol(
@@ -193,6 +201,14 @@ impl WholeFunctionJit {
         let profiled_method_id = module
             .declare_function("napalm_wfjit_profiled_method", Linkage::Import, &profiled_method_sig)
             .map_err(|e| format!("cannot declare whole-function profiled method helper: {e}"))?;
+        let call_to_return_id = module
+            .declare_function("napalm_wfjit_call_to_return", Linkage::Import, &helper_sig)
+            .map_err(|e| format!("cannot declare whole-function generic call helper: {e}"))?;
+        let mut reconstruct_sig = module.make_signature();
+        for _ in 0..3 { reconstruct_sig.params.push(AbiParam::new(pointer)); } // vm, descriptor, values
+        let reconstruct_id = module
+            .declare_function("napalm_wfjit_reconstruct_frames", Linkage::Import, &reconstruct_sig)
+            .map_err(|e| format!("cannot declare whole-function frame reconstruction helper: {e}"))?;
         let small_map_id = module
             .declare_function("napalm_wfjit_small_map_literal", Linkage::Import, &helper_sig)
             .map_err(|e| format!("cannot declare whole-function small-map helper: {e}"))?;
@@ -317,6 +333,8 @@ impl WholeFunctionJit {
             direct_call: direct_id,
             direct_method: direct_method_id,
             profiled_method: profiled_method_id,
+            call_to_return: call_to_return_id,
+            reconstruct_frames: reconstruct_id,
             small_map_literal: small_map_id,
             native_self_call: native_self_call_id,
             small_map_literal_regs: small_map_regs_id,
@@ -335,6 +353,7 @@ impl WholeFunctionJit {
             threshold: if entry_threshold == 0 { u32::MAX } else { entry_threshold.max(MIN_WHOLE_FUNCTION_HOTNESS) },
             active_depth: 0,
             stats: WholeFunctionJitStats::default(),
+            wf_loop_counters: Default::default(),
         };
         Ok(result)
     }
@@ -423,11 +442,10 @@ impl WholeFunctionJit {
         // Methods and constructors (`uses_this`) are eligible: their frame is
         // built by the interpreter before entry, so `this` already sits in its
         // GPR (entry_this_dst) and in SpecialReg::This for GC and bailouts.
+        // Captures and exception handlers are v2-only (see below).
         if function.memoization.enabled()
             || function.is_async
             || function.is_concurrent
-            || function.capture_count != 0
-            || !function.exception_handlers.is_empty()
             || function.return_kind == RegisterKind::RawPtr
             || function.ops.is_empty()
             || function.ops.len() > MAX_WHOLE_FUNCTION_OPS
@@ -444,28 +462,97 @@ impl WholeFunctionJit {
         }
 
         let reachable = reachable_ops(function, bytecode);
-        for (index, op) in function.ops.iter().enumerate() {
+        let unsupported_invoke = |index: usize, opcode: Opcode| opcode == Opcode::Invoke
+            && native_numeric_quick(function, index).is_none()
+            && native_map_property_pic(function, index).is_none()
+            && identity_sites[index].is_none()
+            // Runtime-profiled InvokeMethodDirect (promoted by the VM).
+            && profiled_direct_invoke_site(function, index).is_none();
+        for index in 0..function.ops.len() {
             if !reachable[index] { continue; }
             let opcode = bytecode.chunk.code
                 .get(function.raw_pcs[index] as usize)
                 .and_then(|word| word.opcode())
                 .ok_or_else(|| format!("invalid opcode at prepared op {index}"))?;
-            let unsupported_invoke = opcode == Opcode::Invoke
-                && native_numeric_quick(function, index).is_none()
-                && native_map_property_pic(function, index).is_none()
-                && identity_sites[index].is_none()
-                // Runtime-profiled InvokeMethodDirect (promoted by the VM).
-                && profiled_direct_invoke_site(function, index).is_none();
             // A recursive descent can become hot before it has returned even
             // once, leaving the unwind path unprofiled. Retry after more calls
-            // instead of permanently rejecting a function on its first visit.
-            if unsupported_invoke && self.slots[function_index as usize].profile_retries < 4 {
+            // instead of settling for a generic call on its first visit, but
+            // only while the site can still be promoted to a direct call (not
+            // disabled as polymorphic, no host-primitive target).
+            let promotable = function.ops[index].flags & QUICK_GENERIC_DISABLED == 0
+                && function.quick_invokes.get(index)
+                    .is_none_or(|site| site.class.0 == 0 || matches!(site.target, CallTarget::Bytecode(_)));
+            if unsupported_invoke(index, opcode) && promotable
+                && self.slots[function_index as usize].profile_retries < 4
+            {
                 let slot = &mut self.slots[function_index as usize];
                 slot.hotness = 0;
                 slot.profile_retries += 1;
                 self.stats.profile_deferrals += 1;
                 return Ok(());
             }
+        }
+
+        // Prefer the typed-SSA v2 tier; functions it does not cover yet (or whose
+        // speculation failed too often) keep the v1 code generator below.
+        if wfjit_v2_enabled() && !self.slots[function_index as usize].speculation_disabled {
+            let counters = self.wf_loop_counters.entry(function_index).or_default().clone();
+            let root = wf_ir::WfFunctionData {
+                function_index, function, bytecode, constants,
+                reachable: reachable.clone(),
+                identity_sites: identity_sites.to_vec(),
+                plain_store_classes: native_plain_store_classes.clone(),
+            };
+            let source = wf_ir::WfSource {
+                root: &root,
+                callees: inline_callees,
+                expected_method_epoch,
+                class_slots: native_direct_method_class_slots,
+                method_targets: native_direct_method_targets,
+                trace_headers: function.jit_trace_headers.as_ptr() as usize,
+                shared_flag: offset_of!(Interpreter<'static>, heap) + offset_of!(Heap, shared_mode),
+                loop_counters: &counters,
+            };
+            let events = std::env::var_os("NAPALM_JIT_EVENTS").is_some();
+            match wf_ir::build(&source).and_then(|ir| self.compile_v2(&ir, function, bytecode, small_map_fast_alloc)
+                .map(|entry| (entry, ir.inlined_calls, ir.summary())))
+            {
+                Ok((entry, inlined_calls, summary)) => {
+                    self.stats.v2_inlined_calls = self.stats.v2_inlined_calls.saturating_add(u64::from(inlined_calls));
+                    let slot = &mut self.slots[function_index as usize];
+                    slot.state = FunctionState::Compiled;
+                    slot.entry = Some(entry);
+                    slot.speculative = true;
+                    slot.native_entries = 0;
+                    slot.bailouts = 0;
+                    slot.speculation_failures = 0;
+                    self.stats.compiled_functions = self.stats.compiled_functions.saturating_add(1);
+                    self.stats.v2_compiled_functions = self.stats.v2_compiled_functions.saturating_add(1);
+                    if events { eprintln!("[napalm-wfjit] v2 compiled {:?}: {summary}", function.id); }
+                    return Ok(());
+                }
+                Err(reason) => {
+                    if events { eprintln!("[napalm-wfjit] v2 declined {:?}: {reason}", function.id); }
+                }
+            }
+        }
+
+        // The v1 code generator supports neither captures nor handlers.
+        if function.capture_count != 0 || !function.exception_handlers.is_empty() {
+            if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
+                eprintln!("[napalm-wfjit] rejected {:?}: captures={} handlers={}",
+                    function.id, function.capture_count, function.exception_handlers.len());
+            }
+            self.reject(function_index);
+            return Ok(());
+        }
+        for (index, op) in function.ops.iter().enumerate() {
+            if !reachable[index] { continue; }
+            let opcode = bytecode.chunk.code
+                .get(function.raw_pcs[index] as usize)
+                .and_then(|word| word.opcode())
+                .ok_or_else(|| format!("invalid opcode at prepared op {index}"))?;
+            let unsupported_invoke = unsupported_invoke(index, opcode);
             if !eligible_opcode(opcode)
                 || unsupported_invoke
                 || (matches!(opcode, Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue)
@@ -479,44 +566,6 @@ impl WholeFunctionJit {
                 // GC polling without adding a second stack-map scheme.
                 self.reject(function_index);
                 return Ok(());
-            }
-        }
-
-        // Prefer the typed-SSA v2 tier; functions it does not cover yet (or whose
-        // speculation failed too often) keep the v1 code generator below.
-        if wfjit_v2_enabled() && !self.slots[function_index as usize].speculation_disabled {
-            let root = wf_ir::WfFunctionData {
-                function_index, function, bytecode, constants,
-                reachable: reachable.clone(),
-                identity_sites: identity_sites.to_vec(),
-                plain_store_classes: native_plain_store_classes.clone(),
-            };
-            let source = wf_ir::WfSource {
-                root: &root,
-                callees: inline_callees,
-                expected_method_epoch,
-                class_slots: native_direct_method_class_slots,
-                method_targets: native_direct_method_targets,
-            };
-            let events = std::env::var_os("NAPALM_JIT_EVENTS").is_some();
-            match wf_ir::build(&source).and_then(|ir| self.compile_v2(&ir, function).map(|entry| (entry, ir.inlined_calls))) {
-                Ok((entry, inlined_calls)) => {
-                    self.stats.v2_inlined_calls = self.stats.v2_inlined_calls.saturating_add(u64::from(inlined_calls));
-                    let slot = &mut self.slots[function_index as usize];
-                    slot.state = FunctionState::Compiled;
-                    slot.entry = Some(entry);
-                    slot.speculative = true;
-                    slot.native_entries = 0;
-                    slot.bailouts = 0;
-                    slot.speculation_failures = 0;
-                    self.stats.compiled_functions = self.stats.compiled_functions.saturating_add(1);
-                    self.stats.v2_compiled_functions = self.stats.v2_compiled_functions.saturating_add(1);
-                    if events { eprintln!("[napalm-wfjit] v2 compiled {:?}", function.id); }
-                    return Ok(());
-                }
-                Err(reason) => {
-                    if events { eprintln!("[napalm-wfjit] v2 declined {:?}: {reason}", function.id); }
-                }
             }
         }
 
@@ -1190,7 +1239,13 @@ impl WholeFunctionJit {
 
     /// Compile a v2 IR function: the typed-SSA body (tail convention, see
     /// `napalm_wfjit_lower.rs`) plus the host-ABI entry trampoline.
-    fn compile_v2(&mut self, ir: &wf_ir::WfFunction, function: &PreparedFunction) -> Result<WholeFunctionEntry, String> {
+    fn compile_v2(
+        &mut self,
+        ir: &wf_ir::WfFunction,
+        function: &PreparedFunction,
+        bytecode: &BytecodeFunction,
+        fast_alloc: Option<GcFastAllocationInfo>,
+    ) -> Result<WholeFunctionEntry, String> {
         let pointer = self.module.target_config().pointer_type();
         let mut entry_signature = self.module.make_signature();
         entry_signature.params.push(AbiParam::new(pointer));
@@ -1212,12 +1267,25 @@ impl WholeFunctionJit {
         self.function_context = FunctionBuilderContext::new();
         {
             let target_config = self.module.target_config();
-            let self_ref = self.module.declare_func_in_func(body_id, &mut self.context.func);
-            let speculation_ref = self.module.declare_func_in_func(self.speculation_failed, &mut self.context.func);
-            let runtime_ref = self.module.declare_func_in_func(self.runtime_op, &mut self.context.func);
-            let direct_ref = self.module.declare_func_in_func(self.direct_call, &mut self.context.func);
+            let func = &mut self.context.func;
+            let helpers = wf_lower::WfHelperRefs {
+                self_ref: self.module.declare_func_in_func(body_id, func),
+                speculation_failed: self.module.declare_func_in_func(self.speculation_failed, func),
+                runtime_op: self.module.declare_func_in_func(self.runtime_op, func),
+                direct_call: self.module.declare_func_in_func(self.direct_call, func),
+                direct_method: self.module.declare_func_in_func(self.direct_method, func),
+                profiled_method: self.module.declare_func_in_func(self.profiled_method, func),
+                call_to_return: self.module.declare_func_in_func(self.call_to_return, func),
+                profiled_small_map: self.module.declare_func_in_func(self.profiled_small_map, func),
+                profiled_small_map_commit: self.module.declare_func_in_func(self.profiled_small_map_commit, func),
+                bind_factory_contract: self.module.declare_func_in_func(self.bind_factory_contract, func),
+                small_map_literal_regs: self.module.declare_func_in_func(self.small_map_literal_regs, func),
+                specialized_factory: self.module.declare_func_in_func(self.specialized_factory, func),
+                reserved_typed_array: self.module.declare_func_in_func(self.reserved_typed_array, func),
+                reconstruct: self.module.declare_func_in_func(self.reconstruct_frames, func),
+            };
             let mut b = FunctionBuilder::new(&mut self.context.func, &mut self.function_context);
-            wf_lower::lower_body(&mut b, ir, function, self_ref, speculation_ref, runtime_ref, direct_ref);
+            wf_lower::lower_body(&mut b, ir, function, bytecode, fast_alloc, helpers);
             b.finalize(target_config);
         }
         let disasm = std::env::var_os("NAPALM_CRANELIFT_DISASM").is_some();
@@ -1287,16 +1355,25 @@ impl WholeFunctionJit {
             }
             let call = b.ins().call(body_ref, &arguments);
             let mut result = b.inst_results(call)[0];
-            if ir.returns_number {
-                // Raw f64 bits from the body: canonicalize NaN for the
-                // interpreter, but pass the bailout sentinel through.
-                let bits = b.ins().bitcast(types::F64, MemFlagsData::new(), result);
-                let is_nan = b.ins().fcmp(FloatCC::Unordered, bits, bits);
-                let bailout = b.ins().icmp_imm(IntCC::Equal, result, WFJIT_BAILOUT as i64);
-                let not_bailout = b.ins().bxor_imm(bailout, 1);
-                let canonicalize = b.ins().band(is_nan, not_bailout);
-                let canonical = b.ins().iconst(types::I64, CANONICAL_NAN as i64);
-                result = b.ins().select(canonicalize, canonical, result);
+            match ir.return_ty {
+                wf_ir::WfTy::F64 => {
+                    // Raw f64 bits from the body: canonicalize NaN for the
+                    // interpreter, but pass the bailout sentinel through.
+                    let bits = b.ins().bitcast(types::F64, MemFlagsData::new(), result);
+                    let is_nan = b.ins().fcmp(FloatCC::Unordered, bits, bits);
+                    let bailout = b.ins().icmp_imm(IntCC::Equal, result, WFJIT_BAILOUT as i64);
+                    let not_bailout = b.ins().bxor_imm(bailout, 1);
+                    let canonicalize = b.ins().band(is_nan, not_bailout);
+                    let canonical = b.ins().iconst(types::I64, CANONICAL_NAN as i64);
+                    result = b.ins().select(canonicalize, canonical, result);
+                }
+                wf_ir::WfTy::Bool => {
+                    // Raw 0/1 from the body: box it, passing the sentinel through.
+                    let bailout = b.ins().icmp_imm(IntCC::Equal, result, WFJIT_BAILOUT as i64);
+                    let boxed = b.ins().iadd_imm(result, TAG_FALSE as i64);
+                    result = b.ins().select(bailout, result, boxed);
+                }
+                wf_ir::WfTy::Tagged => {}
             }
             b.ins().return_(&[result]);
             b.switch_to_block(deopt);
@@ -4462,6 +4539,108 @@ unsafe extern "C" fn napalm_wfjit_small_map_literal(
         vm.hot_registers
     } else {
         std::ptr::null_mut()
+    }
+}
+
+/// Inlined frames a v2 deopt rebuilds (outermost first); see
+/// `WfDeoptState::frames`. Leaked per deopt site of a compiled body.
+pub(super) struct WfReconstruct {
+    pub(super) frames: Vec<WfReconstructFrame>,
+}
+
+pub(super) struct WfReconstructFrame {
+    pub(super) callee: u32,
+    pub(super) call_op: u32,
+    pub(super) resume_op: u32,
+    /// GPRs filled from consecutive words of the value buffer.
+    pub(super) registers: Vec<u8>,
+}
+
+/// v2 deopt after an effect inside inlined code. The caller has materialized
+/// the root frame at the outermost call op; enter each inlined call as the
+/// interpreter would (pushing the callee frame), fill the callee's live
+/// registers and point it at its resume op. The interpreter then continues
+/// in the innermost frame; returns flow back through the real frames.
+unsafe extern "C" fn napalm_wfjit_reconstruct_frames(
+    vm: *mut c_void,
+    descriptor: *const WfReconstruct,
+    values: *const u64,
+) {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    let descriptor = unsafe { &*descriptor };
+    let mut offset = 0usize;
+    for frame in &descriptor.frames {
+        if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return; }
+        let fiber = vm.current_fiber;
+        let depth = vm.fiber(fiber).frames.len();
+        let caller_function = vm.hot_function_index;
+        unsafe { vm.set_pc(frame.call_op); }
+        let op = unsafe { *vm.current_prepared().ops.get_unchecked(frame.call_op as usize) };
+        let raw_pc = unsafe { *vm.current_prepared().raw_pcs.get_unchecked(frame.call_op as usize) };
+        let opcode = vm.program.functions[caller_function as usize].chunk.code[raw_pc as usize].opcode();
+        let mut words = [RegisterWord(0); 17];
+        let count = if op.c <= 4 {
+            let mut small = [RegisterWord(0); 4];
+            let count = unsafe { vm.gather_call_words_small(&op, &mut small) };
+            words[..count].copy_from_slice(&small[..count]);
+            count
+        } else {
+            unsafe { vm.gather_call_words_large(&op, &mut words) }
+        };
+        match opcode {
+            Some(Opcode::CallDirect) => vm.enter_direct_bytecode_call(&op, frame.callee, &words[..count], None),
+            Some(Opcode::Invoke | Opcode::InvokeMethodDirect) => {
+                let receiver = unsafe { vm.reg(op.b) };
+                vm.enter_bytecode_call(&op, frame.callee, Some(receiver), &words[..count], None);
+            }
+            _ => {}
+        }
+        if vm.run_state != RunState::Running || vm.current_fiber != fiber
+            || vm.fiber(fiber).frames.len() != depth + 1 || vm.hot_function_index != frame.callee
+        {
+            let op = unsafe { *vm.current_prepared().ops.get_unchecked(frame.call_op as usize) };
+            vm.fail_at(&op, "whole-function deoptimization could not rebuild an inlined frame");
+            return;
+        }
+        for &reg in &frame.registers {
+            unsafe { *vm.hot_registers.add(reg as usize) = RegisterWord(*values.add(offset)); }
+            offset += 1;
+        }
+        let root_map = vm.current_prepared().gc_map_by_op[frame.resume_op as usize];
+        unsafe {
+            (*vm.hot_frame).root_map = root_map;
+            vm.set_pc(frame.resume_op);
+        }
+    }
+}
+
+/// v2: run any call op of the top frame to completion through the
+/// interpreter's generic call path (polymorphic Invoke, InvokeSuper, closures,
+/// primitives, constructors). Callees entered this way still tier up through
+/// the ordinary entry hooks. Returns the current bank when the interpreter is
+/// back in this frame exactly at the op's successor, otherwise null (the
+/// interpreter state is authoritative and the native caller bails out).
+unsafe extern "C" fn napalm_wfjit_call_to_return(vm: *mut c_void, op_index: u32) -> *mut RegisterWord {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running || vm.hot_frame.is_null() { return std::ptr::null_mut(); }
+    let caller_fiber = vm.current_fiber;
+    let caller_depth = vm.fiber(caller_fiber).frames.len();
+    let caller_function = vm.hot_function_index;
+    let expected_next = unsafe { vm.current_prepared().original_ops.get_unchecked(op_index as usize).next };
+    unsafe { vm.set_pc(op_index); }
+    match vm.trace_execute_call_to_return() {
+        Ok(step) if step.running && !step.frame_changed
+            && vm.current_fiber == caller_fiber
+            && vm.fiber(caller_fiber).frames.len() == caller_depth
+            && vm.hot_function_index == caller_function
+            && vm.hot_pc == expected_next => vm.hot_registers,
+        Ok(_) => std::ptr::null_mut(),
+        Err(error) => {
+            // Report like the interpreter would at this op.
+            let op = unsafe { *vm.current_prepared().ops.get_unchecked(op_index as usize) };
+            unsafe { vm.fail_at(&op, error.message); }
+            std::ptr::null_mut()
+        }
     }
 }
 

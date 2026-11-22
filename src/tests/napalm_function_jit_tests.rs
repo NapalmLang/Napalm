@@ -80,7 +80,9 @@ fn napalm_whole_function_trees_survive_gc_and_shape_bailouts() {
             let stats = vm.whole_function_jit_stats().unwrap();
             assert!(stats.compiled_functions >= 2, "{stats:?}");
             assert!(stats.native_recursive_calls > 1000, "{stats:?}");
-            assert!(stats.inlined_recursive_sites >= 4, "{stats:?}");
+            // v1 unrolls one recursion level; v2 recurses natively with
+            // shadow banks for the allocating `make`.
+            assert!(stats.inlined_recursive_sites >= 4 || stats.v2_compiled_functions >= 2, "{stats:?}");
         }
         assert!(vm.native_shadow_top.is_null());
     }
@@ -246,6 +248,146 @@ fn napalm_whole_function_v2_inlines_guarded_methods_and_replays_on_miss() {
     let stats = vm.whole_function_jit_stats().unwrap();
     assert!(stats.v2_inlined_calls >= 1, "{stats:?}");
     assert!(vm.native_shadow_top.is_null());
+}
+
+/// Run `source` in the interpreter and with only the whole-function tier
+/// (loop traces off, entry traces never install), assert equal `result`
+/// values and return the WFJIT stats.
+fn whole_function_only_run(source: &str) -> WholeFunctionJitStats {
+    let (program, entry, manifest) = whole_function_program(source);
+    let mut baseline = source_vm(&program, &manifest);
+    baseline.set_jit_options(None);
+    baseline.run_module(entry).unwrap();
+    let value = last_source_variable(&baseline);
+    let expected = HostContext { heap: &mut baseline.heap }.format_value(value);
+    let mut vm = source_vm(&program, &manifest);
+    vm.set_jit_options(Some(TracingJitOptions {
+        hot_entry_threshold: 2,
+        hot_loop_threshold: u32::MAX,
+        min_entry_trace_bytecodes: u32::MAX,
+        llvm_hot_threshold: 0,
+        ..Default::default()
+    }));
+    vm.run_module(entry).unwrap();
+    let value = last_source_variable(&vm);
+    assert_eq!(HostContext { heap: &mut vm.heap }.format_value(value), expected,
+        "whole-function JIT changed the result");
+    assert!(vm.native_shadow_top.is_null(), "native roots leaked after returning");
+    vm.whole_function_jit_stats().unwrap()
+}
+
+#[test]
+fn napalm_whole_function_v2_compiles_loops() {
+    // Counted, nested, early-exit and allocating loops; a loop-carried value
+    // that changes type (retyped header parameter); a loop long enough to be
+    // handed to the tracer mid-run.
+    // `one` is a mutable module variable: it keeps the numeric functions out
+    // of automatic memoization.
+    let stats = whole_function_only_run(r#"
+        let one = 0;
+        one = 1;
+        function sumTo(n) { let s = 0; for (let i = one; i <= n; i++) s += i; return s; }
+        function nested(n) { let s = 0; for (let i = 0; i < n; i += one) { for (let j = 0; j < i; j++) s += j; } return s; }
+        function pushLoop(n) { const xs = []; for (let i = 0; i < n; i++) xs.push(i * 2); return xs.length + xs[n - 1]; }
+        function retype(n) { let s: any = 0; for (let i = 0; i < n; i++) { s = s + i; if (i == 5) s = 'x'; } return s; }
+        function early(xs) { for (const x of xs) { if (x > 3) return x; } return -1; }
+        function main() {
+            let total = 0;
+            for (let i = 0; i < 300; i++) {
+                total += sumTo(i % 40) + nested(i % 12) + pushLoop(i % 9 + 1);
+                total += early([1, 2, i % 6, 9]);
+            }
+            const strings = [];
+            for (let i = 0; i < 100; i++) strings.push(retype(8 + i % 3));
+            return [total, sumTo(5000), strings[99], strings[50]];
+        }
+        const result = main();
+    "#);
+    assert!(stats.v2_compiled_functions >= 4, "{stats:?}");
+}
+
+#[test]
+fn napalm_whole_function_v2_closures_handlers_and_dispatch() {
+    // Polymorphic dispatch through the interpreter's call path, method
+    // self-calls (static and dispatched), raw Boolean recursion, closures with
+    // captures, exceptions thrown by callees and caught in a compiled frame
+    // (the handler reads a value defined before `try`), recursion with field
+    // stores, and allocation.
+    let stats = whole_function_only_run(r#"
+        let one = 0;
+        one = 1;
+        class Cat { speak() { return 1; } }
+        class Dog { speak() { return 2; } }
+        class Cow { speak() { return 3; } }
+        function chorus(a, b) { return a.speak() + b.speak() * 10; }
+        class Calc {
+            constructor(base) { this.base = base; }
+            fact(n) { if (n <= one) return this.base; return n * this.fact(n - one); }
+        }
+        function even(n) { if (n == 0) return true; if (n == one) return false; return even(n - 2); }
+        function makeAdder(k) { return x => x + k; }
+        function check(a, b) { if (b == 0) throw 'div0'; return a / b; }
+        function safeDiv(a, b) {
+            const fallback = a * 1000;
+            try { return check(a, b); } catch (e) { return fallback; }
+        }
+        class Acc { constructor() { this.count = 0; } }
+        function walk(depth, acc) {
+            acc.count = acc.count + 1;
+            if (depth > 0) { walk(depth - 1, acc); walk(depth - 1, acc); }
+            return acc.count;
+        }
+        function point(x, y) { return {x: x, y: y}; }
+        function main() {
+            const animals = [new Cat(), new Dog(), new Cow()];
+            let total = 0;
+            for (let i = 0; i < 600; i++) total += chorus(animals[i % 3], animals[(i + 1) % 3]);
+            const calc = new Calc(2);
+            let facts = 0;
+            for (let i = 0; i < 400; i++) facts += calc.fact(10);
+            let evens = 0;
+            for (let i = 0; i < 400; i++) if (even(i % 50)) evens++;
+            const add5 = makeAdder(5);
+            let adds = 0;
+            for (let i = 0; i < 600; i++) adds += add5(i);
+            let divs = 0;
+            for (let i = 0; i < 600; i++) divs += safeDiv(i, i % 7);
+            let walks = 0;
+            for (let i = 0; i < 200; i++) walks += walk(5, new Acc());
+            let points = 0;
+            for (let i = 0; i < 600; i++) { const p = point(i, i + 1); points += p.x + p.y; }
+            return [total, facts, evens, adds, divs, walks, points, even(7), safeDiv(3, 0)];
+        }
+        const result = main();
+    "#);
+    assert!(stats.v2_compiled_functions >= 8, "{stats:?}");
+}
+
+#[test]
+fn napalm_whole_function_v2_rebuilds_inlined_frames_after_effects() {
+    // `touch` stores before a guard that fails for Map arguments. Inlined
+    // into `drive` (and through `mid`, two levels deep), the failing guard
+    // cannot replay the call; the deopt rebuilds the inlined frames and the
+    // interpreter resumes after the store, which must happen exactly once.
+    let stats = whole_function_only_run(r#"
+        class Counter { constructor() { this.n = 0; this.v = 1; } }
+        class Item { constructor(v) { this.v = v; } }
+        function touch(c, x) { c.n = c.n + 1; return x.v + c.v; }
+        function mid(c, x) { return touch(c, x) * 2; }
+        function drive(c, x) { return touch(c, x) + 1; }
+        function drive2(c, x) { return mid(c, x) + 1; }
+        function main() {
+            const c = new Counter();
+            const item = new Item(3);
+            const map = {v: 10};
+            let sum = 0;
+            for (let i = 0; i < 400; i++) sum += drive(c, item) + drive2(c, item);
+            for (let i = 0; i < 20; i++) sum += drive(c, i % 2 == 0 ? map : item) + drive2(c, map);
+            return [sum, c.n];
+        }
+        const result = main();
+    "#);
+    assert!(stats.v2_inlined_calls >= 2, "{stats:?}");
 }
 
 #[test]

@@ -316,31 +316,63 @@ their normal tracing entry and loop paths.
 
 ### Whole-function tier v2: typed SSA
 
-Functions whose operations it fully understands are compiled by the typed-SSA
-generation of the whole-function tier. Everything else keeps the v1 code
-generator. `NAPALM_WFJIT_V2=0` disables v2. `NAPALM_JIT_EVENTS=1` reports, for
-each function, whether v2 compiled it or why it declined.
+The typed-SSA generation of the whole-function tier is tried first; v1 remains
+the fallback (and the non-speculative tier after repeated deopts).
+`NAPALM_WFJIT_V2=0` disables v2. `NAPALM_JIT_EVENTS=1` reports, for each
+function, whether v2 compiled it (with a summary: return type, parameter types,
+native self-calls, helpers, allocations, back edges, inlined calls) or why it
+declined.
 
 - **IR** (`src/napalm_wfjit_ir.rs`). A backend-neutral IR with blocks, typed block
   parameters (`Tagged`, `F64`, `Bool`), one value per instruction and explicit
-  deoptimization states. It is built in one pass over the acyclic bytecode graph,
-  with backward liveness. Cranelift lowers it in `src/napalm_wfjit_lower.rs`; the
-  IR is designed so that an LLVM lowering can consume it as well.
-- **No register bank.** Napalm GPRs are SSA values. Numbers stay unboxed `f64`.
-  NaN is canonicalized only when a value becomes a tagged word again.
+  deoptimization states. Basic blocks are translated in reverse postorder, with
+  backward liveness iterated to a fixpoint. Cranelift lowers it in
+  `src/napalm_wfjit_lower.rs`; the IR is designed so that an LLVM lowering can
+  consume it as well.
+- **No register bank.** Napalm GPRs are SSA values. Numbers stay unboxed `f64`,
+  `true`/`false` stay unboxed Booleans. NaN is canonicalized only when a value
+  becomes a tagged word again.
 - **When registers reach memory.** The live GPRs are stored only when the
-  interpreter or the GC can observe them: a deoptimization, or a host helper call
-  (`RuntimeOp`, top frame only).
+  interpreter or the GC can observe them: a deoptimization, a host helper call
+  (`RuntimeOp`, top frame only), an allocation, or a native self-call of an
+  allocating recursion.
+- **Coverage.** Natively: moves, constants, module loads, branches, loops,
+  numeric quickening, identity, Map PICs, class fields, small literals and typed
+  arrays (inline TLAB path), self-calls, inlining. Calls run through helpers that
+  let the callee tier up: `CallDirect` (direct call), profiled monomorphic
+  `Invoke` and resolved `InvokeMethodDirect` (receiver class guarded natively),
+  and everything else (polymorphic `Invoke`, `InvokeSuper`, `CallClosure`,
+  `CallPrimitive`, `new`) through the interpreter's generic call path, run to
+  completion. Any other op v1 accepts, plus `throw`, executes through its own
+  handler; its operands are not modelled, so it reads every GPR and every GPR
+  live afterwards is reloaded from the bank.
 - **Deoptimization.** A failed guard (type, shape, class, epoch) materializes the
   live GPRs into the interpreter-owned top frame and resumes at the guarded op.
-  Nested native frames have no bank: they unwind, and the top frame replays its
-  outermost self-call. That requires a replay-safe body, so functions mixing
-  self-calls with stores or helper calls are left to v1.
+  Nested native frames unwind and the top frame replays its outermost self-call,
+  so native recursion needs a replay-safe body (no stores, no host helpers;
+  allocation is fine). Otherwise calls to itself go through the direct-call
+  helper, which gives every level a real interpreter frame.
 - **Native self-call ABI.** The body uses Cranelift's `tail` convention,
-  `(vm, frame, depth, args...)`. A parameter becomes an unboxed `F64` when every
-  self-call passes a Number. A function whose returns are all Numbers returns raw
-  `f64` bits. The host-ABI entry trampoline checks the method epoch, unboxes the
-  specialized parameters (with guards) and canonicalizes the result.
+  `(vm, frame, depth, args...[, this])`; methods recurse through a static
+  `CallDirect` or a dispatched call guarded on the receiver class. A parameter
+  becomes an unboxed `F64` when every self-call passes a Number. When every
+  return is a Number (or a Boolean) the body returns raw `f64` bits (or 0/1) and
+  self-call results stay unboxed. The host-ABI entry trampoline checks the method
+  epoch, unboxes the specialized parameters (with guards) and boxes the result.
+- **Allocating recursion.** With allocation in a natively recursive body, nested
+  frames get a register bank on the native stack, linked as a GC shadow frame;
+  before each self-call a frame publishes its live registers and root map.
+- **Loops.** Loop headers carry every live GPR as a block parameter, typed as on
+  entry until a back edge disagrees (then rebuilt as `Tagged`). Each back edge
+  counts iterations: after 1000 (once per loop), whenever a loop trace exists for
+  the header, or when the heap goes shared, the body deopts to the header so the
+  interpreter, the loop tracer or the shared-mode quantum takes over.
+- **Exception handlers and closures.** With handlers, every GPR is treated as
+  live (handlers are reached by edges liveness does not see) and after each
+  helper the interpreter must stand at the op's successor; otherwise a handler of
+  this frame caught an exception and the body leaves. Closure captures are read
+  from their registers at entry; hot closures enter the tier through the closure
+  call path.
 - **Deopt policy.** Repeated speculative failures, but not depth-limit bailouts,
   drop the function back to the non-speculative v1 tier.
 - **Inliner.** Callees are translated into the caller's IR (call-site arguments
@@ -352,15 +384,16 @@ each function, whether v2 compiled it or why it declined.
 
   The callee bodies are collected up front: a breadth-first search, 3 levels
   deep, of at most 24 callees. Limits: depth 3, 96 ops per callee and 480
-  inlined ops per root. A guard that fails inside an inlined body deoptimizes
-  to the caller's call op, so the interpreter replays the whole call. This is
-  why there is no guard after an effect: once an inlined body has stored
-  anything, a later guard would replay the store, and the inline is declined
-  instead. The rule also applies to the enclosing inline frames. Other
-  declines:
-  - stores inside inlines when the root has self-calls (nested frames replay
+  inlined ops per root. Before any effect, a guard that fails inside an inlined
+  body deoptimizes to the caller's call op, so the interpreter replays the whole
+  call. After an effect (a store) replaying is wrong, so the deopt rebuilds the
+  inlined frames instead. The runtime enters each inlined call as the
+  interpreter would, fills the callee registers and resumes the innermost frame
+  at the failed op. Declines:
+  - recursive inlining (a callee already being translated);
+  - stores inside inlines when the root recurses natively (nested frames replay
     the outermost self-call);
-  - host helper calls inside an inlined body;
+  - host helper calls, allocations and loops inside an inlined body;
   - memoized callees that make calls.
 
   A declined site stays a `RuntimeOp`. `NAPALM_JIT_EVENTS=1` prints each

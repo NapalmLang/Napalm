@@ -23356,6 +23356,8 @@ var result = ok * 1000 + failed * 100 + xs.length;
 
     #[test]
     fn out_of_line_ternary_arm_is_if_converted() {
+        use crate::napalm_trace_ir::{TraceInst, TraceKind, TraceValueOrigin};
+
         // The bytecode optimizer lays the cold `: 1` arm of `cost` out of line
         // (after the return, jumping back). It must still become a Select:
         // one side exit per character match would dominate the loop.
@@ -23401,13 +23403,27 @@ var result = total;
             results.push(source_result(&vm).to_bits());
             if native {
                 let stats = vm.jit_stats().unwrap();
-                // As a guard, `cost` = 0 (a character match) leaves the root
-                // trace and grows side traces for the rest of the iteration
-                // (~5 side traces, ~210 exits here). As a Select it stays in
-                // the root trace (~1 side trace, ~80 exits: loop ends).
                 assert!(stats.native_entries > 0, "{stats:?}");
-                assert!(stats.side_exits < 150, "{stats:?}");
-                assert!(stats.side_traces_compiled <= 2, "{stats:?}");
+                // Check `cost` itself: aggregate exit/side-trace counts also
+                // depend on GC and tiering while other tests are running.
+                let jit = vm.jit.as_ref().unwrap();
+                assert!(jit.compiled_traces_for_test().any(|trace| {
+                    if !matches!(trace.anchor.kind, TraceKind::Loop) { return false; }
+                    let is_number = |value, expected: f64| {
+                        match trace.value(trace.canonical_value(value)).map(|v| &v.origin) {
+                            Some(TraceValueOrigin::Constant(TraceConstant::NumBits(bits)
+                                | TraceConstant::F64Bits(bits))) => f64::from_bits(*bits) == expected,
+                            Some(TraceValueOrigin::Constant(TraceConstant::Int32(value))) =>
+                                f64::from(*value) == expected,
+                            _ => false,
+                        }
+                    };
+                    trace.nodes.iter().any(|node| {
+                        let TraceInst::Select { if_true, if_false, .. } = node.kind else { return false; };
+                        (is_number(if_true, 0.0) && is_number(if_false, 1.0))
+                            || (is_number(if_true, 1.0) && is_number(if_false, 0.0))
+                    })
+                }), "missing root-trace Select for the 0/1 cost: {stats:?}");
             }
         }
         assert_eq!(results[0], results[1], "{} vs {}", f64::from_bits(results[0]), f64::from_bits(results[1]));

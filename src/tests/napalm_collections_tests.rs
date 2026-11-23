@@ -167,11 +167,14 @@ fn napalm_collections_instance_subscript_reads_and_writes_fields_by_name() {
 
 #[test]
 fn napalm_collections_instance_subscript_is_reactive() {
+    // Keep the selector immediate: a heap-valued dependency (such as a string
+    // field holding the key) is conservatively invalidated after any GC,
+    // including one requested by another test, and may add an evaluation.
     run_napalm(r#"
         let evaluations = 0;
         class Counter {
-            constructor() { this.hot = 1; this.cold = 100; this.key = 'hot'; }
-            computed doubled() { evaluations++; return this[this.key] * 2; }
+            constructor() { this.hot = 1; this.cold = 100; this.useCold = false; }
+            computed doubled() { evaluations++; return this[this.useCold ? 'cold' : 'hot'] * 2; }
         }
         const c = new Counter();
         const first = [c.doubled, c.doubled];
@@ -179,6 +182,7 @@ fn napalm_collections_instance_subscript_is_reactive() {
         const second = [c.doubled, c.doubled];
         c.hot = 7;                       // subscript read was tracked
         const third = c.doubled;
+        System.gc();
         c['cold'] = 200;                 // unrelated field: still cached
         const result = [first, second, third, c.doubled, evaluations];
     "#, "[[2, 2], [10, 10], 14, 14, 3]");
@@ -758,10 +762,68 @@ fn shared_whole_function_helper_parks_until_the_lock_is_released() {
 
 #[test]
 fn napalm_collections_contended_shared_lock_parks_tasks() {
-    // One long operation (spreading a large shared List) holds the lock for
-    // longer than the 1 ms spin budget, so contending workers park their task
-    // and are resumed when the lock is released.
-    let before = crate::napalm_interpreter::vm_mutex_parked_tasks();
+    use crate::napalm_bytecode::{ArgReg, IncomingSource, ParameterBinding};
+
+    let mut asm = Assembler::new();
+    asm.emit_abc(Opcode::ListSpread, 2, 0, 1);
+    asm.emit_a(Opcode::Return, 0);
+    let mut chunk = asm.finish().unwrap();
+    let mut references = ReferenceMap::default();
+    references.set_general(Reg(0), true);
+    references.set_general(Reg(1), true);
+    chunk.safepoints.push(SafepointEntry {
+        pc: BytecodePc(0), kind: SafepointKind::RuntimeMutation, references,
+    });
+    let mut program = simple_program(chunk, 3);
+    program.functions[0].kind = FunctionKind::Closure;
+    program.functions[0].arity = 2;
+    for reg in 0..2 {
+        program.functions[0].frame.parameters.push(ParameterBinding {
+            source: IncomingSource::Argument(ArgReg(reg)),
+            destination: Reg(reg), kind: RegisterKind::Value,
+        });
+    }
+    let mut vm = Interpreter::new(&program).unwrap();
+    vm.set_jit_options(None);
+    let _roots = vm.gc_root_registration();
+    let destination = vm.heap.alloc(HeapObject::List(Vec::new()));
+    vm.add_root(destination);
+    let source = vm.heap.alloc(HeapObject::List(vec![Value::TRUE, Value::FALSE]));
+    vm.add_root(source);
+    vm.heap.shared_mode = true;
+    vm.heap.mark_shared_deep(source);
+    vm.is_concurrent_worker = true;
+    let handle = source.heap_handle().unwrap();
+
+    // Hold the source lock until this specific task has parked. Large copies
+    // and concurrent launches do not guarantee contention under every schedule,
+    // and a process-wide parking counter can be changed by unrelated tests.
+    assert!(vm_mutex::VmAdaptativeMutex::try_lock(&vm.heap.handle_table.entry(handle).sync));
+    let result = vm.run_function(FuncId(0), &[destination, source]).unwrap();
+    assert!(matches!(result, ExecutionResult::Suspended(_)));
+    assert_eq!(vm.blocked_on_shared_lock(), Some(handle));
+    assert!(matches!(vm.heap.get(destination), Some(HeapObject::List(values)) if values.is_empty()));
+    assert!(vm.held_locks.is_empty());
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let notification = wakes.clone();
+    assert!(vm.park_blocked_task(Box::new(move || {
+        notification.fetch_add(1, Ordering::Release);
+    })).is_ok());
+    assert_eq!(wakes.load(Ordering::Acquire), 0);
+    vm_mutex::VmAdaptativeMutex::unlock(handle, &vm.heap.handle_table.entry(handle).sync);
+    assert_eq!(wakes.load(Ordering::Acquire), 1);
+
+    assert!(matches!(vm.resume_blocked_task().unwrap(), ExecutionResult::Returned(value) if value == destination));
+    assert!(matches!(vm.heap.get(destination), Some(HeapObject::List(values)) if values == &[Value::TRUE, Value::FALSE]));
+    assert_eq!(vm.blocked_on_shared_lock(), None);
+    assert!(vm.held_locks.is_empty());
+    assert!(!vm.shared_op_active);
+    assert_eq!(wakes.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn napalm_collections_shared_list_spread_and_push_are_consistent() {
     run_napalm(r#"
         const shared m = new Map();
         const big = [];
@@ -784,7 +846,6 @@ fn napalm_collections_contended_shared_lock_parks_tasks() {
         for (let i = 1; i < pending.length; i++) pushed += await pending[i];
         const result = [pushed, m.get('big').length, copied >= 6 * 200000];
     "#, "[300, 200300, true]");
-    assert!(crate::napalm_interpreter::vm_mutex_parked_tasks() > before, "no task parked");
 }
 
 #[test]

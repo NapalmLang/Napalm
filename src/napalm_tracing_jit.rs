@@ -14215,6 +14215,11 @@ impl TracingJit {
         self.compiled(id).map(|compiled| &compiled.trace)
     }
 
+    #[cfg(test)]
+    pub(crate) fn compiled_traces_for_test(&self) -> impl Iterator<Item = &Trace> {
+        self.traces.iter().flatten().map(|compiled| &compiled.trace)
+    }
+
     pub fn disassembly(&self, id: TraceId) -> Option<String> {
         self.compiled(id)
             .and_then(|compiled| compiled.debug_text.clone())

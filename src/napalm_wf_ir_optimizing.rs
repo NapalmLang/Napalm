@@ -1302,6 +1302,12 @@ impl WfOptimization for Predicates {
             };
             f.blocks[b].terminator = Some(WfTerminator::Jump(if taken { then } else { otherwise }));
         }
+        if changed {
+            // Each pass must leave verifiable SSA. Pruned edges can strand
+            // blocks whose operands/snapshots no longer have a dominator;
+            // remove them before the scheduler verifies this pass's output.
+            ControlFlow.run(f, analyses);
+        }
         changed
     }
 }
@@ -2252,6 +2258,8 @@ mod wf_opt_tests {
 
     #[test]
     fn dominated_predicate_removes_infeasible_effect() {
+        use super::super::wf_optimizer::{Analyses, WfOptimization, verify};
+
         let mut f = function(
             &[Tagged, Bool, Bool, Tagged, Tagged],
             &[Tagged],
@@ -2275,6 +2283,13 @@ mod wf_opt_tests {
             ],
         );
         f.deopts.push(state(9, &[(0, v(0))]));
+        // Check the pass boundary explicitly, including in release tests where
+        // the pipeline does not verify every intermediate representation.
+        verify(&f).unwrap();
+        let mut pruned = f.clone();
+        assert!(super::Predicates.run(&mut pruned, &mut Analyses::default()));
+        verify(&pruned).unwrap();
+        assert!(!all(&pruned).any(|inst| matches!(inst, GuardEpoch { .. })));
         optimize(&mut f).unwrap();
         assert!(f.deopts.is_empty());
         assert_eq!(

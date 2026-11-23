@@ -28,8 +28,9 @@ use std::collections::HashMap;
 use std::hash::{Hash as _, Hasher};
 use wasmtime_environ::{
     BuiltinFunctionIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, GetPtrSize,
-    ModuleInternedTypeIndex, ModuleTypesBuilder, NUM_COMPONENT_CONTEXT_SLOTS, PtrSize as _,
-    RuntimeDataIndex, StaticModuleIndex, VMOffsets, VmctxArrayIndex as _, WasmCompositeInnerType,
+    MemoryIndex, ModuleInternedTypeIndex, ModuleTypesBuilder, NUM_COMPONENT_CONTEXT_SLOTS,
+    PtrSize as _, RuntimeDataIndex, StaticModuleIndex, VMOffsets, VmctxArrayIndex as _,
+    WasmCompositeInnerType,
     component::{
         ComponentBuiltinFunctionIndex, LoweredIndex, ResourceIndex, RuntimeCallbackIndex,
         RuntimeComponentInstanceIndex, RuntimeMemoryIndex, RuntimePostReturnIndex,
@@ -43,8 +44,6 @@ enum VmType {
     VMStoreContext,
     VMMemoryDefinition,
     VMTableDefinition,
-    // NB: this is currently only referenced by macro-generated
-    // `AliasRegions` helpers that are not all wired up to call sites yet.
     #[allow(
         dead_code,
         reason = "generated uniformly for all VM types via `for_each_vm_type!`"
@@ -86,6 +85,20 @@ enum VmType {
         reason = "generated uniformly for all VM types via `for_each_vm_type!`"
     )]
     VMAsanStackSupport,
+    VMResourceIndex,
+    VMHandleTable,
+    VMHandleTableSlot,
+    VMTypedResource,
+    #[allow(
+        dead_code,
+        reason = "generated uniformly for all VM types via `for_each_vm_type!`"
+    )]
+    VMScope,
+    #[allow(
+        dead_code,
+        reason = "generated uniformly for all VM types via `for_each_vm_type!`"
+    )]
+    VMTransmitLocalState,
 }
 
 /// A key that uniquely identifies an alias region across an entire compilation.
@@ -191,6 +204,9 @@ enum AliasRegionKey {
 
     /// An access of an exception object's tag-defined word.
     GcExnTagDefined,
+
+    /// An access of the shadow bytes of a linear memory, for watchpoints.
+    ShadowMemory,
 }
 
 impl AliasRegionKey {
@@ -667,6 +683,7 @@ macro_rules! define_vm_type_alias_region_helpers {
     // and is marked `#[aggregate]` in `for_each_vm_type!` so that no accessor is
     // generated for it at all.
     (@field_ty $pt:expr, VmPtr < $g:ty >) => { $pt };
+    (@field_ty $pt:expr, VmPtr < VmPtr < $g:ty >>) => { $pt };
     (@field_ty $pt:expr, Option < VmPtr < $g:ty >>) => { $pt };
     (@field_ty $pt:expr, AtomicUsize) => { $pt };
     (@field_ty $pt:expr, usize) => { $pt };
@@ -1003,6 +1020,7 @@ macro_rules! define_vm_type_alias_region_helpers {
     (@munch_enum $Name:ident $snake:ident $tag:ident { $($vs:tt)* }
         $(#[doc = $vdoc:literal])*
         #[snake_name = $vsnake:ident]
+        $(#[$vattr:meta])*
         $Variant:ident { $($vbody:tt)* } = $disc:literal ,
         $($rest:tt)*
     ) => {
@@ -1129,6 +1147,7 @@ macro_rules! define_vmctx_alias_region_helpers {
     // pointer type as an `ir::Type`).
     (@field_ty $pt:expr, u32) => { ir::types::I32 };
     (@field_ty $pt:expr, VmPtr < $g:ident >) => { $pt };
+    (@field_ty $pt:expr, VmPtr < VmPtr < $g:ident >>) => { $pt };
     (@field_ty $pt:expr, VMSharedTypeIndex) => { ir::types::I32 };
     (@field_ty $pt:expr, AtomicU64) => { ir::types::I64 };
     (@field_ty $pt:expr, unsafe extern "C" fn) => { $pt };
@@ -1710,6 +1729,12 @@ where
     /// `memory.init` and `array.{new,init}_data`).
     pub fn data_segment_region(&mut self, func: &mut ir::Function) -> ir::AliasRegion {
         self.region(func, AliasRegionKey::DataSegment)
+    }
+
+    /// Get the alias region for the shadow bytes of linear memories, which
+    /// watchpoint checks read before stores.
+    pub fn shadow_memory_region(&mut self, func: &mut ir::Function) -> ir::AliasRegion {
+        self.region(func, AliasRegionKey::ShadowMemory)
     }
 }
 

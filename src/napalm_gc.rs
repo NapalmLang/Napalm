@@ -470,6 +470,11 @@ impl Collector {
         let mut builder = MMTKBuilder::new();
         assert!(builder.set_option("plan", "StickyImmix"));
         assert!(builder.set_option("full_heap_system_gc", "false"));
+        // Every allocation path writes the complete Header and the payload
+        // (ManagedObject / caller-initialized variable objects), so Immix need
+        // not memset fresh pages and recycled lines first. That memset was a
+        // third of allocation-heavy loops (it also took the first-touch faults).
+        assert!(builder.set_option("immix_zero_memory", "false"));
         assert!(builder.set_option("threads", &config.workers.to_string()));
         assert!(builder.set_option(
             "gc_trigger",
@@ -693,6 +698,12 @@ fn sweep_ids(
             .external_bytes
             .fetch_sub(released_external, Ordering::Relaxed);
     }
+}
+
+/// Number of completed collections of the process-wide collector (0 before
+/// it exists). Root providers use it to scope per-epoch state.
+pub fn collection_epoch() -> u64 {
+    GC.get().map_or(0, |collector| collector.collection_count())
 }
 
 fn gc() -> &'static Collector {
@@ -1204,6 +1215,29 @@ impl Mutator {
                 .barrier
                 .object_reference_write_slow(owner.0, slot, slot.decode(value));
         }
+    }
+
+    /// Number of completed collections. It only changes across a safepoint, so
+    /// a mutator can tag per-epoch state (e.g. remembered handles) with it.
+    #[inline]
+    pub fn collection_epoch(&self) -> u64 {
+        self.gc.collection_count()
+    }
+
+    /// Whether `object` still carries StickyImmix's unlog bit, i.e. it is a
+    /// mature object that has not been logged this epoch. Young objects (the
+    /// Immix space is mixed-age: allocation leaves the bit clear, surviving a
+    /// trace sets it) and mature objects already in the modified buffer report
+    /// false; pre-tenured spaces allocate with the bit set.
+    ///
+    /// # Safety
+    /// `object` must be a live object of this heap.
+    #[inline]
+    pub unsafe fn is_unlogged(&self, object: Object) -> bool {
+        Model::GLOBAL_LOG_BIT_SPEC
+            .as_spec()
+            .load_atomic::<Binding, u8>(object.0, None, Ordering::SeqCst)
+            != 0
     }
 
     /// Marks `owner` as probably modified. This is the cheapest correct barrier

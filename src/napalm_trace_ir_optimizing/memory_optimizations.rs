@@ -5,10 +5,10 @@
 //! are much simpler and therefore permit stronger forwarding.
 
 use super::*;
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{SmallMap, SmallSet};
 
 fn execution_order(trace: &Trace) -> Vec<usize> {
-    let preheader: HashSet<_> = trace.preheader.iter().copied().collect();
+    let preheader = PreheaderMask::new(trace);
     trace
         .preheader
         .iter()
@@ -40,11 +40,45 @@ pub struct ArchitecturalLoadForwarding;
 
 impl TraceOptimization for ArchitecturalLoadForwarding {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut frames = HashMap::<(FrameSlot, TraceRep), TraceValueId>::default();
-        let mut absolute = HashMap::<u64, TraceValueId>::default();
+        let mut frames = SmallMap::<(FrameSlot, TraceRep), TraceValueId>::default();
+        let mut absolute = SmallMap::<u64, TraceValueId>::default();
         let mut changed = false;
 
+        // A preheader fact reaches the top of every iteration only if the
+        // body never writes that slot/address: the body's writes follow their
+        // consumers in this linear order but precede them on the next
+        // iteration. (The verifier keeps frame/absolute accesses out of the
+        // preheader today; this keeps the walk correct if that changes.)
+        let preheader = PreheaderMask::new(trace);
+        let looping = !preheader.is_empty() && matches!(trace.terminator, TraceTerminator::LoopBack);
+        let mut body_barrier = false;
+        let mut body_slots = SmallSet::<FrameSlot>::default();
+        let mut body_addresses = SmallSet::<u64>::default();
+        if looping {
+            for node in trace.nodes.iter().filter(|node| !preheader.contains(&node.id)) {
+                match &node.kind {
+                    TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } => body_barrier = true,
+                    TraceInst::CommitFrameSlot { slot, .. } => { body_slots.insert(*slot); }
+                    TraceInst::StoreAbsoluteValue { address, .. } => { body_addresses.insert(*address); }
+                    _ => {}
+                }
+            }
+        }
+        let mut in_body = preheader.is_empty();
+
         for id in execution_order(trace) {
+            if !in_body && !preheader.contains(&id) {
+                in_body = true;
+                if looping {
+                    if body_barrier {
+                        frames.clear();
+                        absolute.clear();
+                    } else {
+                        frames.retain(|(slot, _), _| !body_slots.contains(slot));
+                        absolute.retain(|address, _| !body_addresses.contains(address));
+                    }
+                }
+            }
             let kind = trace.nodes[id].kind.clone();
             match kind {
                 TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } => {
@@ -129,7 +163,7 @@ pub struct DeadStoreElimination;
 
 impl TraceOptimization for DeadStoreElimination {
     fn optimize_trace(&mut self, trace: &mut Trace) -> bool {
-        let mut pending = HashMap::<DeadStoreKey, usize>::default();
+        let mut pending = SmallMap::<DeadStoreKey, usize>::default();
         let mut changed = false;
 
         for id in execution_order(trace) {
@@ -180,8 +214,13 @@ impl TraceOptimization for DeadStoreElimination {
 }
 
 /// Complete redundant-load elimination for the two memory namespaces modeled
-/// by Trace IR: heap/container loads (`LoadStorePRE`) and architectural VM/global
-/// loads (`ArchitecturalLoadForwarding`).
+/// by Trace IR: heap/container loads (`LoadStorePRE`, including loop-carried
+/// reuse across the backedge) and architectural VM/global loads
+/// (`ArchitecturalLoadForwarding`).
+///
+/// Both linear walks run preheader then body; facts cross the loop header only
+/// when no body store can change them, so the pass is valid at any point of
+/// the pipeline, including after guard/load hoisting has filled the preheader.
 #[derive(Default)]
 pub struct RedundantLoadElimination;
 

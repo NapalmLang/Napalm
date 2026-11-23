@@ -1,0 +1,29 @@
+const db = Database.open(DatabaseMode.Memory);
+if (db.getVersion() < 1) {
+    db.execute([[[
+        CREATE TABLE users (id Number PRIMARY KEY, name String NOT NULL);
+        CREATE INDEX users_name ON users (name);
+        SET VERSION 1;
+    ]]]);
+}
+
+if (db.getVersion() < 2) {
+    db.execute([[[
+        UPDATE TABLE users ADD COLUMN active Bool NOT NULL DEFAULT true;
+        SET VERSION 2;
+    ]]]);
+}
+
+const name = "Ada";
+db.execute([[[
+    INSERT INTO users (id, name, active)
+    VALUES (1, $name, true), (2, 'Grace', true);
+]]]);
+
+const id = 1;
+const rows = db.execute([[[
+    UPDATE users SET name = 'Ada Lovelace' WHERE id = $id;
+    SELECT id, name FROM users WHERE active ORDER BY name;
+]]]);
+for (const row of rows) System.print(row.name);
+db.close();

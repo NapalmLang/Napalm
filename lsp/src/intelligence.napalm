@@ -1,0 +1,961 @@
+// Gradual, side-effect-free type inference and LSP code intelligence.
+// All analysis is implemented in Napalm; unknown information remains unknown.
+import {recordForUri} from "./module_index";
+import {offsetAt} from "./positions";
+
+const MAX_TYPE_DEPTH = 32;
+const MAX_COMPLETIONS = 200;
+const LANGUAGE_KEYWORDS = "let const var function class interface type enum if else for while do " +
+    "return throw try catch finally break continue async await concurrent launch " +
+    "import export from as new null true false this super typeof instanceof " +
+    "extends implements computed static readonly public private protected defer errdefer";
+const ENGINE_GLOBALS = "System Process Fs Path Uri JSON Bytes ByteBuffer Array List Map Set " +
+    "Object Number String Boolean Date Promise Timer Random Range Event Emitter Channel Receiver";
+const BUILTIN_TYPES = "any unknown never null void number string boolean Number String Boolean " +
+    "Array List Map Set Promise Bytes ByteBuffer File FileInfo InputStream OutputStream";
+
+function at(node, field) {
+    if (node === null) return null;
+    return node[field];
+}
+
+function shape(name) {
+    return {name: name, members: new Map(), returns: null, parameters: [], classNode: null};
+}
+
+function property(target, name, value, kind) {
+    if (name !== null && name.length > 0) target.members.set(name, {type: value, kind: kind});
+}
+
+function functionShape(parameters, result) {
+    const t = shape("Function");
+    t.parameters = parameters;
+    t.returns = result;
+    return t;
+}
+
+function descriptor(t) {
+    if (t === null) return "unknown";
+    if (t.name === "Function") {
+        const params = [];
+        for (const p of t.parameters) params.push(p.name + ": " + p.type);
+        return "(" + params.join(", ") + ") => " + descriptor(t.returns);
+    }
+    return t.name;
+}
+
+function combine(a, b) {
+    if (a === null) return b;
+    if (b === null) return a;
+    if (a.name === b.name) return a;
+    if (a.name === "unknown" || b.name === "unknown") return shape("unknown");
+    if (a.name === "any" || b.name === "any") return shape("any");
+    const names = [];
+    const seen = new Set();
+    for (const source of [a.name, b.name]) {
+        for (const part of source.split(" | ")) {
+            if (!seen.has(part) && part !== "Null") {
+                names.push(part);
+                seen.add(part);
+            }
+        }
+    }
+    for (const source of [a.name, b.name]) {
+        for (const part of source.split(" | ")) {
+            if (part === "Null" && !seen.has("Null")) {
+                names.push("Null");
+                seen.add("Null");
+            }
+        }
+    }
+    return primitiveMembers(shape(names.join(" | ")));
+}
+
+function method(result, params) {
+    return functionShape(params, shape(result));
+}
+
+function primitiveMembers(t) {
+    if (t.name === "String") {
+        property(t, "length", shape("Number"), 10);
+        property(t, "utf8Length", shape("Number"), 10);
+        property(t, "utf16Length", shape("Number"), 10);
+        property(t, "isEmpty", shape("Boolean"), 10);
+        for (const name of "trim trimStart trimEnd toUpperCase toLowerCase toString repeat padStart padEnd replace replaceAll slice substring".split(" ")) {
+            property(t, name, method("String", []), 2);
+        }
+        for (const name of "startsWith endsWith contains includes".split(" ")) {
+            property(t, name, method("Boolean", []), 2);
+        }
+        for (const name of "indexOf lastIndexOf codePointAt hashCode".split(" ")) {
+            property(t, name, method("Number", []), 2);
+        }
+        property(t, "split", method("Array<String>", []), 2);
+    } else if (t.name === "Array") {
+        property(t, "length", shape("Number"), 10);
+        for (const name of "push unshift".split(" ")) property(t, name, method("Number", []), 2);
+        for (const name of "pop shift".split(" ")) property(t, name, method("unknown", []), 2);
+        property(t, "count", shape("Number"), 10);
+        property(t, "isEmpty", shape("Boolean"), 10);
+        for (const name of "removeAt remove find add insert reduce forEach clear".split(" ")) property(t, name, method("unknown", []), 2);
+        for (const name of "slice fill concat reverse sort map filter".split(" ")) property(t, name, method("Array", []), 2);
+        for (const name of "indexOf findIndex".split(" ")) property(t, name, method("Number", []), 2);
+        for (const name of "includes some every".split(" ")) property(t, name, method("Boolean", []), 2);
+        property(t, "join", method("String", []), 2);
+    } else if (t.name === "Map" || t.name === "Object") {
+        property(t, "get", method("unknown", []), 2);
+        property(t, "has", method("Boolean", []), 2);
+        property(t, "set", method("Map", []), 2);
+        property(t, "keys", method("Array<String>", []), 2);
+        property(t, "values", method("Array", []), 2);
+    } else if (t.name === "Bytes" || t.name === "ByteBuffer") {
+        property(t, "length", shape("Number"), 10);
+        property(t, "toUtf8", method("String", []), 2);
+        property(t, "slice", method("Bytes", []), 2);
+    }
+    return t;
+}
+
+function builtinType(name) {
+    const t = shape(name);
+    if (name === "Path") {
+        for (const methodName of "join resolve normalize dirname basename extension relative".split(" ")) {
+            property(t, methodName, method("String", []), 2);
+        }
+        property(t, "isAbsolute", method("Boolean", []), 2);
+    } else if (name === "Uri") {
+        property(t, "parse", method("Object", []), 2);
+        property(t, "fromFilePath", method("String", []), 2);
+        property(t, "toFilePath", method("String", []), 2);
+    } else if (name === "Fs") {
+        property(t, "readText", method("String", []), 2);
+        property(t, "readBytes", method("Bytes", []), 2);
+        property(t, "exists", method("Boolean", []), 2);
+        property(t, "stat", method("FileInfo", []), 2);
+        property(t, "open", method("File", []), 2);
+        property(t, "watch", method("FileWatcher", []), 2);
+        property(t, "readDir", method("Array", []), 2);
+    } else if (name === "JSON") {
+        property(t, "parse", method("unknown", []), 2);
+        property(t, "stringify", method("String", []), 2);
+    } else if (name === "Bytes") {
+        property(t, "fromUtf8", method("Bytes", []), 2);
+        property(t, "fromArray", method("Bytes", []), 2);
+        property(t, "alloc", method("Bytes", []), 2);
+    } else if (name === "Process") {
+        property(t, "cwd", method("String", []), 2);
+        property(t, "getenv", method("String | Null", []), 2);
+        property(t, "stdin", shape("InputStream"), 10);
+        property(t, "stdout", shape("OutputStream"), 10);
+        property(t, "stderr", shape("OutputStream"), 10);
+        property(t, "args", shape("Array<String>"), 10);
+    }
+    return t;
+}
+
+function fromAnnotation(node, record, index, active, depth) {
+    if (node == null || depth > MAX_TYPE_DEPTH) return shape("unknown");
+    const kind = node.kind;
+    if (kind === "Identifier") {
+        const text = node.name;
+        if (text === "number" || text === "num") return shape("Number");
+        if (text === "string") return primitiveMembers(shape("String"));
+        if (text === "boolean" || text === "bool") return shape("Boolean");
+        if (text === "null") return shape("Null");
+        if (text === "any" || text === "unknown" || text === "never" || text === "void") return shape(text);
+        if (text === "Array" || text === "List") return primitiveMembers(shape("Array"));
+        if (text === "Map") return primitiveMembers(shape("Map"));
+        const sym = symbolForNode(record, node);
+        if (sym !== null) {
+            const declared = symbolType(sym, record, index, active, depth + 1);
+            if (declared.members.size > 0) {
+                declared.name = text;
+                return declared;
+            }
+        }
+        return primitiveMembers(shape(text));
+    }
+    if (kind === "GenericType") {
+        const base = fromAnnotation(node.name, record, index, active, depth + 1);
+        const args = [];
+        for (const item of node.arguments) args.push(descriptor(fromAnnotation(item, record, index, active, depth + 1)));
+        const name = base.name + "<" + args.join(", ") + ">";
+        const t = primitiveMembers(shape(base.name));
+        t.name = name;
+        return t;
+    }
+    if (kind === "ArrayType") {
+        const t = primitiveMembers(shape("Array"));
+        t.name = "Array<" + descriptor(fromAnnotation(node.element, record, index, active, depth + 1)) + ">";
+        return t;
+    }
+    if (kind === "UnionType" || kind === "IntersectionType") {
+        const left = fromAnnotation(node.left, record, index, active, depth + 1);
+        const right = fromAnnotation(node.right, record, index, active, depth + 1);
+        return shape(left.name + (kind === "UnionType" ? " | " : " & ") + right.name);
+    }
+    if (kind === "OptionalType") return shape(descriptor(fromAnnotation(node.base, record, index, active, depth + 1)) + " | Null");
+    if (kind === "ParenthesizedType") return fromAnnotation(at(node, "inner"), record, index, active, depth + 1);
+    if (kind === "ObjectType") {
+        const t = primitiveMembers(shape("Object"));
+        for (const member of node.members) {
+            if (member.name.kind === "Identifier") {
+                property(t, member.name.name, fromAnnotation(member.annotation, record, index, active, depth + 1), 10);
+            }
+        }
+        return t;
+    }
+    if (kind === "TupleType") return primitiveMembers(shape("Array"));
+    if (kind === "FunctionType" || kind === "MethodType") return functionType(node, record, index, active, depth + 1);
+    if (kind === "LiteralType") {
+        if (node.value === "null") return shape("Null");
+        if (node.value === "true" || node.value === "false") return shape("Boolean");
+        if (node.value.startsWith('"') || node.value.startsWith("'")) return primitiveMembers(shape("String"));
+        return shape("Number");
+    }
+    return shape("unknown");
+}
+
+function symbolForNode(record, node) {
+    if (node === null || node.kind !== "Identifier") return null;
+    const found = record.symbolBySpan.get(node.startByte + ":" + node.endByte);
+    if (found !== null) return found;
+    for (const occurrence of record.semantic.occurrences) {
+        if (occurrence.startByte === node.startByte && occurrence.endByte === node.endByte) {
+            return occurrence.symbol;
+        }
+    }
+    return null;
+}
+
+function targetSymbol(index, record, symbol) {
+    if (symbol.kind !== "import") return {record: record, symbol: symbol};
+    const link = record.links.get(symbol.id);
+    if (link === null) return {record: record, symbol: symbol};
+    const destination = recordForUri(index, link.uri);
+    if (destination === null) return {record: record, symbol: symbol};
+    for (const candidate of destination.semantic.symbols) {
+        const a = candidate.declaration.range.start;
+        const b = link.range.start;
+        if (a.line === b.line && a.character === b.character) {
+            return {record: destination, symbol: candidate};
+        }
+    }
+    return {record: record, symbol: symbol};
+}
+
+function inferredReturn(body, record, index, active, depth) {
+    if (body == null || depth > MAX_TYPE_DEPTH) return shape("unknown");
+    if (body.kind !== "BlockStatement") return expressionType(body, record, index, active, depth + 1);
+    let result = null;
+    for (const stmt of body.body) {
+        if (stmt.kind === "ReturnStatement") result = combine(result,
+            stmt.argument === null ? shape("Null") : expressionType(stmt.argument, record, index, active, depth + 1));
+        else if (stmt.kind === "IfStatement") {
+            const first = inferredReturn(stmt.consequent, record, index, active, depth + 1);
+            const other = inferredReturn(stmt.alternate, record, index, active, depth + 1);
+            if (first.name !== "unknown") result = combine(result, first);
+            if (other.name !== "unknown") result = combine(result, other);
+        } else if (stmt.kind === "BlockStatement") {
+            const inner = inferredReturn(stmt, record, index, active, depth + 1);
+            if (inner.name !== "unknown") result = combine(result, inner);
+        }
+    }
+    return result === null ? shape("unknown") : result;
+}
+
+function functionType(node, record, index, active, depth) {
+    const params = [];
+    if (at(node, "params") !== null) for (const param of node.params) {
+        const name = at(param, "name");
+        const text = name !== null && name.kind === "Identifier" ? name.name : "arg";
+        const specified = at(param, "annotation");
+        const kind = specified !== null ? fromAnnotation(specified, record, index, active, depth + 1) :
+            (at(param, "defaultValue") !== null ? expressionType(param.defaultValue, record, index, active, depth + 1) : shape("unknown"));
+        params.push({name: text, type: descriptor(kind)});
+    }
+    const annotated = at(node, "returnType");
+    const result = annotated !== null ? fromAnnotation(annotated, record, index, active, depth + 1) :
+        inferredReturn(at(node, "body"), record, index, active, depth + 1);
+    return functionShape(params, result);
+}
+
+function classType(node, record, index, active, depth) {
+    const className = at(node, "id") !== null ? node.id.name : "Anonymous";
+    const t = shape(className);
+    t.classNode = node;
+    for (const member of node.members) {
+        if (member.kind !== "FieldDefinition" && member.kind !== "MethodDefinition") continue;
+        if (member.name.kind !== "Identifier") continue;
+        let staticMember = false;
+        for (const modifier of member.modifiers) {
+            if (modifier === "static") staticMember = true;
+        }
+        if (staticMember) continue;
+        const annotation = at(member, "annotation");
+        let value = shape("unknown");
+        if (annotation !== null) value = fromAnnotation(annotation, record, index, active, depth + 1);
+        else if (member.kind === "FieldDefinition" && member.initializer !== null) {
+            value = expressionType(member.initializer, record, index, active, depth + 1);
+        } else if (member.kind === "MethodDefinition") {
+            value = functionType(member, record, index, active, depth + 1);
+            if (member.memberKind === "get" || member.memberKind === "computed") value = value.returns;
+        }
+        property(t, member.name.name, value, member.kind === "MethodDefinition" && member.memberKind === "method" ? 2 : 10);
+    }
+    return t;
+}
+
+function symbolType(symbol, record, index, active, depth) {
+    if (symbol === null || depth > MAX_TYPE_DEPTH) return shape("unknown");
+    const resolved = targetSymbol(index, record, symbol);
+    record = resolved.record;
+    symbol = resolved.symbol;
+    const marker = record.key + ":" + symbol.id;
+    if (active.has(marker)) return shape("unknown");
+    active.add(marker);
+    const owner = symbol.owner;
+    let result = shape("unknown");
+    if (owner !== null) {
+        if (owner.kind === "VariableDeclarator" || owner.kind === "Parameter") {
+            if (owner.annotation !== null) result = fromAnnotation(owner.annotation, record, index, active, depth + 1);
+            else {
+                const init = owner.kind === "VariableDeclarator" ? owner.init : owner.defaultValue;
+                if (init !== null) result = expressionType(init, record, index, active, depth + 1);
+            }
+        } else if (owner.kind === "FunctionDeclaration" || owner.kind === "FunctionExpression" ||
+            owner.kind === "MethodDefinition") result = functionType(owner, record, index, active, depth + 1);
+        else if (owner.kind === "ClassDeclaration" || owner.kind === "ClassExpression") {
+            result = classType(owner, record, index, active, depth + 1);
+        } else if (owner.kind === "FieldDefinition") {
+            if (owner.annotation !== null) result = fromAnnotation(owner.annotation, record, index, active, depth + 1);
+            else if (owner.initializer !== null) result = expressionType(owner.initializer, record, index, active, depth + 1);
+        } else if (owner.kind === "TypeAliasDeclaration") result = fromAnnotation(owner.annotation, record, index, active, depth + 1);
+        else if (owner.kind === "InterfaceDeclaration") result = fromAnnotation(owner.body, record, index, active, depth + 1);
+        else if (owner.kind === "EnumDeclaration") {
+            result = shape(owner.id.name);
+            for (const member of owner.members) {
+                if (member.name.kind !== "Identifier") continue;
+                const type = at(member, "initializer") === null ? shape("Number") :
+                    expressionType(member.initializer, record, index, active, depth + 1);
+                property(result, member.name.name, type, 20);
+            }
+        } else if (owner.kind === "EnumMember") {
+            result = at(owner, "initializer") === null ? shape("Number") :
+                expressionType(owner.initializer, record, index, active, depth + 1);
+        }
+    }
+    active.delete(marker);
+    return result;
+}
+
+function expressionType(node, record, index, active, depth) {
+    if (node == null || depth > MAX_TYPE_DEPTH) return shape("unknown");
+    const kind = node.kind;
+    if (kind === "NumericLiteral") return shape("Number");
+    if (kind === "StringLiteral" || kind === "TemplateLiteral") return primitiveMembers(shape("String"));
+    if (kind === "BooleanLiteral") return shape("Boolean");
+    if (kind === "NullLiteral") return shape("Null");
+    if (kind === "Identifier") {
+        const symbol = symbolForNode(record, node);
+        return symbol === null ? builtinType(node.name) : symbolType(symbol, record, index, active, depth + 1);
+    }
+    if (kind === "ParenthesizedExpression") return expressionType(node.expression, record, index, active, depth + 1);
+    if (kind === "ArrayExpression" || kind === "ListComprehension") {
+        const t = primitiveMembers(shape("Array"));
+        const item = kind === "ArrayExpression" && node.elements.length > 0 ? node.elements[0] : at(node, "element");
+        if (item !== null) t.name = "Array<" + descriptor(expressionType(item, record, index, active, depth + 1)) + ">";
+        return t;
+    }
+    if (kind === "ObjectExpression") {
+        const t = primitiveMembers(shape("Object"));
+        for (const prop of node.properties) {
+            if (prop.kind === "ObjectProperty" && prop.key.kind === "Identifier") {
+                property(t, prop.key.name, expressionType(prop.value, record, index, active, depth + 1), 10);
+            } else if (prop.kind === "ObjectMethod" && prop.key.kind === "Identifier") {
+                property(t, prop.key.name, functionType(prop, record, index, active, depth + 1), 2);
+            }
+        }
+        return t;
+    }
+    if (kind === "FunctionExpression" || kind === "ArrowFunctionExpression" || kind === "LambdaExpression") {
+        return functionType(node, record, index, active, depth + 1);
+    }
+    if (kind === "NewExpression") {
+        const base = expressionType(node.callee, record, index, active, depth + 1);
+        if (base.name === "Array") return primitiveMembers(shape("Array"));
+        if (base.name === "Map") return primitiveMembers(shape("Map"));
+        if (base.name === "Bytes" || base.name === "ByteBuffer") return primitiveMembers(shape(base.name));
+        return base;
+    }
+    if (kind === "MemberExpression") {
+        const receiver = expressionType(node.object, record, index, active, depth + 1);
+        const memberName = node.property.kind === "Identifier" ? node.property.name :
+            (node.computed && node.property.kind === "StringLiteral" ? node.property.raw.slice(1, -1) : null);
+        if (memberName === null) return shape("unknown");
+        const member = receiver.members.get(memberName);
+        return member === null ? shape("unknown") : member.type;
+    }
+    if (kind === "CallExpression") {
+        const callable = expressionType(node.callee, record, index, active, depth + 1);
+        return callable.returns === null ? shape("unknown") : callable.returns;
+    }
+    if (kind === "UnaryExpression") {
+        if (node.operator === "!" || node.operator === "delete") return shape("Boolean");
+        if (node.operator === "+" || node.operator === "-" || node.operator === "~") return shape("Number");
+    }
+    if (kind === "UpdateExpression") return shape("Number");
+    if (kind === "BinaryExpression") {
+        if ((" === !== == != < > <= >= in instanceof implements inherits ").contains(" " + node.operator + " ")) return shape("Boolean");
+        if (node.operator === "+") {
+            const l = expressionType(node.left, record, index, active, depth + 1);
+            const r = expressionType(node.right, record, index, active, depth + 1);
+            if (l.name === "String" || r.name === "String") return primitiveMembers(shape("String"));
+            if (l.name === "Number" && r.name === "Number") return shape("Number");
+            return shape("unknown");
+        }
+        const left = expressionType(node.left, record, index, active, depth + 1);
+        const right = expressionType(node.right, record, index, active, depth + 1);
+        return left.name === "Number" && right.name === "Number" ? shape("Number") : shape("unknown");
+    }
+    if (kind === "ConditionalExpression") return combine(
+        expressionType(node.consequent, record, index, active, depth + 1),
+        expressionType(node.alternate, record, index, active, depth + 1));
+    if (kind === "LogicalExpression") return combine(
+        expressionType(node.left, record, index, active, depth + 1),
+        expressionType(node.right, record, index, active, depth + 1));
+    if (kind === "AssignmentExpression") return expressionType(node.right, record, index, active, depth + 1);
+    if (kind === "AwaitExpression") return shape("unknown");
+    if (kind === "ThisExpression") return shape("unknown");
+    return shape("unknown");
+}
+
+// Flow analysis is query-local and never changes semantic symbols or cached ASTs.
+// It follows the path to a cursor, joins completed branches, and only narrows
+// stable local identifiers. Unknown side effects intentionally remain unknown.
+const MAX_FLOW_DEPTH = 64;
+const MAX_FLOW_STEPS = 12000;
+
+function flowClone(values) {
+    const result = new Map();
+    for (const key of values.keys()) result.set(key, values.get(key));
+    return result;
+}
+
+function flowSymbol(record, node) {
+    return node !== null && node.kind === "Identifier" ? symbolForNode(record, node) : null;
+}
+
+function flowValue(context, values, symbol) {
+    const current = values.get(symbol.id);
+    return current === null ? symbolType(symbol, context.record, context.index, new Set(), 0) : current;
+}
+
+function flowAssignment(context, values, id, type) {
+    const symbol = flowSymbol(context.record, id);
+    if (symbol !== null && symbol.domain === "value" && symbol.kind !== "constant") {
+        values.set(symbol.id, type);
+    }
+}
+
+function flowTypeForExpression(context, values, expression) {
+    if (expression === null) return shape("unknown");
+    if (expression.kind === "Identifier") {
+        const symbol = flowSymbol(context.record, expression);
+        if (symbol !== null) return flowValue(context, values, symbol);
+    }
+    if (expression.kind === "ParenthesizedExpression") return flowTypeForExpression(context, values, expression.expression);
+    return expressionType(expression, context.record, context.index, new Set(), 0);
+}
+
+function flowParts(type) {
+    return type.name.split(" | ");
+}
+
+function flowNarrowType(type, expected, positive) {
+    const pieces = flowParts(type);
+    const result = [];
+    let matched = false;
+    for (const piece of pieces) {
+        if (piece === expected) matched = true;
+        if ((piece === expected) === positive) result.push(piece);
+    }
+    if (positive && !matched) {
+        if (type.name === "unknown" || type.name === "any") return primitiveMembers(shape(expected));
+        return type;
+    }
+    if (result.length === 0) return shape("never");
+    if (result.length === 1 && result[0] === type.name) return type;
+    return primitiveMembers(shape(result.join(" | ")));
+}
+
+function flowGuardOfComparison(test) {
+    if (test === null || test.kind !== "BinaryExpression") return null;
+    const equal = test.operator === "==" || test.operator === "===";
+    if (!equal && test.operator !== "!=" && test.operator !== "!==") return null;
+    let left = test.left;
+    let right = test.right;
+    if (left.kind === "NullLiteral" || left.kind === "StringLiteral") {
+        left = test.right;
+        right = test.left;
+    }
+    if (left.kind === "Identifier" && right.kind === "NullLiteral") {
+        return {target: left, expected: "Null", positive: equal};
+    }
+    if (left.kind === "UnaryExpression" && left.operator === "typeof" &&
+        left.argument.kind === "Identifier" && right.kind === "StringLiteral") {
+        const literal = right.raw.slice(1, right.raw.length - 1);
+        const target = literal === "string" || literal === "String" ? "String" :
+            literal === "number" || literal === "Number" ? "Number" :
+            literal === "boolean" || literal === "Boolean" ? "Boolean" : null;
+        if (target !== null) return {target: left.argument, expected: target, positive: equal};
+    }
+    return null;
+}
+
+function flowGuard(context, values, test, positive, depth) {
+    if (test === null || depth > MAX_FLOW_DEPTH) return values;
+    if (test.kind === "ParenthesizedExpression") return flowGuard(context, values, test.expression, positive, depth + 1);
+    if (test.kind === "UnaryExpression" && test.operator === "!") {
+        return flowGuard(context, values, test.argument, !positive, depth + 1);
+    }
+    if (test.kind === "LogicalExpression") {
+        if ((test.operator === "&&" && positive) || (test.operator === "||" && !positive)) {
+            flowGuard(context, values, test.left, positive, depth + 1);
+            flowGuard(context, values, test.right, positive, depth + 1);
+        }
+        return values;
+    }
+    const comparison = flowGuardOfComparison(test);
+    if (comparison !== null) {
+        const symbol = flowSymbol(context.record, comparison.target);
+        if (symbol !== null) {
+            const narrowed = flowNarrowType(flowValue(context, values, symbol),
+                comparison.expected, positive === comparison.positive);
+            values.set(symbol.id, narrowed);
+        }
+    } else if (test.kind === "Identifier" && positive) {
+        const symbol = flowSymbol(context.record, test);
+        if (symbol !== null) values.set(symbol.id,
+            flowNarrowType(flowValue(context, values, symbol), "Null", false));
+    }
+    return values;
+}
+
+function flowJoin(context, before, first, second) {
+    const result = flowClone(before);
+    const all = new Set();
+    for (const key of first.keys()) all.add(key);
+    for (const key of second.keys()) all.add(key);
+    for (const key of all) {
+        const symbol = context.record.semantic.symbols[key];
+        if (symbol === null) continue;
+        const base = flowValue(context, before, symbol);
+        const a = first.has(key) ? first.get(key) : base;
+        const b = second.has(key) ? second.get(key) : base;
+        result.set(key, combine(a, b));
+    }
+    return result;
+}
+
+function flowStops(node) {
+    if (node === null) return false;
+    if (node.kind === "ReturnStatement" || node.kind === "ThrowStatement") return true;
+    if (node.kind === "BlockStatement" && node.body.length > 0) {
+        return flowStops(node.body[node.body.length - 1]);
+    }
+    if (node.kind === "IfStatement") return node.alternate !== null &&
+        flowStops(node.consequent) && flowStops(node.alternate);
+    return false;
+}
+
+function flowApplyExpression(context, values, node) {
+    if (node === null) return;
+    if (node.kind === "AssignmentExpression" && node.left.kind === "Identifier") {
+        flowAssignment(context, values, node.left, flowTypeForExpression(context, values, node.right));
+    } else if (node.kind === "UpdateExpression" && node.argument.kind === "Identifier") {
+        flowAssignment(context, values, node.argument, shape("Number"));
+    } else if (node.kind === "SequenceExpression") {
+        for (const item of node.expressions) flowApplyExpression(context, values, item);
+    }
+}
+
+function flowWalk(context, node, position, values, depth) {
+    if (node === null || depth > MAX_FLOW_DEPTH || context.steps >= MAX_FLOW_STEPS ||
+        node.startByte >= position) return values;
+    context.steps++;
+    const kind = node.kind;
+    if (kind === "Module" || kind === "Program" || kind === "BlockStatement") {
+        for (const statement of node.body) {
+            if (statement.startByte >= position) break;
+            values = flowWalk(context, statement, position, values, depth + 1);
+        }
+        return values;
+    }
+    if (kind === "ExportDeclaration" || kind === "ExportDefaultDeclaration" ||
+        kind === "DeclareStatement" || kind === "DecoratedDeclaration") {
+        return flowWalk(context, node.declaration, position, values, depth + 1);
+    }
+    if (kind === "VariableDeclaration") {
+        for (const declaration of node.declarations) {
+            if (declaration.startByte >= position) break;
+            if (declaration.id.kind === "Identifier" && declaration.init !== null &&
+                declaration.annotation === null && declaration.init.endByte <= position) {
+                const symbol = flowSymbol(context.record, declaration.id);
+                if (symbol !== null) values.set(symbol.id,
+                    flowTypeForExpression(context, values, declaration.init));
+            }
+        }
+    } else if (kind === "ExpressionStatement") {
+        if (node.endByte <= position) flowApplyExpression(context, values, node.expression);
+    } else if (kind === "IfStatement") {
+        if (node.test.endByte >= position) return values;
+        const before = flowClone(values);
+        const thenFlow = flowGuard(context, flowClone(before), node.test, true, depth + 1);
+        const elseFlow = flowGuard(context, flowClone(before), node.test, false, depth + 1);
+        if (position <= node.consequent.endByte && position >= node.consequent.startByte) {
+            return flowWalk(context, node.consequent, position, thenFlow, depth + 1);
+        }
+        if (node.alternate !== null && position >= node.alternate.startByte &&
+            position <= node.alternate.endByte) {
+            return flowWalk(context, node.alternate, position, elseFlow, depth + 1);
+        }
+        if (node.endByte <= position) {
+            const a = flowWalk(context, node.consequent, position, thenFlow, depth + 1);
+            const b = node.alternate === null ? elseFlow :
+                flowWalk(context, node.alternate, position, elseFlow, depth + 1);
+            if (flowStops(node.consequent)) return b;
+            if (node.alternate !== null && flowStops(node.alternate)) return a;
+            return flowJoin(context, before, a, b);
+        }
+    } else if (kind === "FunctionDeclaration" || kind === "FunctionExpression" ||
+        kind === "ArrowFunctionExpression" || kind === "LambdaExpression" ||
+        kind === "MethodDefinition" || kind === "ObjectMethod") {
+        const body = node.body;
+        if (body !== null && position >= body.startByte && position <= body.endByte) {
+            return flowWalk(context, body, position, flowClone(values), depth + 1);
+        }
+    } else if (kind === "ClassDeclaration" || kind === "ClassExpression") {
+        for (const member of node.members) {
+            if (position >= member.startByte && position <= member.endByte) {
+                return flowWalk(context, member, position, flowClone(values), depth + 1);
+            }
+        }
+    } else if (kind === "WhileStatement" || kind === "DoWhileStatement" ||
+        kind === "ForStatement" || kind === "ForOfStatement" || kind === "ForInStatement") {
+        if (node.body !== null && position >= node.body.startByte && position <= node.body.endByte) {
+            return flowWalk(context, node.body, position, flowClone(values), depth + 1);
+        }
+        if (node.body !== null && node.endByte <= position) {
+            const applied = flowWalk(context, node.body, position, flowClone(values), depth + 1);
+            return flowJoin(context, values, values, applied);
+        }
+    } else if (kind === "TryStatement") {
+        if (position >= node.block.startByte && position <= node.block.endByte) {
+            return flowWalk(context, node.block, position, flowClone(values), depth + 1);
+        }
+        if (node.handler !== null && position >= node.handler.startByte && position <= node.handler.endByte) {
+            return flowWalk(context, node.handler, position, flowClone(values), depth + 1);
+        }
+        if (node.finalizer !== null && position >= node.finalizer.startByte && position <= node.finalizer.endByte) {
+            return flowWalk(context, node.finalizer, position, flowClone(values), depth + 1);
+        }
+        if (node.endByte <= position) {
+            const attempted = flowWalk(context, node.block, position, flowClone(values), depth + 1);
+            const fallback = node.handler === null ? values :
+                flowWalk(context, node.handler, position, flowClone(values), depth + 1);
+            let joined = flowJoin(context, values, attempted, fallback);
+            if (node.finalizer !== null) joined = flowWalk(context, node.finalizer, position, joined, depth + 1);
+            return joined;
+        }
+    } else if (kind === "CatchClause") {
+        return flowWalk(context, node.body, position, values, depth + 1);
+    }
+    return values;
+}
+
+function flowTypeAt(index, record, symbol, byteOffset) {
+    if (symbol === null) return shape("unknown");
+    const base = symbolType(symbol, record, index, new Set(), 0);
+    if (symbol.kind === "import" || symbol.domain !== "value") return base;
+    const context = {index: index, record: record, steps: 0};
+    const env = flowWalk(context, record.ast, byteOffset, new Map(), 0);
+    const type = env.get(symbol.id);
+    return type === null ? base : type;
+}
+
+function positionByte(record, position) {
+    const offset = offsetAt(record.source, position.line, position.character);
+    if (offset === null) return null;
+    return record.source.slice(0, offset).utf8Length;
+}
+
+function activeScope(record, byteOffset) {
+    let result = null;
+    let width = 0;
+    for (const entry of record.semantic.scopes) {
+        if (entry.startByte <= byteOffset && entry.endByte >= byteOffset) {
+            const size = entry.endByte - entry.startByte;
+            if (result === null || size <= width) {
+                result = entry.scope;
+                width = size;
+            }
+        }
+    }
+    return result;
+}
+
+function memberContext(record, byteOffset) {
+    const tokens = record.lexical.tokens;
+    let dot = null;
+    let before = null;
+    let prefix = "";
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (token.startByte > byteOffset) break;
+        if (token.endByte >= byteOffset && token.kind === "identifier") {
+            prefix = token.text.slice(0, byteOffset - token.startByte);
+            if (i > 0 && (tokens[i - 1].text === "." || tokens[i - 1].text === "?.")) {
+                dot = tokens[i - 1];
+                if (i > 1) before = tokens[i - 2];
+            }
+            break;
+        }
+        if (token.endByte <= byteOffset && (token.text === "." || token.text === "?.")) {
+            dot = token;
+            if (i > 0) before = tokens[i - 1];
+        }
+        if (token.endByte <= byteOffset && token.text !== "." && token.text !== "?.") {
+            dot = null;
+        }
+    }
+    if (dot === null || before === null || before.kind !== "identifier" && before.text !== "this") return null;
+    return {token: before, prefix: prefix};
+}
+
+function scopeSymbols(record, byteOffset, domain) {
+    const found = activeScope(record, byteOffset);
+    const output = [];
+    let current = found;
+    const names = new Set();
+    while (current !== null) {
+        const table = domain === "type" ? current.types : current.values;
+        for (const name of table.keys()) {
+            if (names.has(name)) continue;
+            names.add(name);
+            output.push(table.get(name));
+        }
+        current = current.parent;
+    }
+    return output;
+}
+
+function tokenSymbol(record, token) {
+    for (const occurrence of record.semantic.occurrences) {
+        if (occurrence.startByte === token.startByte && occurrence.endByte === token.endByte) return occurrence.symbol;
+    }
+    return null;
+}
+
+function memberReceiverType(index, record, context, byteOffset, active) {
+    if (context.token.text === "this") {
+        let current = activeScope(record, byteOffset);
+        while (current !== null && current.classScope === null) current = current.parent;
+        if (current !== null && current.classScope !== null) {
+            const node = current.classScope.ownerNode;
+            if (node !== null) return classType(node, record, index, active, 0);
+        }
+        return shape("unknown");
+    }
+    const sym = tokenSymbol(record, context.token);
+    return sym !== null ? flowTypeAt(index, record, sym, byteOffset) : builtinType(context.token.text);
+}
+
+function completionKind(symbol) {
+    if (symbol.kind === "function") return 3;
+    if (symbol.kind === "class") return 7;
+    if (symbol.kind === "interface") return 8;
+    if (symbol.kind === "enum") return 13;
+    if (symbol.kind === "method") return 2;
+    if (symbol.kind === "field" || symbol.kind === "property") return 10;
+    if (symbol.kind === "constant") return 21;
+    return 6;
+}
+
+function completionTypePosition(record, byteOffset) {
+    let previous = null;
+    let before = null;
+    for (const token of record.lexical.tokens) {
+        if (token.startByte > byteOffset) break;
+        if (token.kind === "newline") continue;
+        if (token.startByte <= byteOffset && byteOffset <= token.endByte &&
+            token.kind === "identifier") {
+            break;
+        }
+        if (token.endByte <= byteOffset) {
+            before = previous;
+            previous = token;
+        }
+    }
+    if (previous === null) return false;
+    if (previous.text === ":" || previous.text === "extends" ||
+        previous.text === "implements") return true;
+    return before !== null && previous.text === "<" && before.kind === "identifier";
+}
+
+function appendCompletion(items, used, name, kind, description, prefix) {
+    if (items.length >= MAX_COMPLETIONS || used.has(name) || !name.startsWith(prefix)) return;
+    used.add(name);
+    items.push({label: name, kind: kind, detail: description});
+}
+
+export function completionAt(index, uri, position) {
+    const record = recordForUri(index, uri);
+    if (record === null) return {isIncomplete: false, items: []};
+    const byteOffset = positionByte(record, position);
+    if (byteOffset === null) return {isIncomplete: false, items: []};
+    const active = new Set();
+    const items = [];
+    const context = memberContext(record, byteOffset);
+    if (context !== null) {
+        const receiver = memberReceiverType(index, record, context, byteOffset, active);
+        for (const name of receiver.members.keys()) {
+            if (!name.startsWith(context.prefix)) continue;
+            const value = receiver.members.get(name);
+            items.push({label: name, kind: value.kind, detail: descriptor(value.type)});
+            if (items.length >= MAX_COMPLETIONS) break;
+        }
+    } else {
+        let prefix = "";
+        for (const token of record.lexical.tokens) {
+            if (token.startByte <= byteOffset && token.endByte >= byteOffset &&
+                (token.kind === "identifier" || token.kind === "keyword")) {
+                prefix = token.text.slice(0, byteOffset - token.startByte);
+                break;
+            }
+            if (token.startByte <= byteOffset && byteOffset < token.endByte &&
+                (token.kind === "string" || token.kind.startsWith("comment") ||
+                 token.kind.startsWith("template.text") || token.kind === "number")) {
+                return {isIncomplete: false, items: []};
+            }
+        }
+        const typeContext = completionTypePosition(record, byteOffset);
+        const used = new Set();
+        for (const symbol of scopeSymbols(record, byteOffset, typeContext ? "type" : "value")) {
+            if (!symbol.name.startsWith(prefix)) continue;
+            const type = flowTypeAt(index, record, symbol, byteOffset);
+            appendCompletion(items, used, symbol.name, completionKind(symbol), descriptor(type), prefix);
+        }
+        const builtinWords = typeContext ? BUILTIN_TYPES : ENGINE_GLOBALS;
+        for (const name of builtinWords.split(" ")) {
+            appendCompletion(items, used, name, 7, "Napalm built-in", prefix);
+        }
+        if (!typeContext) for (const name of LANGUAGE_KEYWORDS.split(" ")) {
+            appendCompletion(items, used, name, 14, "Napalm keyword", prefix);
+        }
+    }
+    return {isIncomplete: false, items: items};
+}
+
+export function hoverAt(index, uri, position) {
+    const record = recordForUri(index, uri);
+    if (record === null) return null;
+    const byteOffset = positionByte(record, position);
+    if (byteOffset === null) return null;
+    for (const occurrence of record.semantic.occurrences) {
+        if (occurrence.startByte <= byteOffset && byteOffset < occurrence.endByte) {
+            const symbol = occurrence.symbol;
+            const type = flowTypeAt(index, record, symbol, byteOffset);
+            const text = symbol.kind + " " + symbol.name + ": " + descriptor(type);
+            return {contents: {kind: "markdown", value: "```napalm\n" + text + "\n```"},
+                range: occurrence.range};
+        }
+    }
+    const context = memberContext(record, byteOffset);
+    if (context !== null) {
+        const receiver = memberReceiverType(index, record, context, byteOffset, new Set());
+        for (const token of record.lexical.tokens) {
+            if (token.startByte <= byteOffset && byteOffset < token.endByte &&
+                token.kind === "identifier") {
+                const member = receiver.members.get(token.text);
+                if (member !== null) return {
+                    contents: {kind: "markdown", value: "```napalm\n" + token.text + ": " +
+                        descriptor(member.type) + "\n```"},
+                    range: token.range
+                };
+            }
+        }
+    }
+    return null;
+}
+
+export function inferSymbolAt(index, uri, position) {
+    const record = recordForUri(index, uri);
+    if (record === null) return "unknown";
+    const byteOffset = positionByte(record, position);
+    if (byteOffset === null) return "unknown";
+    for (const occurrence of record.semantic.occurrences) {
+        if (occurrence.startByte <= byteOffset && byteOffset < occurrence.endByte) {
+            return descriptor(flowTypeAt(index, record, occurrence.symbol, byteOffset));
+        }
+    }
+    return "unknown";
+}
+// Collect the closest call's active argument from lexical tokens. Parentheses
+// inside arrays, objects, or nested calls cannot advance an outer argument.
+export function signatureHelpAt(index, uri, position) {
+    const record = recordForUri(index, uri);
+    if (record === null) return null;
+    const byteOffset = positionByte(record, position);
+    if (byteOffset === null) return null;
+    const tokens = record.lexical.tokens;
+    const stack = [];
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (token.startByte >= byteOffset) break;
+        const value = token.text;
+        if (value === "(" || value === "[" || value === "{") {
+            stack.push({tokenIndex: i, symbol: value, argument: 0});
+        } else if (value === ")" || value === "]" || value === "}") {
+            if (stack.length === 0) return null;
+            const last = stack[stack.length - 1];
+            if ((value === ")" && last.symbol !== "(") ||
+                (value === "]" && last.symbol !== "[") ||
+                (value === "}" && last.symbol !== "{")) return null;
+            stack.pop();
+        } else if (value === "," && stack.length > 0 && stack[stack.length - 1].symbol === "(") {
+            stack[stack.length - 1].argument++;
+        }
+    }
+    if (stack.length === 0 || stack[stack.length - 1].symbol !== "(") return null;
+    const call = stack[stack.length - 1];
+    let before = call.tokenIndex - 1;
+    while (before >= 0 && tokens[before].kind === "newline") before--;
+    if (before < 0) return null;
+    const callee = tokens[before];
+    if (callee.kind !== "identifier") return null;
+    let callable = null;
+    if (before >= 2 && (tokens[before - 1].text === "." || tokens[before - 1].text === "?.")) {
+        const receiverToken = tokens[before - 2];
+        const context = {token: receiverToken, prefix: ""};
+        const receiver = memberReceiverType(index, record, context, byteOffset, new Set());
+        const candidate = receiver.members.get(callee.text);
+        if (candidate !== null) callable = candidate.type;
+    } else {
+        const symbol = tokenSymbol(record, callee);
+        if (symbol !== null) callable = flowTypeAt(index, record, symbol, byteOffset);
+    }
+    if (callable === null || callable.name !== "Function") return null;
+    const parameters = [];
+    const names = [];
+    for (const parameter of callable.parameters) {
+        const label = parameter.name + ": " + parameter.type;
+        parameters.push({label: label});
+        names.push(label);
+    }
+    const label = callee.text + "(" + names.join(", ") + "): " + descriptor(callable.returns);
+    const activeParameter = parameters.length === 0 ? 0 :
+        (call.argument < parameters.length ? call.argument : parameters.length - 1);
+    return {signatures: [{label: label, parameters: parameters}], activeSignature: 0,
+        activeParameter: activeParameter};
+}

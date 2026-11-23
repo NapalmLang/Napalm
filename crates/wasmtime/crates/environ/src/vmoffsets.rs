@@ -16,6 +16,13 @@ use crate::{
 /// defined by the component model's `context.{get,set}` intrinsics.
 pub const NUM_COMPONENT_CONTEXT_SLOTS: usize = 2;
 
+/// Capacity of the `lazy_lenders` buffer in the `VMStoreContext`.
+///
+/// Fast paths usually lend only one or two handles, so this is small; a lend
+/// that does not fit forces the deferred thread and records in its
+/// `CallContext` instead.
+pub const LAZY_LENDERS_CAPACITY: usize = 8;
+
 #[cfg(target_pointer_width = "32")]
 fn cast_to_u32(sz: usize) -> u32 {
     u32::try_from(sz).unwrap()
@@ -55,6 +62,7 @@ macro_rules! define_vm_type_offsets {
     // references; and `VMGlobalKind` is a `repr(C, u32)` enum with a `u32`
     // payload.
     (@size ($p:expr) VmPtr < $g:ty >) => { u32::from($p) };
+    (@size ($p:expr) VmPtr < VmPtr < $g:ty >>) => { u32::from($p) };
     (@size ($p:expr) Option < VmPtr < $g:ty >>) => { u32::from($p) };
     (@size ($p:expr) AtomicUsize) => { u32::from($p) };
     (@size ($p:expr) usize) => { u32::from($p) };
@@ -89,6 +97,11 @@ macro_rules! define_vm_type_offsets {
         u32::from(($p).vm_common_stack_information().size())
     };
     (@size ($p:expr) VMGcHeader) => { u32::from(($p).vm_gc_header().size()) };
+    (@size ($p:expr) VMTypedResource) => { u32::from(($p).vm_typed_resource().size()) };
+    (@size ($p:expr) VMScope) => { u32::from(($p).vm_scope().size()) };
+    (@size ($p:expr) VMTransmitLocalState) => {
+        u32::from(($p).vm_transmit_local_state().size())
+    };
     // `VMStackChain` is a `repr(usize, C)` enum, and is not itself defined by
     // `for_each_vm_type!`.
     (@size ($p:expr) VMStackChain) => { u32::from(($p).size_of_vmstack_chain()) };
@@ -110,6 +123,7 @@ macro_rules! define_vm_type_offsets {
     // with 64-bit fields must therefore put them first and force their own alignment with
     // `#[repr(C, align(8))]`, as `VMStoreContext` does.
     (@align ($p:expr) VmPtr < $g:ty >) => { u32::from($p) };
+    (@align ($p:expr) VmPtr < VmPtr < $g:ty >>) => { u32::from($p) };
     (@align ($p:expr) Option < VmPtr < $g:ty >>) => { u32::from($p) };
     (@align ($p:expr) AtomicUsize) => { u32::from($p) };
     (@align ($p:expr) usize) => { u32::from($p) };
@@ -139,6 +153,11 @@ macro_rules! define_vm_type_offsets {
         u32::from(($p).vm_common_stack_information().align())
     };
     (@align ($p:expr) VMGcHeader) => { u32::from(($p).vm_gc_header().align()) };
+    (@align ($p:expr) VMTypedResource) => { u32::from(($p).vm_typed_resource().align()) };
+    (@align ($p:expr) VMScope) => { u32::from(($p).vm_scope().align()) };
+    (@align ($p:expr) VMTransmitLocalState) => {
+        u32::from(($p).vm_transmit_local_state().align())
+    };
     (@align ($p:expr) VMStackChain) => { u32::from($p) };
     (@align ($p:expr) VMStackState) => { 4u32 };
     (@align ($p:expr) VMContinuationStack) => { u32::from($p) };
@@ -274,6 +293,7 @@ macro_rules! define_vm_type_offsets {
     (@enum_variants $Name:ident $snake:ident $tag:ident { $($vs:tt)* }
         $(#[doc = $vdoc:literal])*
         #[snake_name = $vsnake:ident]
+        $(#[$vattr:meta])*
         $Variant:ident { $($vbody:tt)* } = $disc:literal ,
         $($rest:tt)*
     ) => {
@@ -721,6 +741,10 @@ pub struct VMOffsets<P> {
     pub num_defined_memories: u32,
     /// The number of memories owned by the module instance.
     pub num_owned_memories: u32,
+    /// The number of shadow memory pointers: one per memory, imported and
+    /// defined, if the module's code checks memory shadows for watchpoints,
+    /// and otherwise none.
+    pub num_shadow_memories: u32,
     /// The number of defined globals in the module.
     pub num_defined_globals: u32,
     /// The number of defined tags in the module.
@@ -737,6 +761,7 @@ pub struct VMOffsets<P> {
     imported_memories: u32,
     memories: u32,
     owned_memories: u32,
+    shadow_memories: u32,
     imported_functions: u32,
     imported_tables: u32,
     imported_globals: u32,
@@ -897,6 +922,10 @@ pub struct VMOffsetsFields<P> {
     pub num_defined_memories: u32,
     /// The number of memories owned by the module instance.
     pub num_owned_memories: u32,
+    /// The number of shadow memory pointers: one per memory, imported and
+    /// defined, if the module's code checks memory shadows for watchpoints,
+    /// and otherwise none.
+    pub num_shadow_memories: u32,
     /// The number of defined globals in the module.
     pub num_defined_globals: u32,
     /// The number of defined tags in the module.
@@ -931,6 +960,11 @@ impl<P: PtrSize> VMOffsets<P> {
             num_defined_tables: cast_to_u32(module.num_defined_tables()),
             num_defined_memories: cast_to_u32(module.num_defined_memories()),
             num_owned_memories,
+            num_shadow_memories: if module.has_shadow_memories {
+                cast_to_u32(module.memories.len())
+            } else {
+                0
+            },
             num_defined_globals: cast_to_u32(module.globals.len() - module.num_imported_globals),
             num_defined_tags: cast_to_u32(module.tags.len() - module.num_imported_tags),
             num_escaped_funcs: cast_to_u32(module.num_escaped_funcs),
@@ -966,6 +1000,7 @@ impl<P: PtrSize> VMOffsets<P> {
                     num_defined_memories: _,
                     num_defined_tags: _,
                     num_owned_memories: _,
+                    num_shadow_memories: _,
                     num_escaped_funcs: _,
                     num_runtime_data: _,
                     has_startup_func: _,
@@ -1008,6 +1043,7 @@ impl<P: PtrSize> VMOffsets<P> {
             imported_globals: "imported globals",
             imported_tables: "imported tables",
             imported_functions: "imported functions",
+            shadow_memories: "shadow memories",
             owned_memories: "owned memories",
             memories: "defined memories",
             imported_memories: "imported memories",
@@ -1036,6 +1072,7 @@ impl<P: PtrSize> From<VMOffsetsFields<P>> for VMOffsets<P> {
             num_defined_tables: fields.num_defined_tables,
             num_defined_memories: fields.num_defined_memories,
             num_owned_memories: fields.num_owned_memories,
+            num_shadow_memories: fields.num_shadow_memories,
             num_defined_globals: fields.num_defined_globals,
             num_defined_tags: fields.num_defined_tags,
             num_escaped_funcs: fields.num_escaped_funcs,
@@ -1044,6 +1081,7 @@ impl<P: PtrSize> From<VMOffsetsFields<P>> for VMOffsets<P> {
             imported_memories: 0,
             memories: 0,
             owned_memories: 0,
+            shadow_memories: 0,
             imported_functions: 0,
             imported_tables: 0,
             imported_globals: 0,
@@ -1174,6 +1212,7 @@ mod tests {
                     num_defined_tables: 0,
                     num_defined_memories: 0,
                     num_owned_memories: 0,
+                    num_shadow_memories: 0,
                     num_defined_globals: 0,
                     num_defined_tags,
                     num_escaped_funcs: 1,

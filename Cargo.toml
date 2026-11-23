@@ -11,51 +11,64 @@ overflow-checks = false
 
 [dependencies]
 ariadne = "0.6" # For painting nice error logs
-logos = "0.16" # Create ridiculously fast and easy tokenizers
+logos = "0.16.1" # Create ridiculously fast and easy tokenizers
 
-smallvec = "1.16.5" # Fast hash map
+smallvec = { version = "1.16.6", features = ["serde"] } # Fast hash map
+serde = { version = "1.0.229", features = ["derive"] } # Serialization and deserialization framework for Rust
+serde_json = "1.0.154" # Canonical HIR snapshots for the --build fixed point
 ahash = "0.8.12" # Portable fallback for the runtime hasher
-hashbrown = "0.17.1" # Fast hash map
+hashbrown = "0.17.2" # Fast hash map
 papaya = "0.2.5" # Concurrent hash map
-#small-map = "0.1.5" # Small map optimization
 smallbox = "0.8.9" # Small Box<T> optimization
 #tinyvec = "1.13.3" # Tiny vector optimization
 compact_str = "0.10.0" # String drop-in replacement
+bytes = "1.12.2" # Utilities for working with byte buffers
+string-interner = "0.20.0" # String interning for efficient string handling
 parking_lot = "0.13.0" # Concurrency primitives
-#trc = "1.2.4" # Alternative to Trc with one non-atomic counter per thread and another general atomic-counter for all threads
+#trc = "1.2.4" # Alternative to Arc with one non-atomic counter per thread and another general atomic-counter for all threads
 #archery = "1.2.1" # Faster Arc
-#triomphe = "0.1.14" # Faster Arc
+#triomphe = "0.1.17" # Faster Arc
 rclite = "0.4.2" # Optimized Rc for memory usage
 chrono = "0.4.45" # Date and time library for Rust
-mimalloc = "0.1.52" # Alternative general purpose memory allocator; usually faster
+mimalloc = { version = "0.1.52", features = ["extended"] } # Faster general purpose memory allocator
+tar = "0.4.46" # Archive manipulation library for Rust
+# vfs = "0.13.0" # Virtual file system abstraction for Rust
+zstd = { version = "0.14.4", features = ["zstdmt"] } # .burning compression
+postcard = { version = "1.2.0", features = ["use-std"] } # Binary .burning metadata/bootstrap encoding
+regexr = { version = "0.6.2", features = ["full"] } # Regular expressions with native compilation enabled
 
 libffi = "5.2.0" # Native C calls
-libloading = "0.9.0" # Dynamic library loading
-http-body-util = "0.1"
+libloading = "0.9.1" # Dynamic library loading
+http-body-util = "0.1.5"
 crossbeam-deque = "0.8.8" # Work-stealing deque for concurrent task scheduling
 
-bumpalo = { version = "3.20.3", features = ["collections"] } # Memory allocator similar to arena allocator
-cranelift = { path = "./crates/wasmtime/cranelift/umbrella", features = ["jit", "module", "native"] } # JIT compiler back-end framework for Rust
+bumpalo = { version = "3.20.4", features = ["collections"] } # Memory allocator similar to arena allocator
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "system-proxy", "gzip", "brotli", "deflate", "zstd"] } # HTTP client for Rust
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "time", "net", "sync"] } # Asynchronous runtime for Rust
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 simd-json = { version = "0.19.0", default-features = false, features = ["runtime-detection", "swar-number-parsing", "big-int-as-float"] } # Fast JSON parsing using SIMD
-mmtk = { path = "./crates/mmtk/" } # Garbage Collector, my own fork for having Windows support
-#rusqlite = { version = "0.41.1", features = ["bundled", "uuid", "chrono", "vtab", "array"] } # SQLite database library for Rust
+rusqlite = { version = "0.43.0", default-features = false, features = ["bundled", "functions"] } # Embedded SQL backend
 
-llvm-sys = { version = "231.0.2", optional = true } # Low-level bindings to LLVM C API
+cranelift = { path = "./crates/wasmtime/cranelift/umbrella", features = ["jit", "module", "native"] } # JIT compiler back-end framework for Rust
+mmtk = { path = "./crates/mmtk/" } # Garbage Collector, my own fork for having Windows support
+small_map = { path = "./crates/small_map" } # Small map optimization
+
 # Safe Rust bindings to the LLVM C API (LLVM trace tier).
 # Windows: the official LLVM release libraries use the static CRT (/MT) plus
 # rpmalloc, which cannot be linked into a /MD Rust binary. build.rs links the
 # LLVM-C.dll C-API instead and copies it next to the executables.
-[target.'cfg(windows)'.dependencies]
+llvm-sys = { version = "231.0.2", optional = true } # Low-level bindings to LLVM C AP
 # Napalm uses initialize_native(), which is independent of Inkwell's target-*
 # features. Its default target-all bindings reference backends absent from the
 # Windows LLVM-C.dll and cause unresolved symbols in unoptimized debug builds.
+[target.'cfg(windows)'.dependencies]
 inkwell = { version = "0.11.0", default-features = false, features = ["llvm23-1-no-llvm-linking"], optional = true }
 [target.'cfg(not(windows))'.dependencies]
 inkwell = { version = "0.11.0", features = ["llvm23-1-prefer-dynamic"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191" # O_NOFOLLOW/O_NONBLOCK for regular-file-only Fs.open
 
 [features]
 default = ["llvm-jit"]

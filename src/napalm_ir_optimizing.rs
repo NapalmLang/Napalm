@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet, SmallMap, SmallMap16};
 use bumpalo::{Bump, collections::Vec as BumpVec};
 use smallvec::SmallVec;
 
@@ -30,6 +30,9 @@ pub use shared_constant_literals::SharedConstantLiterals;
 #[path = "napalm_ir/static_type_specialization.rs"]
 mod static_type_specialization;
 pub use static_type_specialization::StaticTypeSpecialization;
+
+#[path = "napalm_ir/aot.rs"]
+pub mod aot;
 
 /// Interpreter-oriented WIR optimization pipeline.
 ///
@@ -165,7 +168,22 @@ impl ProgramOptimization for AutoMemoization {
         // at whole-program time so recursive/hot calls can use the direct bytecode
         // ABI instead of Closure method dispatch on every edge.
         let direct_calls = rewrite_known_function_calls(program);
-        analyze_auto_memoization(program) | direct_calls
+        analyze_auto_memoization(program, false) | direct_calls
+    }
+}
+
+/// Build-pipeline auto-memoization. HIR rounds repeat until a fixed point, and
+/// later rounds see a reshaped program (hoisted literals, inlined bodies) on
+/// which the whole-program purity/identity proofs can lose precision. Memoization
+/// has priority over those reshaping passes: a classification made in an
+/// earlier round is never withdrawn, only new functions are added.
+#[derive(Default)]
+pub struct MonotoneAutoMemoization;
+
+impl ProgramOptimization for MonotoneAutoMemoization {
+    fn optimize_program(&mut self, program: &mut Program) -> bool {
+        let direct_calls = rewrite_known_function_calls(program);
+        analyze_auto_memoization(program, true) | direct_calls
     }
 }
 
@@ -292,16 +310,28 @@ fn resolve_direct_call_callee(
     }
 }
 
-fn analyze_auto_memoization(program: &mut Program) -> bool {
+fn analyze_auto_memoization(program: &mut Program, monotone: bool) -> bool {
     let module_functions = discover_module_function_bindings(program);
     let shareable_maps = shared_constant_literals::memoizable_map_operations(program);
+    let shared_literals = shared_constant_literals::shared_literal_slots(program);
     let mut summaries: HashMap<FuncId, MemoCandidate> = HashMap::default();
 
     for function in &program.functions {
         summaries.insert(
             function.id,
-            analyze_memo_candidate(program, function, &module_functions, &shareable_maps),
+            analyze_memo_candidate(program, function, &module_functions, &shareable_maps, &shared_literals),
         );
+        // Build rounds keep earlier classifications: every pass preserves
+        // semantics, so a function proven pure stays pure even when a later,
+        // reshaped program defeats the (imprecise) analysis. Seeding it as a
+        // pure leaf also lets its callers keep or gain memoization.
+        if monotone && function.memoization.enabled() && !function.memoization.is_reactive() {
+            summaries.insert(function.id, MemoCandidate {
+                locally_pure: true,
+                allocates: function.memoization.allows_heap_results(),
+                callees: Vec::new(),
+            });
+        }
     }
 
     // Purity is a closed property over the statically known call graph. Start
@@ -336,6 +366,14 @@ fn analyze_auto_memoization(program: &mut Program) -> bool {
         allocating.extend(additional);
     }
     for function in &mut program.functions {
+        // `computed` getters are classified by the lowerer, not by purity.
+        if function.memoization.is_reactive() {
+            continue;
+        }
+        // Monotone (build) mode: an earlier round's classification stands.
+        if monotone && function.memoization.enabled() {
+            continue;
+        }
         // A constructor initializes a fresh `this` on every call: caching it
         // would hand out a shared instance. Constructors are never memoized
         // (NewClassInstance also relies on this and pushes the frame directly).
@@ -436,6 +474,7 @@ fn analyze_memo_candidate(
     function: &Function,
     module_functions: &HashMap<(ModuleId, ModuleSlot), FuncId>,
     shareable_maps: &HashSet<(FuncId, InstId)>,
+    shared_literals: &HashSet<(ModuleId, ModuleSlot)>,
 ) -> MemoCandidate {
     // Receiver-bearing methods and closures with captures have hidden inputs that
     // are not represented by the explicit scalar memo key. Async/concurrent code
@@ -488,6 +527,11 @@ fn analyze_memo_candidate(
                 | Inst::Int32ToNum { .. }
                 | Inst::F64ToNum { .. } => {}
 
+                // A hoisted shared literal stands for the shareable allocation it
+                // replaced (repeated build rounds see it after hoisting).
+                Inst::LoadModuleVar { module, slot } if shared_literals.contains(&(*module, *slot)) => {
+                    allocates = true;
+                }
                 Inst::LoadModuleVar { module, slot } => {
                     if !module_functions.contains_key(&(*module, *slot)) {
                         return MemoCandidate::default();
@@ -604,6 +648,8 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
 
         let mut cse = DominatorCSE::default();
         let mut typed_objects = TypedObjectSpecialization::default();
+        let mut proven_types = ProvenTypeBoundaryElimination::default();
+        let mut contract_checks = DominatingContractElimination::default();
         let mut simplify = FastLocalSimplify::default();
         let mut copies = CopyPropagation::default();
         let mut dce = DeadCodeElimination::default();
@@ -633,6 +679,8 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
         // Recover exact structural/class facts across the SSA merges produced by
         // the frontend before guard cleanup and escape analysis consume them.
         changed_any |= typed_objects.optimize_function(function);
+        changed_any |= proven_types.optimize_function(function);
+        changed_any |= contract_checks.optimize_function(function);
 
         // Remove dead values before touching the CFG.
         changed_any |= dce.optimize_function(function);
@@ -693,6 +741,8 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
             // Moves, guards and loop block parameters may now expose exact closed
             // object/class facts which make the following guard sweep much cheaper.
             round |= typed_objects.optimize_function(function);
+            round |= proven_types.optimize_function(function);
+            round |= contract_checks.optimize_function(function);
 
             // Constant folding, peepholes, local CSE, guard simplification, memory
             // forwarding and the other bounded transformations contained here.
@@ -739,9 +789,11 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
         // ---------------------------------------------------------------------
         let final_copies = copies.optimize_function(function);
         let final_typed = typed_objects.optimize_function(function);
+        let final_boundaries = proven_types.optimize_function(function);
+        let final_contracts = contract_checks.optimize_function(function);
         let final_simplify = simplify.optimize_function(function);
 
-        let mut final_changed = final_copies | final_typed | final_simplify;
+        let mut final_changed = final_copies | final_typed | final_boundaries | final_contracts | final_simplify;
 
         if final_changed {
             final_changed |= dce.optimize_function(function);
@@ -750,6 +802,533 @@ impl FunctionOptimization for InterpreterOptimizationBundle {
         changed_any |= final_changed;
 
         changed_any
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sound typed-boundary elimination
+// ---------------------------------------------------------------------------
+//
+// The source-level type carried by an SSA Value is not, on its own, evidence
+// that a runtime contract has been installed. In particular, a typed function
+// parameter can still be entered from dynamic code, and a typed collection may
+// have mutable heap-side contracts. Only operations with checked semantics can
+// establish the facts used by these passes.
+
+/// Can an already established contract safely discharge a new boundary?
+///
+/// Persistent contracts are intentionally invariant here. `List<Number>` does
+/// not allow us to skip installing `List<any>`, or the other way around, merely
+/// because `Type::accepts` happens to accept the element types. Structural
+/// objects may also be class instances, so their static HIR type cannot be used
+/// to prove an unrelated heap kind.
+fn boundary_contract_implies(required: &Type, established: &Type) -> bool {
+    // Binding a union of heap contracts can choose and install a particular
+    // member. A later binding might need to install a different member, so an
+    // earlier successful union bind is not an idempotence certificate.
+    if matches!(required, Type::Union(alternatives)
+        if !alternatives.iter().all(boundary_is_plain_scalar))
+    {
+        return false;
+    }
+    if required == established {
+        return true;
+    }
+
+    match (required, established) {
+        // List(None) is only the shallow list-kind check. List(Some(Top))
+        // represents an explicit any[] contract: it must not be confused with
+        // List(None), nor discharged by List(Some(Num)).
+        (Type::List(None), Type::List(Some(_))) => true,
+        (Type::Set(None), Type::Set(Some(_))) => true,
+        (Type::Closure(None), Type::Closure(Some(_))) => true,
+        (Type::Foreign(None), Type::Foreign(Some(_))) => true,
+        (Type::Instance(classes), Type::GenericInstance { class, .. }) => {
+            classes.is_unknown() || classes.contains(*class)
+        }
+        (Type::Instance(expected), Type::Instance(actual))
+        | (Type::Class(expected), Type::Class(actual)) => {
+            expected.is_unknown()
+                || (!actual.is_unknown()
+                    && actual.as_slice().iter().all(|class| expected.contains(*class)))
+        }
+        (Type::Builtin(required, None), Type::Builtin(established, Some(_))) => {
+            required == established
+        }
+        // Every alternative is known to satisfy the non-persistent union.
+        // Unions containing a heap contract are excluded: binding them may
+        // perform an additional persistent installation.
+        (Type::Union(required), established)
+            if required.iter().all(boundary_is_plain_scalar) => {
+                match established {
+                    Type::Union(alternatives) => alternatives.iter().all(|actual| {
+                        required.iter().any(|ty| boundary_contract_implies(ty, actual))
+                    }),
+                    _ => required.iter().any(|ty| boundary_contract_implies(ty, established)),
+                }
+            }
+        _ => false,
+    }
+}
+
+fn boundary_is_plain_scalar(ty: &Type) -> bool {
+    matches!(ty, Type::Null | Type::Bool | Type::Num | Type::String)
+}
+
+fn boundary_constant_proves(required: &Type, constant: &Constant) -> bool {
+    let actual = match constant {
+        Constant::Null => Type::Null,
+        Constant::Bool(_) => Type::Bool,
+        Constant::Num(_) => Type::Num,
+        // Int32 constants occupy raw internal registers, not tagged Number slots.
+        Constant::Int32(_) => return false,
+        Constant::String(_) => Type::String,
+    };
+    boundary_contract_implies(required, &actual)
+}
+
+/// Normal-edge successors of every block, deduplicated. Exception edges are
+/// implicit and deliberately absent.
+fn boundary_successors(function: &Function) -> Vec<Vec<usize>> {
+    let n = function.blocks.len();
+    let mut succs = vec![Vec::new(); n];
+    for (block_ix, block) in function.blocks.iter().enumerate() {
+        let Some(last) = block.insts.last() else { continue; };
+        let Some(node) = function.node(*last) else { continue; };
+        for edge in node.kind.edges() {
+            let target = edge.target.0 as usize;
+            if target < n && !succs[block_ix].contains(&target) {
+                succs[block_ix].push(target);
+            }
+        }
+    }
+    succs
+}
+
+/// Reverse post-order over normal edges from the entry block, followed by
+/// every block not reached that way (handlers, unreachable blocks). The order
+/// only affects how fast a dataflow converges, never its result.
+fn boundary_block_order(function: &Function, succs: &[Vec<usize>]) -> Vec<usize> {
+    let n = function.blocks.len();
+    let mut visited = vec![false; n];
+    let mut postorder = Vec::with_capacity(n);
+    let entry = function.entry.0 as usize;
+    if entry < n {
+        // Iterative DFS: (block, index of the next successor to visit).
+        let mut stack = vec![(entry, 0usize)];
+        visited[entry] = true;
+        while let Some(top) = stack.last_mut() {
+            let block = top.0;
+            if let Some(&next) = succs[block].get(top.1) {
+                top.1 += 1;
+                if !visited[next] {
+                    visited[next] = true;
+                    stack.push((next, 0));
+                }
+            } else {
+                postorder.push(block);
+                stack.pop();
+            }
+        }
+    }
+    postorder.reverse();
+    postorder.extend((0..n).filter(|&block| !visited[block]));
+    postorder
+}
+
+/// Collect only normal SSA predecessor arguments. Exception handlers have an
+/// implicit error edge and are never allowed to inherit ordinary-path facts.
+///
+/// Edges leaving an unreachable block never execute, so their arguments are
+/// ignored: they must not weaken the facts of a reachable parameter. This
+/// relies on `compute_reachable` being conservative (every block that can run,
+/// including handler-reachable ones, is marked reachable).
+fn boundary_phi_inputs(function: &Function, reachable: &[bool]) -> Vec<Vec<ValueId>> {
+    let mut inputs = vec![Vec::new(); function.values.len()];
+    for (block_ix, block) in function.blocks.iter().enumerate() {
+        if !reachable.get(block_ix).copied().unwrap_or(false) { continue; }
+        let Some(last) = block.insts.last() else { continue; };
+        let Some(node) = function.node(*last) else { continue; };
+        for edge in node.kind.edges() {
+            let Some(target) = function.block(edge.target) else { continue; };
+            for (parameter, source) in target.params.iter().zip(&edge.args) {
+                inputs[parameter.0 as usize].push(*source);
+            }
+        }
+    }
+    inputs
+}
+
+/// A cheap greatest fixed-point analysis of guaranteed SSA contracts.
+///
+/// Only successful BindInterface results, tagged literals, and a handful
+/// of intrinsically typed operations provide seed facts. Moves and block
+/// parameters merely forward facts. Starting these forwarding nodes at true
+/// and propagating false backwards through their users handles loop-carried
+/// block parameters without the false negatives of an optimistic `false` seed.
+/// An unvalidated entry parameter is always false even if its HIR Type is exact.
+///
+/// Every seed must produce a value in the same (tagged) representation as the
+/// BindInterface result it may replace, because elimination rewrites the bind
+/// into a plain `Move`. Raw Int32/F64 registers are never seeds. In the current
+/// bytecode VM, CmpInt, CmpF64 and RefEq produce tagged Bool values.
+fn boundary_proven_values(
+    function: &Function,
+    required: &Type,
+    phi_inputs: &[Vec<ValueId>],
+    live: &[bool],
+    handler_blocks: &[bool],
+    reachable: &[bool],
+) -> Vec<bool> {
+    use std::collections::VecDeque;
+
+    let n = function.values.len();
+    let mut proven = vec![false; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut forwarded: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (index, value) in function.values.iter().enumerate() {
+        let mut known = false;
+        let mut dependencies = Vec::new();
+        match value.def {
+            ValueDef::BlockParam(block, _) => {
+                let block_ix = block.0 as usize;
+                if block != function.entry
+                    && reachable.get(block_ix) == Some(&true)
+                    && !handler_blocks.get(block_ix).copied().unwrap_or(true)
+                    && !phi_inputs[index].is_empty()
+                {
+                    dependencies.extend(phi_inputs[index].iter().map(|id| id.0 as usize));
+                }
+            }
+            ValueDef::CaptureParam(_) => {}
+            ValueDef::InstResult(inst, _) if live.get(inst.0 as usize) == Some(&true) => {
+                match &function.nodes[inst.0 as usize].kind {
+                    Inst::BindInterface { value, expected, .. } => {
+                        known = boundary_contract_implies(required, expected);
+                        if !known { dependencies.push(value.0 as usize); }
+                    }
+                    // A speculative guard can be deleted by a different pass;
+                    // it must not be treated as a durable source-level proof.
+                    Inst::Move(source)
+                    | Inst::GuardType { value: source, .. }
+                    | Inst::GuardClass { value: source, .. }
+                    | Inst::GuardNotNull { value: source, .. } => {
+                        dependencies.push(source.0 as usize);
+                    }
+                    Inst::Const(constant) => {
+                        known = boundary_constant_proves(required, constant);
+                    }
+                    // All three comparison opcodes store Value::from_bool(...)
+                    // and therefore yield a tagged Bool (not a raw bit).
+                    Inst::CmpInt { .. } | Inst::CmpF64 { .. } | Inst::RefEq { .. }
+                        if required == &Type::Bool => {
+                        known = true;
+                    }
+                    Inst::Int32ToNum { .. } | Inst::F64ToNum { .. }
+                        if required == &Type::Num => {
+                        known = true;
+                    }
+                    Inst::AllocList { .. } if required == &Type::List(None) => {
+                        known = true;
+                    }
+                    Inst::AllocMap if required == &Type::Map => {
+                        known = true;
+                    }
+                    _ => {}
+                }
+            }
+            ValueDef::InstResult(_, _) => {}
+        }
+
+        if known {
+            proven[index] = true;
+        } else if !dependencies.is_empty() {
+            // Keep ALL dependencies: a phi is known only if every incoming
+            // value is known, including backedges and switch alternatives.
+            proven[index] = true;
+            forwarded[index] = dependencies;
+        }
+    }
+
+    for (index, dependencies) in forwarded.iter().enumerate() {
+        for &source in dependencies {
+            if let Some(users) = dependents.get_mut(source) {
+                users.push(index);
+            } else {
+                // The HIR verifier will reject this reference. Never use an
+                // invalid dependency as a proof in the meantime.
+                proven[index] = false;
+            }
+        }
+    }
+
+    let mut queue: VecDeque<usize> = proven.iter().enumerate()
+        .filter_map(|(index, known)| (!known).then_some(index))
+        .collect();
+    while let Some(value) = queue.pop_front() {
+        for &user in &dependents[value] {
+            if proven[user] {
+                proven[user] = false;
+                queue.push_back(user);
+            }
+        }
+    }
+    proven
+}
+
+fn boundary_live_nodes(function: &Function) -> Vec<bool> {
+    let mut live = vec![false; function.nodes.len()];
+    for block in &function.blocks {
+        for &id in &block.insts {
+            live[id.0 as usize] = true;
+        }
+    }
+    live
+}
+
+fn boundary_handlers(function: &Function) -> Vec<bool> {
+    let mut handlers = vec![false; function.blocks.len()];
+    for region in &function.exception_regions {
+        if let Some(handler) = handlers.get_mut(region.handler.0 as usize) {
+            *handler = true;
+        }
+    }
+    handlers
+}
+
+/// Eliminate a boundary only when the *SSA producer* has already established its
+/// contract on every path. Never infer proof merely from Value.ty: types on
+/// dynamic function entry parameters and optimistically specialized calls are
+/// not runtime validation certificates.
+#[derive(Default)]
+pub struct ProvenTypeBoundaryElimination;
+
+impl FunctionOptimization for ProvenTypeBoundaryElimination {
+    fn optimize_function(&mut self, function: &mut Function) -> bool {
+        let mut expected_types = Vec::<Type>::new();
+        for block in &function.blocks {
+            for &id in &block.insts {
+                if let Inst::BindInterface { expected, .. } = &function.nodes[id.0 as usize].kind {
+                    if !expected_types.contains(expected) {
+                        expected_types.push(expected.clone());
+                    }
+                }
+            }
+        }
+        if expected_types.is_empty() { return false; }
+
+        let live = boundary_live_nodes(function);
+        let reachable = compute_reachable(function);
+        let phi_inputs = boundary_phi_inputs(function, &reachable);
+        let handlers = boundary_handlers(function);
+        let mut changed_blocks = vec![false; function.blocks.len()];
+        let mut changed = false;
+
+        for expected in &expected_types {
+            let proven = boundary_proven_values(function, expected, &phi_inputs, &live, &handlers, &reachable);
+            for (block_ix, block) in function.blocks.iter().enumerate() {
+                for &id in &block.insts {
+                    if let Inst::BindInterface { value, expected: current, .. } =
+                        &function.nodes[id.0 as usize].kind
+                    {
+                        if current == expected && proven.get(value.0 as usize) == Some(&true) {
+                            let source = *value;
+                            function.nodes[id.0 as usize].kind = Inst::Move(source);
+                            changed_blocks[block_ix] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            for (block_ix, changed) in changed_blocks.into_iter().enumerate() {
+                if changed { repair_effect_chain(function, block_ix); }
+            }
+        }
+        changed
+    }
+}
+
+/// A must-analysis over normal CFG paths for successful contract installations.
+///
+/// Revalidating exactly the same SSA object (possibly through identity-preserving
+/// moves or checks) cannot add a new contract. Facts meet by intersection at
+/// merges, are loop-stable, and are killed at exception handler entries. The
+/// runtime protects all subsequent heap writes, so facts survive ordinary calls
+/// and safepoints: they describe the permanent *contract*, not a mutable field.
+///
+/// Only executable edges take part in the meet: unreachable predecessors are
+/// dropped so they cannot shrink the intersection. Bitsets are stored flat
+/// (`block * words + word`) and all buffers are reused across contracts and
+/// iterations; blocks are visited in reverse post-order so forward facts
+/// usually converge in one or two sweeps.
+#[derive(Default)]
+pub struct DominatingContractElimination;
+
+impl FunctionOptimization for DominatingContractElimination {
+    fn optimize_function(&mut self, function: &mut Function) -> bool {
+        let n = function.blocks.len();
+        if n == 0 { return false; }
+
+        let mut contracts = Vec::<Type>::new();
+        for block in &function.blocks {
+            for &id in &block.insts {
+                if let Inst::BindInterface { expected, .. } = &function.nodes[id.0 as usize].kind {
+                    if !contracts.contains(expected) { contracts.push(expected.clone()); }
+                }
+            }
+        }
+        if contracts.is_empty() { return false; }
+
+        let handlers = boundary_handlers(function);
+        let reachable = compute_reachable(function);
+        let is_reachable = |block: usize| reachable.get(block).copied().unwrap_or(false);
+        let succs = boundary_successors(function);
+        let mut preds = vec![Vec::<usize>::new(); n];
+        for (block_ix, targets) in succs.iter().enumerate() {
+            if !is_reachable(block_ix) { continue; }
+            for &target in targets { preds[target].push(block_ix); }
+        }
+        let order = boundary_block_order(function, &succs);
+        let entry = function.entry.0 as usize;
+        let is_root: Vec<bool> = (0..n)
+            .map(|block| {
+                block == entry || !is_reachable(block) || handlers[block] || preds[block].is_empty()
+            })
+            .collect();
+
+        let mut changed = false;
+        let mut changed_blocks = vec![false; n];
+        // Flat bitsets and scratch space, reused for every contract.
+        let mut generated = Vec::<u64>::new();
+        let mut inputs = Vec::<u64>::new();
+        let mut outputs = Vec::<u64>::new();
+        let mut scratch = Vec::<u64>::new();
+
+        for expected in &contracts {
+            // Index only the original SSA aliases actually checked for this
+            // type. This avoids a block-by-all-SSA-value bitset on big functions.
+            let mut roots = HashMap::<ValueId, usize>::default();
+            for block in &function.blocks {
+                for &id in &block.insts {
+                    if let Inst::BindInterface { value, expected: current, .. } =
+                        &function.nodes[id.0 as usize].kind
+                    {
+                        if current == expected {
+                            let root = object_alias_root(function, *value);
+                            let next = roots.len();
+                            roots.entry(root).or_insert(next);
+                        }
+                    }
+                }
+            }
+            if roots.is_empty() { continue; }
+            let Some(words) = roots.len().checked_add(63).map(|count| count / 64) else {
+                continue;
+            };
+            let Some(total_words) = n.checked_mul(words) else {
+                continue;
+            };
+            let span = |block: usize| block * words..(block + 1) * words;
+
+            generated.clear();
+            generated.resize(total_words, 0);
+            for (block_ix, block) in function.blocks.iter().enumerate() {
+                for &id in &block.insts {
+                    if let Inst::BindInterface { value, expected: installed, .. } =
+                        &function.nodes[id.0 as usize].kind
+                    {
+                        if boundary_contract_implies(expected, installed) {
+                            let root = object_alias_root(function, *value);
+                            if let Some(&bit) = roots.get(&root) {
+                                generated[block_ix * words + bit / 64] |= 1u64 << (bit % 64);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Greatest fixed point is needed for backedges. A check inside one
+            // loop iteration cannot justify its own first iteration unless a
+            // predecessor path already established the same contract.
+            inputs.clear();
+            inputs.resize(total_words, u64::MAX);
+            outputs.clear();
+            outputs.resize(total_words, u64::MAX);
+            for block in 0..n {
+                if is_root[block] {
+                    inputs[span(block)].fill(0);
+                    outputs[span(block)].copy_from_slice(&generated[span(block)]);
+                }
+            }
+
+            scratch.clear();
+            scratch.resize(words, 0);
+            let mut changed_dataflow = true;
+            while changed_dataflow {
+                changed_dataflow = false;
+                for &block in &order {
+                    // Roots have fixed facts: IN = ∅, OUT = GEN.
+                    if is_root[block] { continue; }
+
+                    // IN = ∩ OUT(executable predecessors)
+                    scratch.fill(u64::MAX);
+                    for &pred in &preds[block] {
+                        for (word, previous) in scratch.iter_mut().zip(&outputs[span(pred)]) {
+                            *word &= *previous;
+                        }
+                    }
+                    if inputs[span(block)] != scratch[..] {
+                        inputs[span(block)].copy_from_slice(&scratch);
+                    }
+
+                    // OUT = IN ∪ GEN
+                    for (word, added) in scratch.iter_mut().zip(&generated[span(block)]) {
+                        *word |= *added;
+                    }
+                    if outputs[span(block)] != scratch[..] {
+                        outputs[span(block)].copy_from_slice(&scratch);
+                        changed_dataflow = true;
+                    }
+                }
+            }
+
+            // Instructions are considered in source order. The first successful
+            // check makes the contract a fact for following instructions; only
+            // repetitions are rewritten. Never remove the establishing check.
+            for (block_ix, block) in function.blocks.iter().enumerate() {
+                scratch.copy_from_slice(&inputs[span(block_ix)]);
+                for &id in &block.insts {
+                    // Only an idempotent bind (one that `implies` the contract,
+                    // which excludes unions with heap members) establishes the
+                    // fact or can be removed; matching `GEN` above.
+                    let candidate = match &function.nodes[id.0 as usize].kind {
+                        Inst::BindInterface { value, expected: current, .. }
+                            if boundary_contract_implies(expected, current) =>
+                            Some((*value, current == expected)),
+                        _ => None,
+                    };
+                    let Some((source, is_target_bind)) = candidate else { continue; };
+                    let root = object_alias_root(function, source);
+                    let Some(&bit) = roots.get(&root) else { continue; };
+                    let mask = 1u64 << (bit % 64);
+                    if is_target_bind && scratch[bit / 64] & mask != 0 {
+                        function.nodes[id.0 as usize].kind = Inst::Move(source);
+                        changed_blocks[block_ix] = true;
+                        changed = true;
+                    }
+                    scratch[bit / 64] |= mask;
+                }
+            }
+        }
+        if changed {
+            for (block_ix, changed) in changed_blocks.into_iter().enumerate() {
+                if changed { repair_effect_chain(function, block_ix); }
+            }
+        }
+        changed
     }
 }
 
@@ -1647,21 +2226,21 @@ impl FunctionOptimization for FastLocalSimplify {
                 continue;
             }
 
-            let mut pure_values: HashMap<PureKey, ValueId> = HashMap::default();
-            let mut guards: HashMap<GuardKey, Option<ValueId>> = HashMap::default();
+            let mut pure_values: SmallMap<PureKey, ValueId> = SmallMap::default();
+            let mut guards: SmallMap16<GuardKey, Option<ValueId>> = SmallMap16::default();
 
-            let mut field_values: HashMap<FieldKey, ValueId> = HashMap::default();
-            let mut static_values: HashMap<StaticFieldKey, ValueId> = HashMap::default();
-            let mut cell_values: HashMap<ValueId, ValueId> = HashMap::default();
-            let mut module_values: HashMap<ModuleKey, ValueId> = HashMap::default();
-            let mut list_values: HashMap<SeqReadKey, ValueId> = HashMap::default();
-            let mut map_values: HashMap<SeqReadKey, ValueId> = HashMap::default();
-            let mut string_values: HashMap<SeqReadKey, ValueId> = HashMap::default();
+            let mut field_values: SmallMap<FieldKey, ValueId> = SmallMap::default();
+            let mut static_values: SmallMap<StaticFieldKey, ValueId> = SmallMap::default();
+            let mut cell_values: SmallMap<ValueId, ValueId> = SmallMap::default();
+            let mut module_values: SmallMap<ModuleKey, ValueId> = SmallMap::default();
+            let mut list_values: SmallMap<SeqReadKey, ValueId> = SmallMap::default();
+            let mut map_values: SmallMap<SeqReadKey, ValueId> = SmallMap::default();
+            let mut string_values: SmallMap<SeqReadKey, ValueId> = SmallMap::default();
 
-            let mut last_field_store: HashMap<FieldKey, InstId> = HashMap::default();
-            let mut last_static_store: HashMap<StaticFieldKey, InstId> = HashMap::default();
-            let mut last_cell_store: HashMap<ValueId, InstId> = HashMap::default();
-            let mut last_module_store: HashMap<ModuleKey, InstId> = HashMap::default();
+            let mut last_field_store: SmallMap<FieldKey, InstId> = SmallMap::default();
+            let mut last_static_store: SmallMap<StaticFieldKey, InstId> = SmallMap::default();
+            let mut last_cell_store: SmallMap<ValueId, InstId> = SmallMap::default();
+            let mut last_module_store: SmallMap<ModuleKey, InstId> = SmallMap::default();
 
             let mut effect_shape_changed = false;
 
@@ -1700,7 +2279,9 @@ impl FunctionOptimization for FastLocalSimplify {
                 }
 
                 if let Some((key, result)) = guard_fact(function, id, &kind) {
-                    guards.entry(key).or_insert(result);
+                    if !guards.contains_key(&key) {
+                        guards.insert(key, result);
+                    }
                 }
 
                 kind = function.nodes[id.0 as usize].kind.clone();
@@ -2017,7 +2598,7 @@ fn redundant_guard_replacement(
     function: &Function,
     _id: InstId,
     kind: &Inst,
-    guards: &HashMap<GuardKey, Option<ValueId>>,
+    guards: &SmallMap16<GuardKey, Option<ValueId>>,
 ) -> Option<GuardReplacement> {
     let key = match kind {
         Inst::GuardType { value, expected, .. } => {
@@ -2201,7 +2782,7 @@ fn cse_read(
     function: &mut Function,
     id: InstId,
     key: SeqReadKey,
-    values: &mut HashMap<SeqReadKey, ValueId>,
+    values: &mut SmallMap<SeqReadKey, ValueId>,
     changed: &mut bool,
     effect_shape_changed: &mut bool,
 ) {
@@ -2215,12 +2796,12 @@ fn cse_read(
 }
 
 fn invalidate_memory_values(
-    fields: &mut HashMap<FieldKey, ValueId>,
-    statics: &mut HashMap<StaticFieldKey, ValueId>,
-    cells: &mut HashMap<ValueId, ValueId>,
-    modules: &mut HashMap<ModuleKey, ValueId>,
-    lists: &mut HashMap<SeqReadKey, ValueId>,
-    maps: &mut HashMap<SeqReadKey, ValueId>,
+    fields: &mut SmallMap<FieldKey, ValueId>,
+    statics: &mut SmallMap<StaticFieldKey, ValueId>,
+    cells: &mut SmallMap<ValueId, ValueId>,
+    modules: &mut SmallMap<ModuleKey, ValueId>,
+    lists: &mut SmallMap<SeqReadKey, ValueId>,
+    maps: &mut SmallMap<SeqReadKey, ValueId>,
 ) {
     fields.clear();
     statics.clear();
@@ -2231,10 +2812,10 @@ fn invalidate_memory_values(
 }
 
 fn clear_last_stores(
-    fields: &mut HashMap<FieldKey, InstId>,
-    statics: &mut HashMap<StaticFieldKey, InstId>,
-    cells: &mut HashMap<ValueId, InstId>,
-    modules: &mut HashMap<ModuleKey, InstId>,
+    fields: &mut SmallMap<FieldKey, InstId>,
+    statics: &mut SmallMap<StaticFieldKey, InstId>,
+    cells: &mut SmallMap<ValueId, InstId>,
+    modules: &mut SmallMap<ModuleKey, InstId>,
 ) {
     fields.clear();
     statics.clear();
@@ -2958,6 +3539,401 @@ fn live_instruction_ids(function: &Function) -> Vec<InstId> {
     }
 
     ids
+}
+
+#[cfg(test)]
+mod sound_type_boundary_tests {
+    use super::*;
+    use crate::napalm_ir::{Builder, FunctionKind, InterfaceFieldType, Program};
+
+    fn bind(builder: &mut Builder<'_>, value: ValueId, expected: Type) -> ValueId {
+        builder.emit1(
+            Inst::BindInterface {
+                value,
+                expected: expected.clone(),
+                layout: None,
+            },
+            expected,
+        )
+    }
+
+    fn is_check(function: &Function, value: ValueId) -> bool {
+        let ValueDef::InstResult(inst, _) = function.value(value).unwrap().def else {
+            panic!("expected instruction result");
+        };
+        matches!(&function.node(inst).unwrap().kind, Inst::BindInterface { .. })
+    }
+
+    fn is_move(function: &Function, value: ValueId) -> bool {
+        let ValueDef::InstResult(inst, _) = function.value(value).unwrap().def else {
+            panic!("expected instruction result");
+        };
+        matches!(&function.node(inst).unwrap().kind, Inst::Move(_))
+    }
+
+    #[test]
+    fn dynamic_entry_keeps_first_scalar_check_even_when_hir_type_is_number() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "typed_entry",
+            FunctionKind::Closure, vec![Type::Num], Type::Num);
+        let unknown = builder.param(0);
+        let first = bind(&mut builder, unknown, Type::Num);
+        let repeated = bind(&mut builder, first, Type::Num);
+        builder.ret(repeated);
+        let function_id = builder.finish();
+        let function = &mut program.functions[function_id.0 as usize];
+        assert!(ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(is_check(function, first));
+        assert!(is_move(function, repeated));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn same_dynamic_ssa_word_is_checked_only_once() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "same_value",
+            FunctionKind::Closure, vec![Type::Top], Type::Num);
+        let incoming = builder.param(0);
+        let first = bind(&mut builder, incoming, Type::Num);
+        let repeated = bind(&mut builder, incoming, Type::Num);
+        builder.ret(repeated);
+        let function_id = builder.finish();
+        let function = &mut program.functions[function_id.0 as usize];
+        assert!(!ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(DominatingContractElimination.optimize_function(function));
+        assert!(is_check(function, first));
+        assert!(is_move(function, repeated));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn persistent_contract_is_installed_once_but_different_contract_is_preserved() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "persistent",
+            FunctionKind::Closure, vec![Type::Top], Type::Top);
+        let incoming = builder.param(0);
+        let record = Type::Record(vec![InterfaceFieldType {
+            name: "x".into(), ty: Type::Num, optional: false, readonly: false,
+        }]);
+        let other = Type::Record(vec![InterfaceFieldType {
+            name: "y".into(), ty: Type::Bool, optional: false, readonly: false,
+        }]);
+        let first = bind(&mut builder, incoming, record.clone());
+        let repeated = bind(&mut builder, first, record);
+        let different = bind(&mut builder, repeated, other);
+        builder.ret(different);
+        let function_id = builder.finish();
+        let function = &mut program.functions[function_id.0 as usize];
+        assert!(ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(is_check(function, first));
+        assert!(is_move(function, repeated));
+        assert!(is_check(function, different));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn diamond_requires_checks_on_every_predecessor() {
+        for both_checked in [false, true] {
+            let mut program = Program::new();
+            let module = program.add_module("boundary", 0);
+            let mut builder = Builder::new(&mut program, module, "diamond",
+                FunctionKind::Closure, vec![Type::Bool, Type::Top], Type::Num);
+            let condition = builder.param(0);
+            let incoming = builder.param(1);
+            let left = builder.new_block(&[]);
+            let right = builder.new_block(&[]);
+            let join = builder.new_block(&[]);
+            builder.branch(condition, left, vec![], right, vec![]);
+            builder.position_at(left);
+            let _left_bound = bind(&mut builder, incoming, Type::Num);
+            builder.jump(join, vec![]);
+            builder.position_at(right);
+            if both_checked {
+                let _right_bound = bind(&mut builder, incoming, Type::Num);
+            }
+            builder.jump(join, vec![]);
+            builder.position_at(join);
+            let after_join = bind(&mut builder, incoming, Type::Num);
+            builder.ret(after_join);
+            let id = builder.finish();
+            let function = &mut program.functions[id.0 as usize];
+            let changed = DominatingContractElimination.optimize_function(function);
+            assert_eq!(changed, both_checked);
+            assert_eq!(is_move(function, after_join), both_checked);
+            crate::napalm_ir::verify_function(function).unwrap();
+        }
+    }
+
+    #[test]
+    fn merging_checked_values_preserves_proof_across_block_parameters() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "phi",
+            FunctionKind::Closure, vec![Type::Bool, Type::Top, Type::Top], Type::Num);
+        let condition = builder.param(0);
+        let first = builder.param(1);
+        let second = builder.param(2);
+        let left = builder.new_block(&[]);
+        let right = builder.new_block(&[]);
+        let join = builder.new_block(&[Type::Num]);
+        builder.branch(condition, left, vec![], right, vec![]);
+        builder.position_at(left);
+        let validated_left = bind(&mut builder, first, Type::Num);
+        builder.jump(join, vec![validated_left]);
+        builder.position_at(right);
+        let validated_right = bind(&mut builder, second, Type::Num);
+        builder.jump(join, vec![validated_right]);
+        builder.position_at(join);
+        let phi = builder.block_param(join, 0);
+        let redundant = bind(&mut builder, phi, Type::Num);
+        builder.ret(redundant);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(is_move(function, redundant));
+        assert!(is_check(function, validated_left));
+        assert!(is_check(function, validated_right));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn loop_carried_phi_proof_requires_a_checked_entry_edge() {
+        for entry_checked in [false, true] {
+            let mut program = Program::new();
+            let module = program.add_module("boundary", 0);
+            let mut builder = Builder::new(&mut program, module, "loop",
+                FunctionKind::Closure, vec![Type::Bool, Type::Top], Type::Num);
+            let condition = builder.param(0);
+            let dynamic = builder.param(1);
+            let header = builder.new_block(&[Type::Top]);
+            let exit = builder.new_block(&[Type::Num]);
+            let initial = if entry_checked {
+                bind(&mut builder, dynamic, Type::Num)
+            } else {
+                dynamic
+            };
+            builder.jump(header, vec![initial]);
+            builder.position_at(header);
+            let phi = builder.block_param(header, 0);
+            let checked = bind(&mut builder, phi, Type::Num);
+            builder.branch(condition, header, vec![checked], exit, vec![checked]);
+            builder.position_at(exit);
+            builder.ret(builder.block_param(exit, 0));
+            let id = builder.finish();
+            let function = &mut program.functions[id.0 as usize];
+            let changed = ProvenTypeBoundaryElimination.optimize_function(function);
+            assert_eq!(changed, entry_checked);
+            assert_eq!(is_move(function, checked), entry_checked);
+            crate::napalm_ir::verify_function(function).unwrap();
+        }
+    }
+
+    #[test]
+    fn exception_handler_does_not_inherit_validated_contracts() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "catch",
+            FunctionKind::Closure, vec![Type::Top], Type::Num);
+        let dynamic = builder.param(0);
+        let protected = builder.new_block(&[]);
+        let handler = builder.new_block(&[Type::Top]);
+        builder.jump(protected, vec![]);
+        builder.position_at(protected);
+        let first = bind(&mut builder, dynamic, Type::Num);
+        builder.ret(first);
+        builder.position_at(handler);
+        let error = builder.block_param(handler, 0);
+        let checked = bind(&mut builder, dynamic, Type::Num);
+        builder.ret(checked);
+        builder.add_exception_region(vec![protected], handler, error, 0);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(!ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(!DominatingContractElimination.optimize_function(function));
+        assert!(is_check(function, checked));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn scalar_union_reuses_a_checked_scalar_without_skipping_the_first_boundary() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "scalar_union",
+            FunctionKind::Closure, vec![Type::Top], Type::Top);
+        let dynamic = builder.param(0);
+        let first = bind(&mut builder, dynamic, Type::Num);
+        let union = Type::Union(vec![Type::Num, Type::Null]);
+        let redundant = bind(&mut builder, first, union);
+        builder.ret(redundant);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(is_check(function, first));
+        assert!(is_move(function, redundant));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn mutable_contract_union_is_not_assumed_idempotent() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "contract_union",
+            FunctionKind::Closure, vec![Type::Top], Type::Top);
+        let dynamic = builder.param(0);
+        let record = Type::Record(vec![InterfaceFieldType {
+            name: "value".into(), ty: Type::Num, optional: false, readonly: false,
+        }]);
+        let union = Type::Union(vec![record, Type::Null]);
+        let first = bind(&mut builder, dynamic, union.clone());
+        let second = bind(&mut builder, first, union);
+        builder.ret(second);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(!ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(!DominatingContractElimination.optimize_function(function));
+        assert!(is_check(function, first));
+        assert!(is_check(function, second));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn internal_int32_is_not_a_tagged_number_proof() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "raw_int",
+            FunctionKind::Closure, vec![], Type::Num);
+        let internal = builder.const_i32(42);
+        let checked = bind(&mut builder, internal, Type::Num);
+        builder.ret(checked);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(!ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(!DominatingContractElimination.optimize_function(function));
+        assert!(is_check(function, checked));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn shallow_list_checks_do_not_replace_element_contract_installation() {
+        let shallow = Type::List(None);
+        let any = Type::List(Some(Box::new(Type::Top)));
+        let numbers = Type::List(Some(Box::new(Type::Num)));
+
+        assert!(boundary_contract_implies(&shallow, &any));
+        assert!(boundary_contract_implies(&shallow, &numbers));
+        assert!(!boundary_contract_implies(&any, &shallow));
+        assert!(!boundary_contract_implies(&numbers, &shallow));
+        assert!(!boundary_contract_implies(&any, &numbers));
+        assert!(!boundary_contract_implies(&numbers, &any));
+    }
+
+    #[test]
+    fn comparison_result_is_a_tagged_bool_and_proves_a_bool_boundary() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "comparison",
+            FunctionKind::Closure, vec![], Type::Bool);
+        let lhs = builder.const_i32(2);
+        let rhs = builder.const_i32(3);
+        let compared = builder.emit1(
+            Inst::CmpInt { kind: CmpKind::Lt, left: lhs, right: rhs }, Type::Bool);
+        let redundant = bind(&mut builder, compared, Type::Bool);
+        builder.ret(redundant);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(is_move(function, redundant));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn float_comparison_result_proves_bool_boundary() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "float_comparison",
+            FunctionKind::Closure, vec![], Type::Bool);
+        let lhs_num = builder.const_num(2.0);
+        let rhs_num = builder.const_num(3.0);
+        let lhs = builder.emit1(Inst::NumToF64 { value: lhs_num }, Type::F64);
+        let rhs = builder.emit1(Inst::NumToF64 { value: rhs_num }, Type::F64);
+        let compared = builder.emit1(
+            Inst::CmpF64 { kind: CmpKind::Lt, left: lhs, right: rhs }, Type::Bool);
+        let redundant = bind(&mut builder, compared, Type::Bool);
+        builder.ret(redundant);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(is_move(function, redundant));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn reference_equality_result_proves_bool_boundary() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "reference_equality",
+            FunctionKind::Closure, vec![], Type::Bool);
+        let lhs = builder.const_null();
+        let rhs = builder.const_null();
+        let compared = builder.emit1(Inst::RefEq { left: lhs, right: rhs }, Type::Bool);
+        let redundant = bind(&mut builder, compared, Type::Bool);
+        builder.ret(redundant);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(is_move(function, redundant));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn unreachable_predecessor_cannot_erase_reachable_phi_proof() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "dead_predecessor",
+            FunctionKind::Closure, vec![Type::Top], Type::Num);
+        let dynamic = builder.param(0);
+        let join = builder.new_block(&[Type::Top]);
+        let dead = builder.new_block(&[]);
+        let checked = bind(&mut builder, dynamic, Type::Num);
+        builder.jump(join, vec![checked]);
+        builder.position_at(dead);
+        builder.jump(join, vec![dynamic]);
+        builder.position_at(join);
+        let incoming = builder.block_param(join, 0);
+        let repeated = bind(&mut builder, incoming, Type::Num);
+        builder.ret(repeated);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(is_check(function, checked));
+        assert!(is_move(function, repeated));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
+    #[test]
+    fn first_list_any_contract_cannot_be_skipped_after_list_number_contract() {
+        let mut program = Program::new();
+        let module = program.add_module("boundary", 0);
+        let mut builder = Builder::new(&mut program, module, "invariant_list",
+            FunctionKind::Closure, vec![Type::Top], Type::Top);
+        let dynamic = builder.param(0);
+        let numeric_type = Type::List(Some(Box::new(Type::Num)));
+        let any_type = Type::List(Some(Box::new(Type::Top)));
+        let numeric = bind(&mut builder, dynamic, numeric_type);
+        let any = bind(&mut builder, numeric, any_type);
+        builder.ret(any);
+        let id = builder.finish();
+        let function = &mut program.functions[id.0 as usize];
+        assert!(!ProvenTypeBoundaryElimination.optimize_function(function));
+        assert!(!DominatingContractElimination.optimize_function(function));
+        assert!(is_check(function, numeric));
+        assert!(is_check(function, any));
+        crate::napalm_ir::verify_function(function).unwrap();
+    }
+
 }
 
 #[cfg(test)]

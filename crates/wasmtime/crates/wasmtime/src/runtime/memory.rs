@@ -10,6 +10,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::cell::UnsafeCell;
 use core::fmt;
+use core::ops::Range;
 use core::slice;
 use core::time::Duration;
 use wasmtime_environ::{DefinedMemoryIndex, MemoryTunables};
@@ -400,6 +401,33 @@ impl Memory {
         Ok(())
     }
 
+    /// Returns the [`LinearMemory`] backing this memory if it is of the concrete type `M`.
+    ///
+    /// This is intended for embedders that create memories with a custom
+    /// [`MemoryCreator`] (see [`Config::with_host_memory`](crate::Config::with_host_memory))
+    /// and need to inspect the created [`LinearMemory`] object after instantiation.
+    ///
+    /// Returns `None` if the memory is not of type `M`.
+    /// Keeping the concrete `M` returned by a [`MemoryCreator`] private
+    /// ensures that no other code with access to the store can obtain it.
+    ///
+    /// Note that this method will consider the entire store context provided as
+    /// borrowed for the duration of the lifetime of the returned reference.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this memory doesn't belong to `store`.
+    pub fn linear_memory<'a, M: LinearMemory, T: 'static>(
+        &self,
+        store: impl Into<StoreContext<'a, T>>,
+    ) -> Option<&'a M> {
+        let store: &'a StoreOpaque = store.into().0;
+        let memory: &'a dyn Any = store[self.instance]
+            .get_defined_memory(self.index)
+            .as_linear_memory()?;
+        memory.downcast_ref()
+    }
+
     /// Returns this memory as a native Rust slice.
     ///
     /// Note that this method will consider the entire store context provided as
@@ -468,6 +496,85 @@ impl Memory {
             let data = &mut *(store.data_mut() as *mut T);
             (self.data_mut(store), data)
         }
+    }
+
+    /// Returns `range` of this memory as a native Rust slice, or an error if
+    /// it is out of bounds.
+    ///
+    /// Note that this method will consider the entire store context provided as
+    /// borrowed for the duration of the lifetime of the returned slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this memory doesn't belong to `store`.
+    pub fn data_range<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContext<'a, T>>,
+        range: Range<usize>,
+    ) -> Result<&'a [u8], MemoryAccessError> {
+        self.data(store)
+            .get(range)
+            .ok_or(MemoryAccessError { _private: () })
+    }
+
+    /// Returns `range` of this memory as a native Rust mutable slice, or an
+    /// error if it is out of bounds.
+    ///
+    /// Unlike [`Memory::data_mut`], which hands out all of memory,
+    /// only this range is borrowed for modification, so that Wasmtime
+    /// knows precisely what the host may modify. Prefer this method
+    /// over `data_mut` plus a sub-slice operation: the additional
+    /// semantic information about written memory may be useful to
+    /// Wasmtime for efficiency reasons in some cases.
+    ///
+    /// Note that this method will consider the entire store context provided as
+    /// borrowed for the duration of the lifetime of the returned slice. See
+    /// [`Memory::data_ranges_and_store_data_mut`] to access multiple ranges
+    /// while also borrowing the store's data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this memory doesn't belong to `store`.
+    pub fn data_range_mut<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+        range: Range<usize>,
+    ) -> Result<&'a mut [u8], MemoryAccessError> {
+        let store = store.into();
+        MemoryRanges {
+            memory: *self,
+            store: store.0,
+        }
+        .into_range_mut(range)
+    }
+
+    /// Like [`Memory::data_and_store_mut`], but returns a [`MemoryRanges`]
+    /// through which ranges of memory are read and modified, rather than one
+    /// slice of all of memory, alongside the store's data (the `T` in
+    /// [`Store<T>`](crate::Store)).
+    ///
+    /// This is useful for host code that works with the store's `T` while
+    /// accessing several parts of memory, such as the bindings of a WASI
+    /// implementation: as with [`Memory::data_range_mut`], only the ranges
+    /// borrowed for modification are considered modified.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this memory doesn't belong to `store`.
+    pub fn data_ranges_and_store_data_mut<'a, T: 'static>(
+        &self,
+        store: impl Into<StoreContextMut<'a, T>>,
+    ) -> (MemoryRanges<'a>, &'a mut T) {
+        let store = store.into();
+        assert!(self.comes_from_same_store(store.0));
+        let (data, opaque) = store.0.data_and_opaque_mut();
+        (
+            MemoryRanges {
+                memory: *self,
+                store: opaque,
+            },
+            data,
+        )
     }
 
     /// Returns the base pointer, in the host's address space, that the memory
@@ -708,6 +815,32 @@ impl Memory {
         store.id() == self.instance.store_id()
     }
 
+    /// This memory's watchpoint shadow, if compiled code checks it.
+    pub(crate) fn vm_shadow<'a>(
+        &self,
+        store: &'a StoreOpaque,
+    ) -> Option<&'a crate::runtime::vm::ShadowMemory> {
+        store[self.instance].get_defined_memory(self.index).shadow()
+    }
+
+    /// This memory's watchpoint shadow, if compiled code checks it.
+    #[cfg(feature = "debug")]
+    pub(crate) fn vm_shadow_mut<'a>(
+        &self,
+        store: &'a mut StoreOpaque,
+    ) -> Option<&'a mut crate::runtime::vm::ShadowMemory> {
+        self.instance
+            .get_mut(store)
+            .get_defined_memory_mut(self.index)
+            .shadow_mut()
+    }
+
+    /// Whether this is the same memory as `other`.
+    #[cfg(feature = "debug")]
+    pub(crate) fn same(&self, other: &Memory) -> bool {
+        self.instance == other.instance && self.index == other.index
+    }
+
     /// Returns a stable identifier for this memory within its store.
     ///
     /// This allows distinguishing memories when introspecting them
@@ -778,6 +911,11 @@ impl Memory {
 /// then every byte from `as_ptr() + byte_size()`, rounded up to the next host page boundary, up to
 /// `as_ptr() + max(reserved_size_in_bytes, byte_size()) + guard_size_in_bytes` must be
 /// inaccessible, so that any access to it faults. This must hold at all times, including after growth.
+///
+/// - **Shared access.** Embedders can obtain `&Self` through [`Memory::linear_memory`] whenever
+/// the owning store is not in use. Methods taking `&self` must therefore be safe to call at any
+/// such time, from any thread, and must not hand out mutable access to state that Wasmtime or
+/// WebAssembly code also mutates, such as the memory's contents.
 ///
 /// Additionally, observe the safety requirements when the memory is accessed, as explained in [`Memory`].
 ///
@@ -1578,5 +1716,71 @@ mod tests {
         assert!(mapped[data_start + 5..].iter().all(|b| *b == 0));
 
         Ok(())
+    }
+}
+
+/// Access to ranges of a [`Memory`], from
+/// [`Memory::data_ranges_and_store_data_mut`].
+///
+/// Ranges are read with [`MemoryRanges::data_range`] (or all of memory with
+/// [`MemoryRanges::data`]) and modified with
+/// [`MemoryRanges::data_range_mut`], which considers only the range it
+/// returns modified.
+pub struct MemoryRanges<'a> {
+    memory: Memory,
+    store: &'a mut StoreOpaque,
+}
+
+impl<'a> MemoryRanges<'a> {
+    /// The length of the memory, in bytes.
+    pub fn len(&self) -> usize {
+        self.memory.internal_data_size(self.store)
+    }
+
+    /// Whether the memory is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// All of the memory, for reading.
+    pub fn data(&self) -> &[u8] {
+        let definition = self.store[self.memory.instance].memory(self.memory.index);
+        // SAFETY: the store owns this non-shared memory, and this borrow of
+        // `self` excludes modification through it.
+        unsafe { slice::from_raw_parts(definition.base.as_ptr(), definition.current_length()) }
+    }
+
+    /// `range` of the memory, for reading, or an error if it is out of
+    /// bounds.
+    pub fn data_range(&self, range: Range<usize>) -> Result<&[u8], MemoryAccessError> {
+        self.data()
+            .get(range)
+            .ok_or(MemoryAccessError { _private: () })
+    }
+
+    /// `range` of the memory, for modification, or an error if it is out of
+    /// bounds. Only this range is considered modified.
+    pub fn data_range_mut(&mut self, range: Range<usize>) -> Result<&mut [u8], MemoryAccessError> {
+        MemoryRanges {
+            memory: self.memory,
+            store: &mut *self.store,
+        }
+        .into_range_mut(range)
+    }
+
+    fn into_range_mut(self, range: Range<usize>) -> Result<&'a mut [u8], MemoryAccessError> {
+        let len = self.len();
+        if range.start > range.end || range.end > len {
+            return Err(MemoryAccessError { _private: () });
+        }
+        let definition = self.store[self.memory.instance].memory(self.memory.index);
+        // SAFETY: the range is in bounds, and the store, which owns this
+        // non-shared memory, is borrowed for the slice's lifetime.
+        unsafe {
+            Ok(slice::from_raw_parts_mut(
+                definition.base.as_ptr().add(range.start),
+                range.len(),
+            ))
+        }
     }
 }

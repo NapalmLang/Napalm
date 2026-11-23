@@ -616,6 +616,7 @@ impl MxOptimizer {
             }
             drop(tx);
         });
+        drop(rx);
 
         let collected = errors.into_inner();
         if !collected.is_empty() {

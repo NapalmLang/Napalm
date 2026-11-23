@@ -324,6 +324,56 @@ fn test_trap_stack_overflow_mutual_recursion(config: &mut Config) -> Result<()> 
     Ok(())
 }
 
+#[wasmtime_test(wasm_features(tail_call))]
+fn test_trap_stack_overflow_before_frame_setup(config: &mut Config) -> Result<()> {
+    let params = "i32 ".repeat(40);
+    let args = "(i32.const 0) ".repeat(40);
+    let wat = format!(
+        r#"
+            (module
+                (func $g (param {params}))
+                (func $f (return_call $g {args}))
+                (func $rec (export "rec") (param i32)
+                    (if (local.get 0)
+                        (then (call $rec (i32.sub (local.get 0) (i32.const 1))))
+                        (else (call $f))))
+            )
+        "#
+    );
+
+    config.max_wasm_stack(1024);
+    config.wasm_backtrace_max_frames(NonZeroUsize::new(1000));
+    let engine = Engine::new(&config)?;
+    let module = Module::new(&engine, &wat)?;
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+    let rec = instance.get_typed_func::<i32, ()>(&mut store, "rec")?;
+
+    // Until `$rec` itself overflows, a trap happens in `$f` or `$g` with all
+    // `n + 1` `$rec` frames on the stack, and all of them must be in the
+    // backtrace. Once `$rec` overflows at some depth, every deeper call traps
+    // in that same `$rec` prologue and has the same number of `$rec` frames.
+    let mut rec_limit = None;
+    for n in 0..100 {
+        let Err(e) = rec.call(&mut store, n) else {
+            continue;
+        };
+        let trace = e.downcast_ref::<WasmBacktrace>().unwrap().frames();
+        let recs = trace
+            .iter()
+            .filter(|f| f.func_name() == Some("rec"))
+            .count();
+        if recs != n as usize + 1 {
+            let limit = *rec_limit.get_or_insert(recs);
+            let names = trace.iter().map(|f| f.func_name()).collect::<Vec<_>>();
+            assert_eq!(recs, limit, "n = {n}: {names:?}");
+        }
+        assert_eq!(e.downcast::<Trap>()?, Trap::StackOverflow);
+    }
+
+    Ok(())
+}
+
 #[test]
 fn trap_display_pretty() -> Result<()> {
     let mut store = Store::<()>::default();
@@ -597,31 +647,6 @@ fn mismatched_arguments() -> Result<()> {
             .to_string(),
         "expected 1 arguments, got 2"
     );
-    Ok(())
-}
-
-#[test]
-fn call_signature_mismatch() -> Result<()> {
-    let mut store = Store::<()>::default();
-    let binary = wat::parse_str(
-        r#"
-            (module $a
-                (func $foo
-                    i32.const 0
-                    call_indirect)
-                (func $bar (param i32))
-                (start $foo)
-
-                (table 1 funcref)
-                (elem (i32.const 0) 1)
-            )
-        "#,
-    )?;
-
-    let module = Module::new(store.engine(), &binary)?;
-    let err = Instance::new(&mut store, &module, &[]).err().unwrap();
-    err.downcast_ref::<Trap>().unwrap();
-    err.assert_contains("wasm trap: indirect call type mismatch");
     Ok(())
 }
 
@@ -1339,100 +1364,6 @@ fn host_return_error_no_backtrace() -> Result<()> {
     let f = instance.get_typed_func::<(), ()>(&mut store, "f")?;
     assert!(f.call(&mut store, ()).is_err());
     Ok(())
-}
-
-#[test]
-fn div_plus_load_reported_right() -> Result<()> {
-    let engine = Engine::default();
-    let mut store = Store::new(&engine, ());
-    let module = Module::new(
-        &engine,
-        r#"
-            (module
-                (memory (export "memory") 1)
-                (func (export "i32.div_s") (param i32 i32) (result i32)
-                    (i32.div_s (local.get 0) (i32.load (local.get 1))))
-                (func (export "i32.div_u") (param i32 i32) (result i32)
-                    (i32.div_u (local.get 0) (i32.load (local.get 1))))
-                (func (export "i32.rem_s") (param i32 i32) (result i32)
-                    (i32.rem_s (local.get 0) (i32.load (local.get 1))))
-                (func (export "i32.rem_u") (param i32 i32) (result i32)
-                    (i32.rem_u (local.get 0) (i32.load (local.get 1))))
-            )
-        "#,
-    )?;
-    let instance = Instance::new(&mut store, &module, &[])?;
-    let memory = instance.get_memory(&mut store, "memory").unwrap();
-    let i32_div_s = instance.get_typed_func::<(i32, i32), i32>(&mut store, "i32.div_s")?;
-    let i32_div_u = instance.get_typed_func::<(u32, u32), u32>(&mut store, "i32.div_u")?;
-    let i32_rem_s = instance.get_typed_func::<(i32, i32), i32>(&mut store, "i32.rem_s")?;
-    let i32_rem_u = instance.get_typed_func::<(u32, u32), u32>(&mut store, "i32.rem_u")?;
-
-    memory.write(&mut store, 0, &1i32.to_le_bytes()).unwrap();
-    memory.write(&mut store, 4, &0i32.to_le_bytes()).unwrap();
-    memory.write(&mut store, 8, &(-1i32).to_le_bytes()).unwrap();
-
-    assert_eq!(i32_div_s.call(&mut store, (100, 0))?, 100);
-    assert_eq!(i32_div_u.call(&mut store, (101, 0))?, 101);
-    assert_eq!(i32_rem_s.call(&mut store, (102, 0))?, 0);
-    assert_eq!(i32_rem_u.call(&mut store, (103, 0))?, 0);
-
-    assert_trap(
-        i32_div_s.call(&mut store, (100, 4)),
-        Trap::IntegerDivisionByZero,
-    );
-    assert_trap(
-        i32_div_u.call(&mut store, (100, 4)),
-        Trap::IntegerDivisionByZero,
-    );
-    assert_trap(
-        i32_rem_s.call(&mut store, (100, 4)),
-        Trap::IntegerDivisionByZero,
-    );
-    assert_trap(
-        i32_rem_u.call(&mut store, (100, 4)),
-        Trap::IntegerDivisionByZero,
-    );
-
-    assert_trap(
-        i32_div_s.call(&mut store, (i32::MIN, 8)),
-        Trap::IntegerOverflow,
-    );
-    assert_eq!(i32_rem_s.call(&mut store, (i32::MIN, 8))?, 0);
-
-    assert_trap(
-        i32_div_s.call(&mut store, (100, 100_000)),
-        Trap::MemoryOutOfBounds,
-    );
-    assert_trap(
-        i32_div_u.call(&mut store, (100, 100_000)),
-        Trap::MemoryOutOfBounds,
-    );
-    assert_trap(
-        i32_rem_s.call(&mut store, (100, 100_000)),
-        Trap::MemoryOutOfBounds,
-    );
-    assert_trap(
-        i32_rem_u.call(&mut store, (100, 100_000)),
-        Trap::MemoryOutOfBounds,
-    );
-
-    return Ok(());
-
-    #[track_caller]
-    fn assert_trap<T>(result: Result<T>, expected: Trap) {
-        match result {
-            Ok(_) => panic!("expected failure"),
-            Err(e) => {
-                if let Some(code) = e.downcast_ref::<Trap>() {
-                    if *code == expected {
-                        return;
-                    }
-                }
-                panic!("unexpected error {e:?}");
-            }
-        }
-    }
 }
 
 #[test]

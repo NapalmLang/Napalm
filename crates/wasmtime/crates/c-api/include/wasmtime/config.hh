@@ -433,6 +433,14 @@ class Config {
     wasmtime_config_wasm_memory64_set(ptr.get(), enable);
   }
 
+  /// \brief Configures whether the WebAssembly stack switching proposal is
+  /// enabled
+  ///
+  /// https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.wasm_stack_switching
+  void wasm_stack_switching(bool enable) {
+    wasmtime_config_wasm_stack_switching_set(ptr.get(), enable);
+  }
+
 #ifdef WASMTIME_FEATURE_GC
   /// \brief Configures whether the WebAssembly Garbage Collection proposal will
   /// be enabled
@@ -625,6 +633,14 @@ class Config {
   /// https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.native_unwind_info
   void native_unwind_info(bool enable) {
     wasmtime_config_native_unwind_info_set(ptr.get(), enable);
+  }
+
+  /// \brief Configures whether compiled code is compatible with a Wasmtime
+  /// runtime built with AddressSanitizer.
+  ///
+  /// https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.asan_compatible_code
+  void asan_compatible_code(bool enable) {
+    wasmtime_config_asan_compatible_code_set(ptr.get(), enable);
   }
 
   /// \brief Configures whether mach ports are used on macOS

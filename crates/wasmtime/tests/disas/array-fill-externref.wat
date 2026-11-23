@@ -15,20 +15,20 @@
 )
 ;; function u0:0(i64 vmctx, i64, i32, i32, i32, i32) tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
-;;     region2 = 196 ""
-;;     region3 = 206 ""
+;;     region1 = 25 ""
+;;     region2 = 160 ""
+;;     region3 = 196 ""
 ;;     region4 = 108 ""
 ;;     region5 = 5 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32, v3: i32, v4: i32, v5: i32):
 ;; @002f                               trapz v2, user16
 ;; @002f                               v7 = load.i64 notrap aligned readonly can_move region0 v0+8
-;; @002f                               v8 = load.i64 notrap aligned readonly can_move region2 v7+32
+;; @002f                               v8 = load.i64 notrap aligned readonly can_move region2 v7+24
 ;; @002f                               v6 = uextend.i64 v2
 ;; @002f                               v9 = iadd v8, v6
 ;; @002f                               v10 = iconst.i64 16
@@ -40,7 +40,7 @@
 ;; @002f                               v13 = uextend.i64 v12
 ;; @002f                               v19 = icmp ugt v18, v13
 ;; @002f                               trapnz v19, user17
-;; @002f                               v36 = load.i64 notrap aligned region3 v7+40
+;; @002f                               v36 = load.i64 notrap aligned region3 v7+32
 ;; @002f                               v24 = iconst.i64 20
 ;; @002f                               v25 = iadd v9, v24  ; v24 = 20
 ;;                                     v49 = iconst.i64 2
@@ -59,8 +59,8 @@
 ;;
 ;;                                 block2(v43: i64):
 ;; @002f                               store.i32 user2 little region5 v4, v43
-;;                                     v57 = iconst.i64 4
-;;                                     v58 = iadd v43, v57  ; v57 = 4
+;; @002f                               v57 = iconst.i64 4
+;; @002f                               v58 = iadd v43, v57  ; v57 = 4
 ;; @002f                               v46 = icmp eq v58, v40
 ;; @002f                               brif v46, block3, block2(v58)
 ;;
@@ -73,20 +73,20 @@
 ;;
 ;; function u0:1(i64 vmctx, i64, i32, i32, i32) tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
-;;     region2 = 196 ""
-;;     region3 = 206 ""
+;;     region1 = 25 ""
+;;     region2 = 160 ""
+;;     region3 = 196 ""
 ;;     region4 = 108 ""
 ;;     region5 = 5 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32, v3: i32, v4: i32):
 ;; @003d                               trapz v2, user16
 ;; @003d                               v7 = load.i64 notrap aligned readonly can_move region0 v0+8
-;; @003d                               v8 = load.i64 notrap aligned readonly can_move region2 v7+32
+;; @003d                               v8 = load.i64 notrap aligned readonly can_move region2 v7+24
 ;; @003d                               v6 = uextend.i64 v2
 ;; @003d                               v9 = iadd v8, v6
 ;; @003d                               v10 = iconst.i64 16
@@ -98,7 +98,7 @@
 ;; @003d                               v13 = uextend.i64 v12
 ;; @003d                               v19 = icmp ugt v18, v13
 ;; @003d                               trapnz v19, user17
-;; @003d                               v36 = load.i64 notrap aligned region3 v7+40
+;; @003d                               v36 = load.i64 notrap aligned region3 v7+32
 ;; @003d                               v24 = iconst.i64 20
 ;; @003d                               v25 = iadd v9, v24  ; v24 = 20
 ;;                                     v49 = iconst.i64 2
@@ -116,10 +116,10 @@
 ;; @003d                               brif v54, block3, block2(v29)
 ;;
 ;;                                 block2(v43: i64):
-;;                                     v56 = iconst.i32 0
+;; @0039                               v56 = iconst.i32 0
 ;; @003d                               store user2 little region5 v56, v43  ; v56 = 0
-;;                                     v57 = iconst.i64 4
-;;                                     v58 = iadd v43, v57  ; v57 = 4
+;; @003d                               v57 = iconst.i64 4
+;; @003d                               v58 = iadd v43, v57  ; v57 = 4
 ;; @003d                               v46 = icmp eq v58, v40
 ;; @003d                               brif v46, block3, block2(v58)
 ;;

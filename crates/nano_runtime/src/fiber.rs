@@ -7,7 +7,7 @@
 //!
 //! A `Fiber` is deliberately `!Send`/`!Sync`. A suspended native Rust stack may
 //! contain thread-affine state or `!Send` guards, so silently migrating one via
-//! work stealing would be unsound. WrenJIT's VM-level `FiberState` is the right
+//! work stealing would be unsound. NapalmJIT's VM-level `FiberState` is the right
 //! representation for migratable N:M tasks; this module remains useful for
 //! native stackful coroutines and archaeology-compatible experiments.
 

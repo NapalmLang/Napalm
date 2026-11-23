@@ -147,6 +147,9 @@ pub fn catch_unwind_and_record_trap<R>(
 where
     R: HostResult,
 {
+    // Wasm has called out to the host.
+    store.store_opaque_mut().on_wasm_to_host_transition();
+
     // Invoke the closure `f`, optionally catching unwinds depending on `R`. The
     // return value is always provided and if unwind information is provided
     // (e.g. `ret` is a "false"-y value) then it's recorded in TLS for the
@@ -158,6 +161,7 @@ where
         }
         tls::with(|info| info.unwrap().record_unwind(unwind));
     }
+
     ret
 }
 
@@ -520,6 +524,9 @@ where
                 ExecutorRef::Native => closure(caller, None),
             }
         });
+
+    // Wasm has returned, unwound or trapped back to the host.
+    store.0.on_wasm_to_host_transition();
 
     match result {
         Ok(x) => Ok(x),

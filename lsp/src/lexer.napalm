@@ -1,0 +1,508 @@
+// Standalone Napalm lexer for the language server.
+// Lexical rules track the production frontend in napalm_front_main.rs.
+// Every token is a half-open UTF-8 byte span with a UTF-16 LSP range.
+// This module does not call Rust, load files, or depend on the parser.
+
+const MAX_SOURCE_BYTES = 16 * 1024 * 1024;
+const MAX_TOKENS = 1_000_000;
+const MAX_DIAGNOSTICS = 100;
+const MAX_INTERPOLATION_DEPTH = 8;
+
+const KEYWORDS = new Set();
+for (const word of (
+    "abstract as async await break case catch class computed concurrent const " +
+    "constructor continue debugger declare default defer delete do else enum errdefer " +
+    "export extends false finally for foreign from function get if implements import " +
+    "in instanceof interface is launch let module namespace new null of override " +
+    "private protected public readonly return set shared static super switch this " +
+    "throw true try type typeof var void while yield"
+).split(" ")) {
+    KEYWORDS.add(word);
+}
+
+// Ordered longest-first. The single-character fallback handles every remaining symbol.
+const MULTI_OPERATORS = [
+    ">>>=", "===", "!==", ">>>", "??=", "&&=", "||=", "**=", "<<=", ">>=",
+    "...", "?.", "??", "=>", "++", "--", "+=", "-=", "*=", "/=", "%=",
+    "**", "&&", "||", "<<", ">>", "<=", ">=", "==", "!=", "|>",
+    "&=", "|=", "^=", ".."
+];
+
+function isDigit(value) {
+    return value >= 48 && value <= 57;
+}
+
+function isAlpha(value) {
+    return (value >= 65 && value <= 90) || (value >= 97 && value <= 122);
+}
+
+function isWordStart(value) {
+    return isAlpha(value) || value === 95 || value === 36;
+}
+
+function isWordContinue(value) {
+    return isWordStart(value) || isDigit(value);
+}
+
+function digitValue(value) {
+    if (isDigit(value)) return value - 48;
+    if (value >= 65 && value <= 70) return value - 65 + 10;
+    if (value >= 97 && value <= 102) return value - 97 + 10;
+    return -1;
+}
+
+function utf8Width(value) {
+    if (value < 128) return 1;
+    if (value < 224) return 2;
+    if (value < 240) return 3;
+    return 4;
+}
+
+function lspPosition(line, character) {
+    return {line: line, character: character};
+}
+
+// Advance a byte cursor without splitting valid UTF-8 scalar values.
+// A CRLF sequence is exactly one line break in the LSP position space.
+function advancePosition(bytes, index, end, position) {
+    while (index < end) {
+        const value = bytes[index];
+        if (index === 0 && value === 239 && bytes.length >= 3 &&
+            bytes[1] === 187 && bytes[2] === 191) {
+            index += 3;
+        } else if (value === 13) {
+            index++;
+            if (index < bytes.length && bytes[index] === 10) index++;
+            position.line++;
+            position.character = 0;
+        } else if (value === 10) {
+            index++;
+            position.line++;
+            position.character = 0;
+        } else {
+            const width = utf8Width(value);
+            index += width;
+            position.character += width === 4 ? 2 : 1;
+        }
+    }
+    return index;
+}
+
+// Diagnostics are rare; obtaining their positions is intentionally a cold path.
+function diagnosticRange(bytes, start, end) {
+    const position = {line: 0, character: 0};
+    let cursor = advancePosition(bytes, 0, start, position);
+    const begin = lspPosition(position.line, position.character);
+    advancePosition(bytes, cursor, end, position);
+    return {start: begin, end: lspPosition(position.line, position.character)};
+}
+
+class Lexer {
+    constructor(source) {
+        this.bytes = Bytes.fromUtf8(source);
+        this.length = this.bytes.length;
+        this.index = 0;
+        this.tokens = [];
+        this.diagnostics = [];
+        this.stopped = false;
+    }
+
+    byte(offset) {
+        if (offset < 0 || offset >= this.length) return -1;
+        return this.bytes[offset];
+    }
+
+    matches(symbol) {
+        if (this.index + symbol.length > this.length) return false;
+        for (let j = 0; j < symbol.length; j++) {
+            if (this.bytes[this.index + j] !== symbol.codePointAt(j)) return false;
+        }
+        return true;
+    }
+
+    emit(kind, start) {
+        if (this.tokens.length >= MAX_TOKENS) {
+            if (!this.stopped) {
+                this.error("NAPALM-LEX-009", "Token limit exceeded", start, this.index);
+            }
+            this.stopped = true;
+            return;
+        }
+        this.tokens.push({kind: kind, startByte: start, endByte: this.index});
+    }
+
+    error(code, message, start, end) {
+        if (this.diagnostics.length >= MAX_DIAGNOSTICS) return;
+        this.diagnostics.push({
+            code: code,
+            message: message,
+            severity: 1,
+            startByte: start,
+            endByte: end
+        });
+    }
+
+    // Accept underscores only between two digits of the same radix.
+    digits(base) {
+        let count = 0;
+        while (this.index < this.length) {
+            const next = digitValue(this.byte(this.index));
+            if (next >= 0 && next < base) {
+                this.index++;
+                count++;
+            } else if (this.byte(this.index) === 95) {
+                const after = digitValue(this.byte(this.index + 1));
+                if (count > 0 && after >= 0 && after < base) {
+                    this.index++;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        return count;
+    }
+
+    number() {
+        const start = this.index;
+        let invalid = false;
+        let radix = 10;
+        let prefix = false;
+        if (this.byte(this.index) === 48) {
+            const next = this.byte(this.index + 1);
+            if (next === 120 || next === 88) radix = 16;
+            else if (next === 98 || next === 66) radix = 2;
+            else if (next === 111 || next === 79) radix = 8;
+            if (radix !== 10) {
+                prefix = true;
+                this.index += 2;
+                if (this.digits(radix) === 0) invalid = true;
+            }
+        }
+        if (!prefix) {
+            if (this.byte(this.index) === 46) {
+                this.index++;
+                this.digits(10);
+            } else {
+                this.digits(10);
+                if (this.byte(this.index) === 46 && isDigit(this.byte(this.index + 1))) {
+                    this.index++;
+                    this.digits(10);
+                }
+            }
+            const exponent = this.byte(this.index);
+            if (exponent === 101 || exponent === 69) {
+                this.index++;
+                if (this.byte(this.index) === 43 || this.byte(this.index) === 45) this.index++;
+                if (this.digits(10) === 0) invalid = true;
+            }
+        }
+        // Do not silently split an invalid digit separator or a malformed radix suffix.
+        if (this.byte(this.index) === 95 ||
+            (prefix && isWordContinue(this.byte(this.index)))) {
+            invalid = true;
+            while (isWordContinue(this.byte(this.index))) this.index++;
+        }
+        this.emit("number", start);
+        if (invalid) this.error("NAPALM-LEX-003", "Invalid numeric literal", start, this.index);
+    }
+
+    word() {
+        const start = this.index;
+        this.index++;
+        while (isWordContinue(this.byte(this.index))) this.index++;
+        const spelling = this.bytes.slice(start, this.index).toUtf8();
+        let kind = "identifier";
+        if (spelling === "true" || spelling === "false") kind = "boolean";
+        else if (spelling === "null") kind = "null";
+        else if (KEYWORDS.has(spelling)) kind = "keyword";
+        this.emit(kind, start);
+    }
+
+    // Called with the cursor on '\\'; returns after the complete escape sequence.
+    escape() {
+        const start = this.index;
+        this.index++;
+        const next = this.byte(this.index);
+        if (next < 0) {
+            this.error("NAPALM-LEX-004", "Incomplete escape sequence", start, this.index);
+            return;
+        }
+        // Simple escapes and escaped quotes, template punctuation or dollar signs.
+        if (next === 110 || next === 114 || next === 116 || next === 48 ||
+            next === 98 || next === 102 || next === 118 || next === 92 ||
+            next === 39 || next === 34 || next === 96 || next === 36) {
+            this.index++;
+            return;
+        }
+        // Escaped physical line break.
+        if (next === 13 || next === 10) {
+            this.index++;
+            if (next === 13 && this.byte(this.index) === 10) this.index++;
+            return;
+        }
+        if (next === 120 || next === 117) {
+            const unicode = next === 117;
+            this.index++;
+            if (unicode && this.byte(this.index) === 123) {
+                this.index++;
+                let count = 0;
+                let scalar = 0;
+                while (digitValue(this.byte(this.index)) >= 0 && count < 7) {
+                    scalar = scalar * 16 + digitValue(this.byte(this.index));
+                    this.index++;
+                    count++;
+                }
+                if (count === 0 || count > 6 || this.byte(this.index) !== 125 ||
+                    scalar > 1114111 || (scalar >= 55296 && scalar <= 57343)) {
+                    this.error("NAPALM-LEX-004", "Invalid Unicode escape sequence", start, this.index);
+                } else {
+                    this.index++;
+                }
+                return;
+            }
+            const digits = unicode ? 4 : 2;
+            for (let n = 0; n < digits; n++) {
+                if (digitValue(this.byte(this.index)) < 0) {
+                    this.error("NAPALM-LEX-004", "Invalid hexadecimal escape sequence", start, this.index);
+                    return;
+                }
+                this.index++;
+            }
+            return;
+        }
+        // Keep scanning the literal after an unknown escape for useful recovery.
+        this.index++;
+        this.error("NAPALM-LEX-004", "Unknown string escape", start, this.index);
+    }
+
+    quoted(quote) {
+        const start = this.index;
+        this.index++;
+        while (this.index < this.length) {
+            const value = this.byte(this.index);
+            if (value === quote) {
+                this.index++;
+                this.emit("string", start);
+                return;
+            }
+            if (value === 92) {
+                this.escape();
+                continue;
+            }
+            if (value === 10 || value === 13) break;
+            this.index += utf8Width(value);
+        }
+        this.emit("string", start);
+        this.error("NAPALM-LEX-001", "Unterminated string literal", start, this.index);
+    }
+
+    lineComment(shebang) {
+        const start = this.index;
+        this.index += 2;
+        while (this.index < this.length && this.byte(this.index) !== 10 &&
+            this.byte(this.index) !== 13) {
+            this.index += utf8Width(this.byte(this.index));
+        }
+        this.emit(shebang ? "comment.shebang" : "comment.line", start);
+    }
+
+    blockComment() {
+        const start = this.index;
+        this.index += 2;
+        // Matches the current production parser: block comments do not nest.
+        while (this.index < this.length) {
+            if (this.byte(this.index) === 42 && this.byte(this.index + 1) === 47) {
+                this.index += 2;
+                this.emit("comment.block", start);
+                return;
+            }
+            this.index += utf8Width(this.byte(this.index));
+        }
+        this.emit("comment.block", start);
+        this.error("NAPALM-LEX-002", "Unterminated block comment", start, this.index);
+    }
+
+    template(depth) {
+        const start = this.index;
+        this.index++;
+        this.emit("template.start", start);
+        let contentStart = this.index;
+        if (depth > MAX_INTERPOLATION_DEPTH) {
+            this.error("NAPALM-LEX-006", "Template interpolation nesting limit exceeded", start, this.index);
+            this.index = this.length;
+            return;
+        }
+        while (this.index < this.length) {
+            const value = this.byte(this.index);
+            if (value === 96) {
+                if (contentStart < this.index) this.emit("template.text", contentStart);
+                const close = this.index;
+                this.index++;
+                this.emit("template.end", close);
+                return;
+            }
+            if (value === 92) {
+                this.escape();
+                continue;
+            }
+            if (value === 36 && this.byte(this.index + 1) === 123) {
+                if (contentStart < this.index) this.emit("template.text", contentStart);
+                const open = this.index;
+                this.index += 2;
+                this.emit("template.expression.start", open);
+                if (depth >= MAX_INTERPOLATION_DEPTH) {
+                    this.error("NAPALM-LEX-006", "Template interpolation nesting limit exceeded", open, this.index);
+                    this.index = this.length;
+                    return;
+                }
+                const complete = this.interpolation(depth + 1);
+                if (!complete) return;
+                contentStart = this.index;
+                continue;
+            }
+            this.index += utf8Width(value);
+        }
+        if (contentStart < this.index) this.emit("template.text", contentStart);
+        this.error("NAPALM-LEX-005", "Unterminated template literal", start, this.index);
+    }
+
+    interpolation(depth) {
+        let braces = 0;
+        while (this.index < this.length && !this.stopped) {
+            const value = this.byte(this.index);
+            if (value === 125 && braces === 0) {
+                const start = this.index;
+                this.index++;
+                this.emit("template.expression.end", start);
+                return true;
+            }
+            if (value === 123) braces++;
+            if (value === 125) braces--;
+            this.token(depth);
+        }
+        this.error("NAPALM-LEX-007", "Unterminated template interpolation", this.index, this.index);
+        return false;
+    }
+
+    token(depth) {
+        const start = this.index;
+        const value = this.byte(start);
+        if (value === 32 || value === 9 || value === 12) {
+            this.index++;
+            while (this.byte(this.index) === 32 || this.byte(this.index) === 9 ||
+                this.byte(this.index) === 12) this.index++;
+            return;
+        }
+        if (value === 10 || value === 13) {
+            this.index++;
+            if (value === 13 && this.byte(this.index) === 10) this.index++;
+            this.emit("newline", start);
+            return;
+        }
+        if (isWordStart(value)) {
+            this.word();
+            return;
+        }
+        if (isDigit(value) || (value === 46 && isDigit(this.byte(start + 1)))) {
+            this.number();
+            return;
+        }
+        if (value === 39 || value === 34) {
+            this.quoted(value);
+            return;
+        }
+        if (value === 96) {
+            this.template(depth);
+            return;
+        }
+        if (value === 47 && this.byte(start + 1) === 47) {
+            this.lineComment(false);
+            return;
+        }
+        if (value === 47 && this.byte(start + 1) === 42) {
+            this.blockComment();
+            return;
+        }
+        for (const symbol of MULTI_OPERATORS) {
+            if (symbol.codePointAt(0) === value && this.matches(symbol)) {
+                this.index += symbol.length;
+                this.emit("operator", start);
+                return;
+            }
+        }
+        if (value === 123 || value === 125 || value === 40 || value === 41 ||
+            value === 91 || value === 93 || value === 44 || value === 59 ||
+            value === 58 || value === 46 || value === 64) {
+            this.index++;
+            this.emit("punctuation", start);
+            return;
+        }
+        if (value === 43 || value === 45 || value === 42 || value === 47 ||
+            value === 37 || value === 126 || value === 33 || value === 38 ||
+            value === 124 || value === 94 || value === 61 || value === 60 ||
+            value === 62 || value === 63) {
+            this.index++;
+            this.emit("operator", start);
+            return;
+        }
+        this.index += utf8Width(value);
+        this.emit("invalid", start);
+        this.error("NAPALM-LEX-008", "Unexpected character in source", start, this.index);
+    }
+
+    finish() {
+        // Populate sorted token spans in one pass, using byte-based source traversal.
+        const position = {line: 0, character: 0};
+        let cursor = 0;
+        for (const token of this.tokens) {
+            cursor = advancePosition(this.bytes, cursor, token.startByte, position);
+            const begin = lspPosition(position.line, position.character);
+            cursor = advancePosition(this.bytes, cursor, token.endByte, position);
+            token.range = {start: begin, end: lspPosition(position.line, position.character)};
+        }
+        for (const diagnostic of this.diagnostics) {
+            diagnostic.range = diagnosticRange(this.bytes, diagnostic.startByte, diagnostic.endByte);
+        }
+        return {tokens: this.tokens, diagnostics: this.diagnostics};
+    }
+
+    run() {
+        if (this.length > MAX_SOURCE_BYTES) {
+            this.error("NAPALM-LEX-010", "Source exceeds the lexer size limit", 0, 0);
+            this.emit("eof", 0);
+            return this.finish();
+        }
+        if (this.length >= 3 && this.byte(0) === 239 &&
+            this.byte(1) === 187 && this.byte(2) === 191) {
+            this.index = 3;
+        }
+        if (this.byte(this.index) === 35 && this.byte(this.index + 1) === 33 &&
+            this.byte(this.index + 2) === 47) {
+            this.lineComment(true);
+        }
+        while (this.index < this.length && !this.stopped) this.token(0);
+        const at = this.index;
+        if (this.stopped) {
+            // Keep the token cap strict while preserving the parser's EOF sentinel.
+            this.tokens.pop();
+            this.tokens.push({kind: "eof", startByte: at, endByte: at});
+        } else {
+            this.emit("eof", at);
+        }
+        return this.finish();
+    }
+}
+
+// Public entry point: lex any in-memory source, including unsaved editor text.
+export function tokenize(source) {
+    if (typeof source !== "String") throw "Lexer expects a String";
+    return new Lexer(source).run();
+}
+
+// Extract token spelling without rescanning the source or allocating per token.
+// Cache Bytes.fromUtf8(source) once if many spellings are needed.
+export function tokenText(sourceBytes, token) {
+    return sourceBytes.slice(token.startByte, token.endByte).toUtf8();
+}

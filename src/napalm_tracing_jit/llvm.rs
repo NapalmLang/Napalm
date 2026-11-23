@@ -131,6 +131,14 @@ fn load_llvm_library() -> Result<(), String> {
     if let Some(explicit) = std::env::var_os("NAPALM_LLVM_DLL") {
         candidates.push(explicit);
     }
+    // A standalone executable (`--compile`) carries the DLL it was built with;
+    // it is extracted to the per-user cache the first time the tier starts.
+    if let Some(embedded) = crate::napalm_standalone::embedded().and_then(|e| e.llvm_library()) {
+        match embedded {
+            Ok(path) => candidates.push(path.clone().into_os_string()),
+            Err(error) => eprintln!("[napalm-llvm] {error}"),
+        }
+    }
     // The bundled copy shipped next to napalm.exe always wins over PATH, so a
     // different LLVM install on the user's machine can never be picked up.
     if let Some(bundled) = std::env::current_exe()
@@ -274,7 +282,7 @@ pub(super) struct LlvmJob {
     pub(super) symbol: String,
     pub(super) trace: Trace,
     pub(super) exits: Vec<CompiledExitPlan>,
-    pub(super) binding_slots: HashMap<VmBindingKey, u32>,
+    pub(super) binding_slots: VmBindingSlots,
     pub(super) native_budget: u32,
     /// Profile gathered by the instrumented Cranelift code (PGO), if enabled.
     pub(super) profile: Option<TraceProfile>,
@@ -869,42 +877,43 @@ struct LlvmLowering<'p> {
     current: String,
     values: Vec<Option<V>>,
     heap_addresses: Vec<Option<V>>,
-    heap_entries: HashMap<(TraceValueId, u32), (V, V)>,
-    heap_live_entries: HashMap<TraceValueId, (V, V)>,
-    heap_data: HashMap<V, V>,
-    heap_len: HashMap<V, V>,
-    heap_metadata: HashMap<V, V>,
-    heap_receiver_class: HashMap<V, V>,
-    list_indices: HashMap<(TraceValueId, TraceValueId), V>,
-    list_lengths: HashMap<TraceValueId, TraceValueId>,
+    heap_entries: SmallMap<(TraceValueId, u32), (V, V)>,
+    heap_live_entries: SmallMap<TraceValueId, (V, V)>,
+    heap_data: SmallMap<V, V>,
+    heap_len: SmallMap<V, V>,
+    heap_metadata: SmallMap<V, V>,
+    heap_receiver_class: SmallMap<V, V>,
+    list_indices: SmallMap<(TraceValueId, TraceValueId), V>,
+    list_lengths: SmallMap<TraceValueId, TraceValueId>,
     bounds_proofs: HashSet<(TraceValueId, TraceValueId)>,
-    constant_index_proofs: HashSet<(V, u32)>,
-    map_shape_proofs: HashSet<(TraceValueId, u32)>,
-    string_key_proofs: HashSet<(TraceValueId, Vec<u8>)>,
+    constant_index_proofs: SmallSet16<(V, u32)>,
+    map_shape_proofs: SmallSet16<(TraceValueId, u32)>,
+    string_key_proofs: SmallSet16<(TraceValueId, Vec<u8>)>,
     shared_constant_exit_blocks: HashMap<(u32, Option<V>), String>,
-    forwarded_heap_loads: HashMap<Fwd, V>,
-    forwarded_absolute_loads: HashMap<u64, V>,
+    forwarded_heap_loads: SmallMap<Fwd, V>,
+    forwarded_absolute_loads: SmallMap<u64, V>,
     /// Per-module TBAA leaves: two physical slots never overlap inside one
     /// shaped Map/Instance, irrespective of the shape/class that selected them.
-    shaped_slot_tbaa: HashMap<u32, u32>,
-    instance_slot_tbaa: HashMap<u32, u32>,
+    shaped_slot_tbaa: SmallMap<u32, u32>,
+    instance_slot_tbaa: SmallMap<u32, u32>,
     next_tbaa: u32,
     /// Keep identity evidence separate across calls, read barriers and GC epochs.
     identity_epoch: u64,
-    active_identity_proofs: HashSet<(TraceValueId, TraceValueId)>,
+    active_identity_proofs: SmallSet<(TraceValueId, TraceValueId)>,
     identity_proofs: Vec<IdentityDisjointProof>,
     seen_identity_accesses: HashMap<IdentityAccess, Vec<SeenIdentityAccess>>,
-    entry_identity_roots: HashMap<V, TraceValueId>,
+    entry_identity_roots: SmallMap<V, TraceValueId>,
     identity_metadata_lists: Vec<(u32, Vec<u32>)>,
     /// Bounded speculation is enabled only when the trace has useful accesses.
     speculative_noalias: bool,
     speculative_guards: usize,
-    vm_binding_slots: HashMap<VmBindingKey, u32>,
-    vm_binding_values: HashMap<u32, V>,
+    vm_binding_slots: VmBindingSlots,
+    vm_binding_values: SmallMap<u32, V>,
     vm_bindings_base: Option<V>,
     runtime_context: Option<V>,
     execute_callee: Option<V>,
     heap_barrier_callee: Option<V>,
+    list_push_callee: Option<V>,
     method_epoch_value: Option<V>,
     native_budget_remaining: Option<V>,
     native_budget_initial: u32,
@@ -914,6 +923,11 @@ struct LlvmLowering<'p> {
     /// LLVM's loop-carried scratch allocations do not escape the generated
     /// function. Lifetime markers complement O3's mem2reg/SROA promotion.
     nonescaping_stack_slots: Vec<(String, usize)>,
+    /// Single-trace functions funnel every return through one `trace_ret`
+    /// block: `(predecessor block, result code)`. Side exits are most of a
+    /// trace's IR; one shared epilogue (lifetime ends + ret) instead of one per
+    /// exit shrinks both the IR LLVM optimizes and the machine code.
+    common_returns: Vec<(String, u32)>,
     /// Preserve IEEE arithmetic unless the application explicitly accepts
     /// the different rounding that contracting multiply-add can introduce.
     allow_fp_contract: bool,
@@ -942,10 +956,13 @@ const PGO_METADATA_BASE: u32 = 900_000;
 /// shape, capacity or sidecar identity. GC post-barriers are intentionally NOT
 /// classified as memory(none) calls: the collector's metadata writes are not
 /// modeled here.
+/// Whether sidecar words of `trace` may change while it runs: a runtime/GC
+/// boundary, or a native `list.push` (List length and element buffer).
 fn trace_has_heap_epoch_boundary(trace: &Trace) -> bool {
     trace.nodes.iter().any(|node| matches!(
         node.kind,
         TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. }
+            | TraceInst::HeapListPush { .. }
     ))
 }
 
@@ -954,7 +971,7 @@ fn trace_has_heap_epoch_boundary(trace: &Trace) -> bool {
 pub(super) fn lower_trace(
     trace: &Trace,
     exit_plans: &[CompiledExitPlan],
-    vm_binding_slots: HashMap<VmBindingKey, u32>,
+    vm_binding_slots: VmBindingSlots,
     native_budget: u32,
     symbol: &str,
     host: &HostInfo,
@@ -968,7 +985,7 @@ pub(super) fn lower_trace(
 pub(super) fn lower_trace_profiled(
     trace: &Trace,
     exit_plans: &[CompiledExitPlan],
-    vm_binding_slots: HashMap<VmBindingKey, u32>,
+    vm_binding_slots: VmBindingSlots,
     native_budget: u32,
     symbol: &str,
     host: &HostInfo,
@@ -985,7 +1002,7 @@ impl<'p> LlvmLowering<'p> {
     fn new(
         trace: &'p Trace,
         exit_plans: &'p [CompiledExitPlan],
-        vm_binding_slots: HashMap<VmBindingKey, u32>,
+        vm_binding_slots: VmBindingSlots,
         native_budget: u32,
         profile: Option<&'p TraceProfile>,
     ) -> Self {
@@ -1000,44 +1017,46 @@ impl<'p> LlvmLowering<'p> {
         current: "start".to_owned(),
         values: vec![None; trace.values.len()],
         heap_addresses: vec![None; trace.values.len()],
-        heap_entries: HashMap::default(),
-        heap_live_entries: HashMap::default(),
-        heap_data: HashMap::default(),
-        heap_len: HashMap::default(),
-        heap_metadata: HashMap::default(),
-        heap_receiver_class: HashMap::default(),
-        list_indices: HashMap::default(),
-        list_lengths: HashMap::default(),
+        heap_entries: Default::default(),
+        heap_live_entries: Default::default(),
+        heap_data: Default::default(),
+        heap_len: Default::default(),
+        heap_metadata: Default::default(),
+        heap_receiver_class: Default::default(),
+        list_indices: Default::default(),
+        list_lengths: Default::default(),
         bounds_proofs: HashSet::default(),
-        constant_index_proofs: HashSet::default(),
-        map_shape_proofs: HashSet::default(),
-        string_key_proofs: HashSet::default(),
+        constant_index_proofs: Default::default(),
+        map_shape_proofs: Default::default(),
+        string_key_proofs: Default::default(),
         shared_constant_exit_blocks: HashMap::default(),
-        forwarded_heap_loads: HashMap::default(),
-        forwarded_absolute_loads: HashMap::default(),
-        shaped_slot_tbaa: HashMap::default(),
-        instance_slot_tbaa: HashMap::default(),
+        forwarded_heap_loads: Default::default(),
+        forwarded_absolute_loads: Default::default(),
+        shaped_slot_tbaa: Default::default(),
+        instance_slot_tbaa: Default::default(),
         next_tbaa: 100,
         identity_epoch: 0,
-        active_identity_proofs: HashSet::default(),
+        active_identity_proofs: Default::default(),
         identity_proofs: Vec::new(),
         seen_identity_accesses: HashMap::default(),
-        entry_identity_roots: HashMap::default(),
+        entry_identity_roots: Default::default(),
         identity_metadata_lists: Vec::new(),
         speculative_noalias: std::env::var("NAPALM_LLVM_NOALIAS_GUARDS")
             .ok().as_deref() != Some("0"),
         speculative_guards: 0,
         vm_binding_slots,
-        vm_binding_values: HashMap::default(),
+        vm_binding_values: Default::default(),
         vm_bindings_base: None,
         runtime_context: None,
         execute_callee: None,
         heap_barrier_callee: None,
+        list_push_callee: None,
         method_epoch_value: None,
         native_budget_remaining: None,
         native_budget_initial: native_budget,
         epoch_free_trace,
         nonescaping_stack_slots: Vec::new(),
+        common_returns: Vec::new(),
         allow_fp_contract: std::env::var("NAPALM_LLVM_ALLOW_FMA").ok().as_deref() == Some("1"),
         profile,
         in_preheader: true,
@@ -1128,6 +1147,12 @@ impl LlvmLowering<'_> {
     }
 
     fn ret(&mut self, code: u32) {
+        if self.region.is_none() {
+            let block = self.current.clone();
+            self.common_returns.push((block, code));
+            self.br("trace_ret");
+            return;
+        }
         // With deferred frame slots every return goes through the region's
         // single `region_exit` block, which flushes them to the frame.
         let region_exit = self.region.as_ref().and_then(|region| region.record_return(&self.current, code));
@@ -1726,6 +1751,15 @@ impl LlvmLowering<'_> {
         value
     }
 
+    fn list_push_callee(&mut self) -> V {
+        if let Some(value) = &self.list_push_callee {
+            return value.clone();
+        }
+        let value = self.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, list_push));
+        self.list_push_callee = Some(value.clone());
+        value
+    }
+
     fn method_epoch_value(&mut self) -> V {
         if self.region.is_some() {
             // Runtime helpers refresh `method_epoch`; a region member may run
@@ -1985,7 +2019,10 @@ impl LlvmLowering<'_> {
             .map(f64::abs)
             .filter(|n| n.fract() == 0.0 && (1.0..=i32::MAX as f64).contains(n))
         else {
-            return self.call_pure_f64("napalm_jit_frem", &[lhs, rhs]);
+            if constant.is_some() {
+                return self.call_pure_f64("napalm_jit_frem", &[lhs, rhs]);
+            }
+            return self.f64_remainder_dynamic(lhs, rhs);
         };
         // x % (+/-1) is the signed fractional part of x for every finite
         // binary64 value. For infinities/NaNs the subtraction produces NaN,
@@ -2017,6 +2054,50 @@ impl LlvmLowering<'_> {
         let integer = self.cast("fptosi", &magnitude, Ty::I32);
         let quotient = self.bin("udiv", &integer, &V::i32(divisor as i32));
         let multiple = self.bin("mul", &quotient, &V::i32(divisor as i32));
+        let multiple = self.cast("sitofp", &multiple, Ty::F64);
+        let remainder = self.bin("fsub", &magnitude, &multiple);
+        let fast_result = self.def(
+            Ty::F64,
+            &format!("call double @llvm.copysign.f64(double {}, double {})", remainder.op, lhs.op),
+        );
+        let fast_end = self.current.clone();
+        self.br(&done);
+
+        self.begin(&slow);
+        let slow_result = self.call_pure_f64("napalm_jit_frem", &[lhs, rhs]);
+        let slow_end = self.current.clone();
+        self.br(&done);
+
+        self.begin(&done);
+        self.def(
+            Ty::F64,
+            &format!("phi double [ {}, %{fast_end} ], [ {}, %{slow_end} ]", fast_result.op, slow_result.op),
+        )
+    }
+
+    /// Runtime-divisor `x % y`; mirrors the Cranelift lowering (see there).
+    fn f64_remainder_dynamic(&mut self, lhs: &V, rhs: &V) -> V {
+        let fast = self.new_block();
+        let slow = self.new_block();
+        let done = self.new_block();
+        let magnitude = self.intrinsic_f64("fabs", lhs);
+        let divisor = self.intrinsic_f64("fabs", rhs);
+        let x_in_range = self.fcmp("ole", &magnitude, &V::f64(i32::MAX as f64));
+        let d_low = self.fcmp("oge", &divisor, &V::f64(1.0));
+        let d_high = self.fcmp("ole", &divisor, &V::f64(i32::MAX as f64));
+        let truncated = self.intrinsic_f64("trunc", &divisor);
+        let d_integral = self.fcmp("oeq", &truncated, &divisor);
+        let ok = self.and1(&x_in_range, &d_low);
+        let ok = self.and1(&ok, &d_high);
+        let ok = self.and1(&ok, &d_integral);
+        self.cond_br(&ok, &fast, &slow, Some(MD_HOT_TRUE));
+
+        self.begin(&fast);
+        // Both conversions are dominated by the range checks above.
+        let integer = self.cast("fptosi", &magnitude, Ty::I32);
+        let d = self.cast("fptosi", &divisor, Ty::I32);
+        let quotient = self.bin("udiv", &integer, &d);
+        let multiple = self.bin("mul", &quotient, &d);
         let multiple = self.cast("sitofp", &multiple, Ty::F64);
         let remainder = self.bin("fsub", &magnitude, &multiple);
         let fast_result = self.def(
@@ -2264,11 +2345,11 @@ impl LlvmLowering<'_> {
         value
     }
 
+    /// Shaped-Map values: inline (<= 4 slots) as a tagged owner-relative
+    /// offset, spilled (larger shapes) as a stable absolute pointer. Same
+    /// encoding, and therefore the same decode, as Instance fields.
     fn heap_entry_map_data(&mut self, entry: &V, owner: &V) -> V {
-        let encoded = self.heap_entry_data(entry);
-        let encoded = self.word(&encoded);
-        let offset = self.bin("and", &encoded, &V::i64(!(TRACE_HEAP_DATA_RELATIVE_MASK as u64) as i64));
-        self.gep8_dyn(owner, &offset)
+        self.heap_entry_instance_data(entry, owner)
     }
 
     /// Instance field-array pointer: inline fields (in the moving owner) are a
@@ -2574,7 +2655,7 @@ impl LlvmLowering<'_> {
         // their forwarded values (a runtime/GC epoch still clears both caches).
     }
 
-    fn call_heap_barrier(&mut self, owner: &V) {
+    fn call_heap_barrier(&mut self, owner: &V, tagged: &V) {
         let callee = self.heap_barrier_callee();
         let runtime = self.runtime_context();
         let owner = self.as_ptr(owner);
@@ -2599,7 +2680,8 @@ impl LlvmLowering<'_> {
         let done = self.new_block();
         self.cond_br(&is_heap, &barrier, &done, None);
         self.begin(&barrier);
-        self.call_heap_barrier(owner);
+        let tagged = self.word(tagged);
+        self.call_heap_barrier(owner, &tagged);
         self.br(&done);
         self.begin(&done);
         Ok(())
@@ -3449,7 +3531,8 @@ impl LlvmLowering<'_> {
                     // Branch-local owner proof (see the Cranelift tier).
                     let tagged_object = self.lower_value(*object)?;
                     let (_, owner) = self.guard_live_heap_entry(&tagged_object, *exit)?;
-                    self.call_heap_barrier(&owner);
+                    let tagged = self.word(&tagged);
+                    self.call_heap_barrier(&owner, &tagged);
                     self.br(&done);
                     self.begin(&done);
                 }
@@ -3508,6 +3591,26 @@ impl LlvmLowering<'_> {
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
                 self.store_owned(&tagged, &address, Mem::List.tag(), *list);
                 self.publish_heap_store(Fwd::Indexed { entry, index }, tagged);
+            }
+
+            HeapListPush { list, value, exit } => {
+                let tagged_list = self.lower_value(*list)?;
+                let tagged_value = self.lower_value(*value)?;
+                // Plain-List proof (shared Lists publish an invalid kind).
+                self.heap_entry_for_value(*list, TraceHeapKind::List, *exit)?;
+                let callee = self.list_push_callee();
+                let runtime = self.runtime_context();
+                // Ordinary memory effects: the helper writes the List, its
+                // sidecar and GC metadata.
+                let status = self.def(Ty::I32, &format!(
+                    "call i32 {}(ptr {}, i64 {}, i64 {}) #3",
+                    callee.op, runtime.op, tagged_list.op, tagged_value.op
+                ));
+                // Nonzero: nothing happened; the exit replays the Invoke.
+                let failed = self.icmp("ne", &status, &V::i32(0));
+                self.emit_side_exit(*exit, &failed)?;
+                // List buffers may have moved and lengths changed.
+                self.invalidate_heap_proofs();
             }
 
             HeapMapLen { map, exit } => {
@@ -3811,11 +3914,17 @@ impl LlvmLowering<'_> {
         self.begin(&loop_label);
         self.in_preheader = false;
 
-        if trace.nodes.iter().any(|node| {
-            matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. } | TraceInst::ReadBarrier { .. })
-        }) {
+        if trace_has_heap_epoch_boundary(trace) {
             self.invalidate_heap_proofs();
         }
+        // Forwarded *contents* are facts of the preheader's single execution:
+        // a body store executed on the previous iteration (it follows the
+        // consumer in program order, so the linear cache never saw it) may have
+        // changed them, and in a region a linked side trace may have too.
+        // Kind/address/identity proofs stay valid. LLVM's own alias analysis
+        // still hoists a body reload that really is invariant.
+        self.forwarded_heap_loads.clear();
+        self.forwarded_absolute_loads.clear();
 
         for (phi, (slot, ty)) in trace.loop_phis.iter().zip(phi_slots.iter()) {
             let value = self.def(*ty, &format!("load {}, ptr {slot}, align {}", ty.ir(), ty.align()));
@@ -3877,7 +3986,33 @@ impl LlvmLowering<'_> {
             TraceTerminator::Link => return Err(self.error("direct native trace links are installed after compilation")),
             TraceTerminator::Unreachable => return Err(self.error("trace has unreachable terminator")),
         }
+        self.emit_common_return();
         Ok(())
+    }
+
+    /// The shared epilogue of a single-trace function (see `common_returns`).
+    /// No stack-slot address ever leaves the function, so every slot's
+    /// lifetime ends here, on the way out of every native return.
+    fn emit_common_return(&mut self) {
+        if self.region.is_some() || self.common_returns.is_empty() {
+            return;
+        }
+        let returns = std::mem::take(&mut self.common_returns);
+        self.begin("trace_ret");
+        let code = if returns.iter().all(|(_, code)| *code == returns[0].1) {
+            V::i32(returns[0].1 as i32)
+        } else {
+            let incoming = returns
+                .iter()
+                .map(|(block, code)| format!("[ {}, %{block} ]", *code as i32))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.def(Ty::I32, &format!("phi i32 {incoming}"))
+        };
+        for (slot, size) in &self.nonescaping_stack_slots {
+            self.body.push_str(&format!("  call void @llvm.lifetime.end.p0(i64 {size}, ptr {slot})\n"));
+        }
+        self.line(&format!("ret i32 {}", code.op));
     }
 
     /// Representation coercion for loop-carried slots.
@@ -4121,7 +4256,7 @@ mod tests {
         let plans = trace.exits.iter().map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap())
             .collect::<Vec<_>>();
         let host = host_info().expect("LLVM host");
-        let ir = lower_trace(&trace, &plans, HashMap::default(), 0, "alias_guarded", host)
+        let ir = lower_trace(&trace, &plans, VmBindingSlots::default(), 0, "alias_guarded", host)
             .expect("LLVM lowering with identity guards");
         assert!(ir.contains("napalm.identity.epoch"), "{ir}");
         assert!(ir.contains("!alias.scope !"), "{ir}");
@@ -4139,7 +4274,7 @@ mod tests {
         let plans = trace.exits.iter().map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap())
             .collect::<Vec<_>>();
         let host = host_info().expect("LLVM host");
-        let ir = lower_trace(&trace, &plans, HashMap::default(), 0, "alias_speculative", host)
+        let ir = lower_trace(&trace, &plans, VmBindingSlots::default(), 0, "alias_speculative", host)
             .expect("LLVM lowering with speculative identity guards");
         // Disabled mode remains available for A/B performance comparisons.
         if std::env::var("NAPALM_LLVM_NOALIAS_GUARDS").ok().as_deref() == Some("0") {
@@ -4213,7 +4348,7 @@ mod tests {
         let plans = trace.exits.iter().map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap())
             .collect::<Vec<_>>();
         let host = host_info().expect("LLVM host");
-        let ir = lower_trace(&trace, &plans, HashMap::default(), 0, "sidecar_guard", host)
+        let ir = lower_trace(&trace, &plans, VmBindingSlots::default(), 0, "sidecar_guard", host)
             .expect("LLVM lowering");
         assert!(ir.contains("!tbaa !51"), "missing sidecar address tag");
         assert!(ir.contains("!tbaa !52"), "missing sidecar kind tag");
@@ -4384,7 +4519,7 @@ mod tests {
         let trace = builder.finish().expect("well-formed guarded trace");
         let plans = trace.exits.iter()
             .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
-        let ir = lower_trace(&trace, &plans, HashMap::default(), 0,
+        let ir = lower_trace(&trace, &plans, VmBindingSlots::default(), 0,
             "guarded_index_range", proof_test_host()).expect("lowering");
         let assume = ir.find("call void @llvm.assume(i1").expect("assumption");
         let guard = ir.find("br i1 ").expect("guard");
@@ -4406,7 +4541,7 @@ mod tests {
         let trace = builder.finish().expect("well-formed capture trace");
         let plans = trace.exits.iter()
             .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
-        let ir = lower_trace(&trace, &plans, HashMap::default(), 0,
+        let ir = lower_trace(&trace, &plans, VmBindingSlots::default(), 0,
             "immutable_capture", proof_test_host()).expect("lowering");
         assert!(ir.contains("!tbaa !44, !invariant.load !22"), "{ir}");
         validate_proof_ir(&ir);
@@ -4417,7 +4552,7 @@ mod tests {
         assert!(trace_has_heap_epoch_boundary(&changed_epoch));
         let plans = changed_epoch.exits.iter()
             .map(|exit| CompiledExitPlan::from_exit(&changed_epoch, exit).unwrap()).collect::<Vec<_>>();
-        let ir = lower_trace(&changed_epoch, &plans, HashMap::default(), 0,
+        let ir = lower_trace(&changed_epoch, &plans, VmBindingSlots::default(), 0,
             "capture_with_barrier", proof_test_host()).expect("lowering");
         assert!(!ir.contains("!tbaa !44, !invariant.load"), "{ir}");
         validate_proof_ir(&ir);
@@ -4439,7 +4574,7 @@ mod tests {
         let trace = builder.finish().expect("well-formed shaped-map loop");
         let plans = trace.exits.iter()
             .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
-        let mut slots = HashMap::default();
+        let mut slots = VmBindingSlots::default();
         slots.insert(VmBindingKey::new(VmBindingKind::ShapeId, 17), 0);
         slots.insert(VmBindingKey::new(VmBindingKind::DenseSlot, 0), 1);
         let ir = lower_trace(&trace, &plans, slots, 0,
@@ -4489,7 +4624,7 @@ mod tests {
             }
             let plans = trace.exits.iter()
                 .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
-            let ir = lower_trace(&trace, &plans, HashMap::default(), 0,
+            let ir = lower_trace(&trace, &plans, VmBindingSlots::default(), 0,
                 "induction_nsw", proof_test_host()).expect("lowering");
             validate_proof_ir(&ir);
             ir
@@ -4514,7 +4649,7 @@ mod tests {
         let trace = builder.finish().expect("well-formed loop trace");
         let plans = trace.exits.iter()
             .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
-        let ir = lower_trace(&trace, &plans, HashMap::default(), 4,
+        let ir = lower_trace(&trace, &plans, VmBindingSlots::default(), 4,
             "non_escaping_budget", proof_test_host()).expect("lowering");
         assert!(ir.contains("@llvm.lifetime.start.p0(i64 8, ptr %budget)"), "{ir}");
         assert!(ir.contains("@llvm.lifetime.end.p0(i64 8, ptr %budget)"), "{ir}");
@@ -4596,7 +4731,7 @@ mod tests {
         let trace = builder.finish().expect("well-formed profile trace");
         let plans = trace.exits.iter()
             .map(|exit| CompiledExitPlan::from_exit(&trace, exit).unwrap()).collect::<Vec<_>>();
-        let mut slots = HashMap::default();
+        let mut slots = VmBindingSlots::default();
         slots.insert(VmBindingKey::new(VmBindingKind::ValueAddress, 0x1000), 0);
         slots.insert(VmBindingKey::new(VmBindingKind::ProfileCounterAddress, 0x2000), 1);
         let ir = lower_trace(&trace, &plans, slots, 0,
@@ -4627,7 +4762,7 @@ mod tests {
         };
         let host = host_info().expect("LLVM host");
         let symbol = "pgo_trace";
-        let ir = lower_trace_profiled(&trace, &plans, HashMap::default(), 0, symbol, host, Some(&profile))
+        let ir = lower_trace_profiled(&trace, &plans, VmBindingSlots::default(), 0, symbol, host, Some(&profile))
             .expect("profiled lowering");
         assert!(ir.contains("!\"function_entry_count\", i64 1000"), "{ir}");
         assert!(ir.contains("!\"ProfileSummary\""), "{ir}");
@@ -4653,7 +4788,7 @@ mod tests {
         std::mem::forget(engines); // the leaked test context outlives them
 
         // Without a profile, nothing PGO-specific is emitted.
-        let plain = lower_trace(&trace, &plans, HashMap::default(), 0, symbol, host).unwrap();
+        let plain = lower_trace(&trace, &plans, VmBindingSlots::default(), 0, symbol, host).unwrap();
         assert!(!plain.contains("function_entry_count") && !plain.contains("ProfileSummary"));
     }
 
@@ -4713,7 +4848,7 @@ mod tests {
         let plans = trace.exits.iter().map(|exit| {
             CompiledExitPlan::from_exit(&trace, exit).expect("valid side exit")
         }).collect::<Vec<_>>();
-        let ir = lower_trace(&trace, &plans, HashMap::default(), 0,
+        let ir = lower_trace(&trace, &plans, VmBindingSlots::default(), 0,
             "gc_barrier_scoped", host_info().expect("LLVM host"))
             .expect("LLVM lowering");
 

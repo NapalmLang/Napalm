@@ -849,7 +849,7 @@ unsafe impl GcHeap for CopyingHeap {
         let gc_ref = match self.allocate(size) {
             None => {
                 // Multiply by two because we need capacity in both semi-spaces.
-                let bytes_needed = u64::try_from(layout.size()).unwrap().saturating_mul(2);
+                let bytes_needed = (u64::from(size) + u64::from(ALIGN)).saturating_mul(2);
                 return Ok(Err(bytes_needed));
             }
             Some(index) => {
@@ -942,6 +942,10 @@ unsafe impl GcHeap for CopyingHeap {
 
     fn allocated_bytes(&self) -> usize {
         usize::try_from(self.bump_ptr() - self.active_space_start).unwrap()
+    }
+
+    fn allocatable_bytes(&self) -> usize {
+        usize::try_from(self.active_space_end() - self.active_space_start).unwrap()
     }
 
     fn gc<'a, 'b>(

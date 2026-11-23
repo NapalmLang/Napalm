@@ -1,0 +1,250 @@
+// LSP editor features that operate on the self-hosted lexical/semantic graph.
+// All edits are returned to the client. This module never writes project files.
+import {recordForUri, moduleReferencesAt, moduleIdentityAt} from "./module_index";
+import {symbolAt} from "./semantic";
+import {tokenize} from "./lexer";
+
+export const SEMANTIC_TOKEN_TYPES = [
+    "namespace", "type", "class", "enum", "interface", "typeParameter",
+    "parameter", "variable", "property", "enumMember", "function", "method",
+    "keyword", "comment", "string", "number", "operator"
+];
+export const SEMANTIC_TOKEN_MODIFIERS = [
+    "declaration", "readonly", "static", "async", "defaultLibrary"
+];
+
+function equalRange(a, b) {
+    return a.start.line === b.start.line && a.start.character === b.start.character &&
+        a.end.line === b.end.line && a.end.character === b.end.character;
+}
+
+function tokenCategory(token, occurrence, previous) {
+    if (token.kind === "keyword" || token.kind === "boolean" || token.kind === "null") return 12;
+    if (token.kind.startsWith("comment")) return 13;
+    if (token.kind === "string" || token.kind.startsWith("template")) return 14;
+    if (token.kind === "number") return 15;
+    if (token.kind === "operator") return 16;
+    if (token.kind !== "identifier") return -1;
+    if (occurrence === null) {
+        if (previous !== null && (previous.text === "." || previous.text === "?.")) return 8;
+        return 7;
+    }
+    const symbol = occurrence.symbol;
+    if (symbol.kind === "type") return 1;
+    if (symbol.kind === "class") return 2;
+    if (symbol.kind === "enum") return 3;
+    if (symbol.kind === "interface") return 4;
+    if (symbol.kind === "parameter") return 6;
+    if (symbol.kind === "field" || symbol.kind === "property") return 8;
+    if (symbol.kind === "enumMember") return 9;
+    if (symbol.kind === "function") return 10;
+    if (symbol.kind === "method" || symbol.kind === "constructor") return 11;
+    return 7;
+}
+
+function tokenModifiers(occurrence) {
+    if (occurrence === null) return 0;
+    let result = occurrence.declaration ? 1 : 0;
+    if (occurrence.symbol.kind === "constant") result |= 2;
+    return result;
+}
+
+// Return delta-encoded LSP tokens. Multiline comments/templates are split at
+// logical line boundaries; CRLF contributes no semantic token characters.
+export function semanticTokensAt(index, uri, requestedRange) {
+    const record = recordForUri(index, uri);
+    if (record === null) return {data: []};
+    const occurrences = new Map();
+    for (const item of record.semantic.occurrences) {
+        const key = item.startByte + ":" + item.endByte;
+        if (!occurrences.has(key)) occurrences.set(key, item);
+    }
+    const lines = record.source.split("\n");
+    const widths = [];
+    for (const line of lines) {
+        const plain = line.endsWith("\r") ? line.slice(0, line.length - 1) : line;
+        widths.push(plain.utf16Length);
+    }
+    let previousLine = 0;
+    let previousColumn = 0;
+    let previousToken = null;
+    const encoded = [];
+    for (const token of record.lexical.tokens) {
+        const occurrence = occurrences.get(token.startByte + ":" + token.endByte);
+        const category = tokenCategory(token, occurrence, previousToken);
+        if (token.kind !== "newline" && token.kind !== "eof") previousToken = token;
+        if (category < 0) continue;
+        const from = token.range.start;
+        const to = token.range.end;
+        for (let line = from.line; line <= to.line && line < widths.length; line++) {
+            let start = line === from.line ? from.character : 0;
+            let end = line === to.line ? to.character : widths[line];
+            if (end > widths[line]) end = widths[line];
+            if (requestedRange !== null) {
+                if (line < requestedRange.start.line || line > requestedRange.end.line) continue;
+                if (line === requestedRange.start.line && start < requestedRange.start.character) {
+                    start = requestedRange.start.character;
+                }
+                if (line === requestedRange.end.line && end > requestedRange.end.character) {
+                    end = requestedRange.end.character;
+                }
+            }
+            if (start >= end) continue;
+            encoded.push(line - previousLine);
+            encoded.push(line === previousLine ? start - previousColumn : start);
+            encoded.push(end - start);
+            encoded.push(category);
+            encoded.push(tokenModifiers(occurrence));
+            previousLine = line;
+            previousColumn = start;
+        }
+    }
+    return {data: encoded};
+}
+
+function validIdentifier(text) {
+    if (typeof text !== "String" || text.length === 0 || text.utf8Length > 256) return false;
+    const lexical = tokenize(text);
+    return lexical.diagnostics.length === 0 && lexical.tokens.length === 2 &&
+        lexical.tokens[0].kind === "identifier" && lexical.tokens[0].startByte === 0 &&
+        lexical.tokens[0].endByte === text.utf8Length;
+}
+
+function sameIdentity(a, b) {
+    return a !== null && b !== null && a.identity === b.identity;
+}
+
+function aliasSymbolAt(record, position) {
+    const symbol = symbolAt(record.semantic, position);
+    if (symbol === null || symbol.kind !== "import") return null;
+    for (const statement of record.imports) {
+        if (statement.kind !== "ImportDeclaration") continue;
+        for (const spec of statement.specifiers) {
+            if (spec.local.startByte !== symbol.declaration.startByte ||
+                spec.local.endByte !== symbol.declaration.endByte) continue;
+            if (spec.kind === "DefaultImport" || spec.imported.name !== spec.local.name) return symbol;
+        }
+    }
+    return null;
+}
+
+function renameContext(index, uri, position) {
+    const record = recordForUri(index, uri);
+    if (record === null) return null;
+    const local = aliasSymbolAt(record, position);
+    if (local !== null) return {mode: "local", record: record, symbol: local,
+        name: local.name, range: local.declaration.range};
+    const identity = moduleIdentityAt(index, uri, position);
+    if (identity === null) return null;
+    let declarationName = null;
+    let declarationRange = null;
+    const origin = recordForUri(index, identity.uri);
+    if (origin !== null) {
+        for (const symbol of origin.semantic.symbols) {
+            if (equalRange(symbol.declaration.range, identity.range)) {
+                declarationName = symbol.name;
+                declarationRange = symbol.declaration.range;
+                break;
+            }
+        }
+    }
+    if (declarationName === null) return null;
+    return {mode: "global", record: record, identity: identity,
+        name: declarationName, range: declarationRange};
+}
+
+export function prepareRenameAt(index, uri, position) {
+    const context = renameContext(index, uri, position);
+    if (context === null) return null;
+    if (context.mode === "local") return {range: context.range, placeholder: context.name};
+    const source = recordForUri(index, uri);
+    for (const item of source.semantic.occurrences) {
+        const start = item.range.start;
+        const end = item.range.end;
+        const inside = position.line > start.line ||
+            (position.line === start.line && position.character >= start.character);
+        const before = position.line < end.line ||
+            (position.line === end.line && position.character < end.character);
+        if (inside && before) return {range: item.range, placeholder: item.symbol.name};
+    }
+    for (const item of source.extraOccurrences) {
+        const start = item.node.range.start;
+        const end = item.node.range.end;
+        const inside = position.line > start.line ||
+            (position.line === start.line && position.character >= start.character);
+        const before = position.line < end.line ||
+            (position.line === end.line && position.character < end.character);
+        if (inside && before) return {range: item.node.range, placeholder: context.name};
+    }
+    return null;
+}
+
+function conflictsWithBinding(record, symbol, newName) {
+    if (newName === symbol.name) return false;
+    for (const entry of record.semantic.scopes) {
+        const targetScope = entry.scope;
+        for (const table of [targetScope.values, targetScope.types]) {
+            if (table.get(symbol.name) !== symbol) continue;
+            const other = table.get(newName);
+            if (other !== null && other.id !== symbol.id) return true;
+        }
+    }
+    return false;
+}
+
+function addEdit(edits, seen, uri, range, newName) {
+    const key = uri + ":" + range.start.line + ":" + range.start.character + ":" +
+        range.end.line + ":" + range.end.character;
+    if (seen.has(key)) return;
+    seen.add(key);
+    let list = edits.get(uri);
+    if (list === null) {
+        list = [];
+        edits.set(uri, list);
+    }
+    list.push({range: range, newText: newName});
+}
+
+export function renameAt(index, uri, position, newName) {
+    if (!validIdentifier(newName)) return null;
+    const context = renameContext(index, uri, position);
+    if (context === null) return null;
+    const changes = new Map();
+    const seen = new Set();
+    if (context.mode === "local" && conflictsWithBinding(context.record, context.symbol, newName)) {
+        return null;
+    }
+    if (context.mode === "global") {
+        const origin = recordForUri(index, context.identity.uri);
+        if (origin !== null) {
+            for (const candidate of origin.semantic.symbols) {
+                if (candidate.name === context.name &&
+                    equalRange(candidate.declaration.range, context.identity.range) &&
+                    conflictsWithBinding(origin, candidate, newName)) return null;
+            }
+        }
+    }
+    if (context.mode === "local") {
+        for (const item of context.record.semantic.occurrences) {
+            if (item.symbol.id === context.symbol.id) {
+                addEdit(changes, seen, uri, item.range, newName);
+            }
+        }
+    } else {
+        const refs = moduleReferencesAt(index, uri, position, true);
+        for (const location of refs) {
+            const record = recordForUri(index, location.uri);
+            if (record === null) continue;
+            let keep = true;
+            for (const item of record.semantic.occurrences) {
+                if (!equalRange(item.range, location.range)) continue;
+                // Renaming an exported symbol must not silently rename a local
+                // alias or a name re-exported under a different spelling.
+                if (item.symbol.kind === "import" && item.symbol.name !== context.name) keep = false;
+                break;
+            }
+            if (keep) addEdit(changes, seen, location.uri, location.range, newName);
+        }
+    }
+    return {changes: changes};
+}

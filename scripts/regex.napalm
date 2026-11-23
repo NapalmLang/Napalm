@@ -1,0 +1,22 @@
+// regexr patterns are ordinary strings: "\\d" passes \d to the engine.
+const record: Regex = Regex.builder("(?<name>[A-Za-z]+)=(?<value>[0-9]+)")
+    .sizeLimit(10000)
+    .build();
+
+for (const captures of record.capturesIter("width=128 height=64")) {
+    const value: RegexMatch = captures.name("value");
+    System.print(`${captures["name"]}: ${value.asStr()} at byte ${value.start()}`);
+}
+
+System.print(record.replaceAll("width=128 height=64", "<setting>"));
+System.print(Regex.new(Regex.escape("a.b")).isMatch("a.b"));
+
+const unicode = Regex.new("世").find("é世🎉");
+System.print([unicode.start(), unicode.end(), unicode.len()]); // [2, 5, 3]
+System.print(unicode.asBytes().toUtf8()); // 世
+
+try {
+    Regex.new("(");
+} catch (error) {
+    System.print(`Invalid pattern: ${error}`);
+}

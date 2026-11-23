@@ -1,0 +1,59 @@
+// End-to-end `.orange` package example.
+// Run from the repository root: cargo run --release -- scripts/package.napalm
+function expect(condition, message) {
+    if (!condition) throw message;
+}
+function contains(list, value) {
+    for (const item of list) { if (item === value) return true; }
+    return false;
+}
+
+const root = "scripts/__napalm_package_example__";
+Fs.mkdirAll(root + "/project/src/nested");
+Fs.mkdirAll(root + "/project/assets");
+Fs.mkdirAll(root + "/shared/package/zeta");
+Fs.writeText(root + "/project/README.md", "# demo");
+Fs.writeText(root + "/project/LICENSE", "MIT");
+Fs.writeText(root + "/project/src/main.napalm", "System.print(\"hi\");");
+Fs.writeText(root + "/project/src/nested/util.napalm", "export const x = 1;");
+Fs.writeText(root + "/project/assets/logo.txt", "logo");
+Fs.writeText(root + "/shared/package/zeta/zeta.napalm", "zeta");
+
+// Folder paths inside the archive are relative to the working directory.
+const repository = Process.cwd();
+Process.chdir(root + "/project");
+try {
+    const pkg: Package = Package.package("demo");
+    expect(typeof pkg === "Package" && pkg instanceof Package, "Package runtime type");
+    const created = pkg
+        .addFile("README.md")                  // -> README.md
+        .addFiles(["LICENSE", "src/main.napalm"]) // -> LICENSE, main.napalm
+        .addFolder("src/nested")               // -> src/nested/...
+        .addFolder("../shared/package/zeta")   // -> shared/package/zeta/...
+        .setPackageDest("../dist")
+        .finish();
+    expect(created === "../dist/demo.orange", "finish returns the package path");
+
+    // `./` cannot be expressed relative to itself: the folder name is used.
+    const whole = Package.package("whole.orange").addFolder("./").setPackageDest("../dist").finish();
+    expect(whole === "../dist/whole.orange", "extension in the name is optional");
+} finally {
+    Process.chdir(repository);
+}
+
+const dist = root + "/dist";
+const files = Package.unpackage(dist + "/demo", root + "/out/demo");
+System.print(files);
+for (const expected of [
+    "README.md", "LICENSE", "main.napalm",
+    "src/nested/util.napalm", "shared/package/zeta/zeta.napalm",
+]) {
+    expect(contains(files, root + "/out/demo/" + expected), "missing " + expected);
+}
+expect(Fs.readText(root + "/out/demo/shared/package/zeta/zeta.napalm") === "zeta", "nested contents");
+
+const whole = Package.unpackage(dist + "/whole.orange", root + "/out/whole");
+expect(contains(whole, root + "/out/whole/project/assets/logo.txt"), "./ is stored under its folder name");
+expect(Fs.stat(dist + "/whole.orange").size < 4096, "packages are compressed");
+
+System.print("Package example passed");

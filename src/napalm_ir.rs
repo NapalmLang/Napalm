@@ -26,10 +26,28 @@ use std::fmt;
 use smallvec::SmallVec;
 use compact_str::CompactString;
 
+// Canonical HIR snapshots compare actual state between optimization rounds.
+// Lookup indexes are derived and omitted; profile maps must not depend on hash
+// table iteration order. Constants already serialize their exact f64 bits.
+fn serialize_hir_map<K: Ord + serde::Serialize, V: serde::Serialize, S: serde::Serializer>(
+    map: &HashMap<K, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&map.iter().collect::<std::collections::BTreeMap<_, _>>(), serializer)
+}
+
+fn serialize_hir_strings<S: serde::Serializer>(
+    strings: &[CompactString],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(strings.iter().map(CompactString::as_str))
+}
+
 macro_rules! id_newtype {
     ($name:ident, $repr:ty) => {
         #[repr(transparent)]
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         pub struct $name(pub $repr);
 
         impl fmt::Debug for $name {
@@ -62,6 +80,7 @@ id_newtype!(PropertySlotId, u16);
 
 /// A small, canonicalized set of observed/possible runtime classes.
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClassSet {
     classes: SmallVec<[ClassId; 2]>,
 }
@@ -116,6 +135,7 @@ impl fmt::Debug for ClassSet {
 
 /// Napalm semantic types plus a few internal optimization representations.
 #[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Bottom,
     Top,
@@ -171,6 +191,7 @@ pub enum Type {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct InterfaceFieldType {
     pub name: String,
     pub ty: Type,
@@ -179,12 +200,14 @@ pub struct InterfaceFieldType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum StructuralLayoutKind {
     Interface,
     Record,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct StructuralPropertyInfo {
     pub slot: PropertySlotId,
     pub name: StringId,
@@ -194,6 +217,7 @@ pub struct StructuralPropertyInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct StructuralLayoutInfo {
     pub id: StructuralLayoutId,
     pub kind: StructuralLayoutKind,
@@ -442,17 +466,19 @@ impl fmt::Debug for Type {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum Constant {
     Null,
     Bool(bool),
     /// A Napalm source-level number. Napalm numbers are semantically f64 values.
-    Num(f64),
+    Num(#[serde(with = "crate::napalm_burning::f64_bits")] f64),
     String(StringId),
     /// Internal constant introduced by integer-specialization passes.
     Int32(i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum MethodKind {
     Getter,
     Setter,
@@ -462,6 +488,7 @@ pub enum MethodKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct MethodSignature {
     pub name: StringId,
     pub kind: MethodKind,
@@ -470,6 +497,7 @@ pub struct MethodSignature {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum FunctionKind {
     ModuleBody,
     Method,
@@ -487,6 +515,7 @@ pub enum FunctionKind {
 /// bindings before executing its body.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum BuiltinId {
     Object = 0,
     Class = 1,
@@ -528,20 +557,42 @@ pub enum BuiltinId {
     HttpPostJson = 30,
     SetTimeout = 31,
     Print = 32,
-    /// Read-only subscription surface paired with Emitter.
+    /// Immutable event envelope carrying an optional typed payload.
     Event = 33,
     /// One-to-many native event publisher.
     Emitter = 34,
-    /// FIFO native message sender paired with Receiver.
+    /// Many-to-many conduit between independently created publishers and receivers.
     Channel = 35,
-    /// FIFO native message receiver.
+    /// Subscriber with its own FIFO of Event values.
     Receiver = 36,
     ConcurrentMap = 37,
     ConcurrentSet = 38,
+    Generator = 39,
+    Bytes = 40,
+    ByteBuffer = 41,
+    JSON = 42,
+    Fs = 43,
+    Path = 44,
+    Uri = 45,
+    FileInfo = 46,
+    File = 47,
+    Process = 48,
+    InputStream = 49,
+    OutputStream = 50,
+    /// `.orange` package global and builder class.
+    Package = 51,
+    Database = 52,
+    DatabaseQuery = 53,
+    /// Native enum of `Database.open` storage/access modes.
+    DatabaseMode = 54,
+    Regex = 55,
+    RegexBuilder = 56,
+    RegexMatch = 57,
+    RegexCaptures = 58,
 }
 
 impl BuiltinId {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 59] = [
         Self::Object, Self::Class, Self::Bool, Self::Null, Self::Num,
         Self::String, Self::List, Self::Map, Self::Range, Self::Fn,
         Self::Fiber, Self::System, Self::Date, Self::Random, Self::Promise,
@@ -552,6 +603,13 @@ impl BuiltinId {
         Self::SetTimeout, Self::Print,
         Self::Event, Self::Emitter, Self::Channel, Self::Receiver,
         Self::ConcurrentMap, Self::ConcurrentSet,
+        Self::Generator,
+        Self::Bytes, Self::ByteBuffer, Self::JSON, Self::Fs, Self::Path, Self::Uri,
+        Self::FileInfo, Self::File,
+        Self::Process, Self::InputStream, Self::OutputStream,
+        Self::Package,
+        Self::Database, Self::DatabaseQuery, Self::DatabaseMode,
+        Self::Regex, Self::RegexBuilder, Self::RegexMatch, Self::RegexCaptures,
     ];
     pub const COUNT: usize = Self::ALL.len();
     #[inline] pub const fn name(self) -> &'static str {
@@ -587,10 +645,31 @@ impl BuiltinId {
             Self::Receiver => "Receiver",
             Self::ConcurrentMap => "ConcurrentMap",
             Self::ConcurrentSet => "ConcurrentSet",
+            Self::Generator => "Generator",
+            Self::Bytes => "Bytes",
+            Self::ByteBuffer => "ByteBuffer",
+            Self::JSON => "JSON",
+            Self::Fs => "Fs",
+            Self::Path => "Path",
+            Self::Uri => "Uri",
+            Self::FileInfo => "FileInfo",
+            Self::File => "File",
+            Self::Process => "Process",
+            Self::InputStream => "InputStream",
+            Self::OutputStream => "OutputStream",
+            Self::Package => "Package",
+            Self::Database => "Database",
+            Self::DatabaseQuery => "DatabaseQuery",
+            Self::DatabaseMode => "DatabaseMode",
+            Self::Regex => "Regex",
+            Self::RegexBuilder => "RegexBuilder",
+            Self::RegexMatch => "RegexMatch",
+            Self::RegexCaptures => "RegexCaptures",
         }
     }
-    /// Module-layout key reserving this builtin. Native decorators use a hidden
-    /// key; `lower_name` falls back to it only when no user binding exists.
+    /// Module-layout key reserving this builtin. Native decorators and HTTP
+    /// client helpers use hidden keys; `lower_name` falls back to them only
+    /// when no user binding exists.
     #[inline] pub const fn binding_name(self) -> &'static str {
         match self {
             Self::Memoize => "<native:memoize>",
@@ -599,6 +678,9 @@ impl BuiltinId {
             Self::Delay => "<native:delay>",
             Self::Debounce => "<native:debounce>",
             Self::Throttle => "<native:throttle>",
+            Self::HttpGet => "<native:get>",
+            Self::HttpGetJson => "<native:getJSON>",
+            Self::HttpPostJson => "<native:postJSON>",
             _ => self.name(),
         }
     }
@@ -612,12 +694,14 @@ impl BuiltinId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BuiltinBinding {
     pub slot: ModuleSlot,
     pub builtin: BuiltinId,
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Signature {
     pub name: StringId,
     /// IR-level call parameters. Method-like functions include the receiver as
@@ -627,6 +711,7 @@ pub struct Signature {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ModuleExport {
     pub name: StringId,
     pub slot: ModuleSlot,
@@ -636,12 +721,14 @@ pub struct ModuleExport {
 /// carries no managed state: workers materialize a fresh zero-capture Closure
 /// pointing at the same immutable bytecode function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct WorkerFunctionBinding {
     pub slot: ModuleSlot,
     pub function: FuncId,
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ModuleInfo {
     pub id: ModuleId,
     /// Canonical module identity used by ImportModule. This is intentionally
@@ -680,6 +767,7 @@ impl ModuleInfo {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ClassInfo {
     pub id: ClassId,
     pub module: ModuleId,
@@ -715,6 +803,7 @@ pub struct ClassInfo {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ForeignFunctionInfo {
     pub id: ForeignFnId,
     pub module: StringId,
@@ -724,6 +813,7 @@ pub struct ForeignFunctionInfo {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SourceSpan {
     pub file: Option<StringId>,
     pub line: u32,
@@ -734,11 +824,13 @@ pub struct SourceSpan {
 /// Opaque resume location. The bytecode lowerer can later associate this with a
 /// concrete bytecode PC without making the IR depend on a bytecode format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub struct ResumePoint {
     pub id: ResumeId,
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct SnapshotSlot {
     /// Logical interpreter-visible slot. It is intentionally not a physical VM register.
     pub slot: u32,
@@ -746,6 +838,7 @@ pub struct SnapshotSlot {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct InlinedFrameState {
     pub function: FuncId,
     pub resume: ResumePoint,
@@ -753,6 +846,7 @@ pub struct InlinedFrameState {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct DeoptSnapshot {
     pub resume: ResumePoint,
     pub slots: Vec<SnapshotSlot>,
@@ -770,12 +864,14 @@ impl DeoptSnapshot {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct DeoptPoint {
     pub id: DeoptId,
     pub snapshot: DeoptSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum BailoutReason {
     TypeMismatch,
     ClassMismatch,
@@ -789,6 +885,7 @@ pub enum BailoutReason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum EffectKind {
     Read,
     Write,
@@ -814,12 +911,14 @@ pub enum EffectBehavior {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct EffectValue {
     pub id: EffectId,
     pub def: EffectDef,
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize)]
 pub enum EffectDef {
     Entry,
     BlockParam(BlockId),
@@ -827,12 +926,14 @@ pub enum EffectDef {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum IntUnaryOp {
     Neg,
     BitNot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum IntBinOp {
     Add,
     Sub,
@@ -848,11 +949,13 @@ pub enum IntBinOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum F64UnaryOp {
     Neg,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum F64BinOp {
     Add,
     Sub,
@@ -862,6 +965,7 @@ pub enum F64BinOp {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum CmpKind {
     Eq,
     Ne,
@@ -872,6 +976,7 @@ pub enum CmpKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum CallConv {
     Napalm,
     Fast,
@@ -883,6 +988,7 @@ pub enum CallConv {
 /// Keys are always scalar. Shared-result policies additionally require a
 /// whole-program proof of unobservable object identity and GC-rooted results.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum MemoizationKind {
     #[default]
     None,
@@ -892,12 +998,33 @@ pub enum MemoizationKind {
     Recursive,
     /// Recursive pure allocation with globally shareable results.
     RecursiveShared,
+    /// Getter of a `computed` property. Not an auto-memoization result: the
+    /// lowerer assigns it. The call boundary validates the cached value against
+    /// the reactive dependency graph instead of probing a memo table, and the
+    /// return stores it in the instance. `cache_slot` is the first of three
+    /// consecutive hidden instance slots (cached value, validation epoch,
+    /// observer record); it is class-local until the VM relocates it with the
+    /// declaring class's field base.
+    Reactive { cache_slot: u16 },
 }
 
 impl MemoizationKind {
+    /// Whether calls must go through the ordinary call boundary (never be
+    /// inlined or entered natively without it).
     #[inline]
     pub const fn enabled(self) -> bool {
         !matches!(self, Self::None)
+    }
+
+    #[inline]
+    pub const fn is_reactive(self) -> bool {
+        matches!(self, Self::Reactive { .. })
+    }
+
+    /// Whether results live in a scalar-key memo table.
+    #[inline]
+    pub const fn uses_memo_table(self) -> bool {
+        !matches!(self, Self::None | Self::Reactive { .. })
     }
 
     #[inline]
@@ -912,6 +1039,7 @@ impl MemoizationKind {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Edge {
     pub target: BlockId,
     pub args: Vec<ValueId>,
@@ -919,6 +1047,7 @@ pub struct Edge {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct SwitchCase {
     pub value: i64,
     pub edge: Edge,
@@ -926,6 +1055,7 @@ pub struct SwitchCase {
 
 /// Mid/high-level Napalm operations.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub enum Inst {
     // ----- Control flow -----
     Jump {
@@ -2180,6 +2310,7 @@ impl Inst {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Node {
     pub id: InstId,
     pub kind: Inst,
@@ -2192,6 +2323,7 @@ pub struct Node {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Value {
     pub id: ValueId,
     pub ty: Type,
@@ -2199,6 +2331,7 @@ pub struct Value {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize)]
 pub enum ValueDef {
     InstResult(InstId, u8),
     BlockParam(BlockId, u16),
@@ -2206,6 +2339,7 @@ pub enum ValueDef {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
 pub enum CaptureMode {
     ByValue,
     /// The captured value is a `Type::Cell` and mutations go through the cell.
@@ -2213,6 +2347,7 @@ pub enum CaptureMode {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct CaptureParam {
     pub value: ValueId,
     pub ty: Type,
@@ -2220,6 +2355,7 @@ pub struct CaptureParam {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Block {
     pub id: BlockId,
     pub params: Vec<ValueId>,
@@ -2229,12 +2365,14 @@ pub struct Block {
 }
 
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize)]
 pub struct CallSiteProfile {
     pub receiver_classes: Vec<(ClassId, u64)>,
     pub targets: Vec<(FuncId, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[derive(serde::Serialize)]
 pub struct NumericProfile {
     pub int32_hits: u64,
     pub f64_hits: u64,
@@ -2242,9 +2380,13 @@ pub struct NumericProfile {
 }
 
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize)]
 pub struct ProfileData {
+    #[serde(serialize_with = "serialize_hir_map")]
     pub block_counters: HashMap<BlockId, u64>,
+    #[serde(serialize_with = "serialize_hir_map")]
     pub call_sites: HashMap<SiteId, CallSiteProfile>,
+    #[serde(serialize_with = "serialize_hir_map")]
     pub numeric_sites: HashMap<InstId, NumericProfile>,
 }
 
@@ -2256,6 +2398,7 @@ pub struct ProfileData {
 /// thrown Napalm value there on handler entry. `depth` resolves nested overlapping
 /// regions without putting enter/leave opcodes on the hot path.
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct ExceptionRegion {
     pub protected_blocks: Vec<BlockId>,
     pub handler: BlockId,
@@ -2264,6 +2407,7 @@ pub struct ExceptionRegion {
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct Function {
     pub id: FuncId,
     pub module: ModuleId,
@@ -2295,6 +2439,20 @@ pub struct Function {
     /// pays no bytecode dispatch cost merely for being inside a try/defer region.
     pub exception_regions: Vec<ExceptionRegion>,
     pub profiles: ProfileData,
+    /// Build-only provenance of an AOT call-site specialization clone. The
+    /// clone keeps the generic function's source name (stack traces, closures'
+    /// `toString`), so optimizers identify and deduplicate clones through this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub specialization: Option<SpecializationOrigin>,
+}
+
+/// Generic function a specialization clone was copied from and the canonical,
+/// interned description of the call-site facts it was specialized for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize)]
+pub struct SpecializationOrigin {
+    pub origin: FuncId,
+    pub facts: StringId,
 }
 
 impl Function {
@@ -2318,12 +2476,14 @@ impl Function {
 /// Source declaration identity. A `type Alias = InterfaceName` remains a
 /// DefineType even when its resolved structural value is an Interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize)]
 pub enum ContractDeclarationKind {
     Interface,
     Type,
 }
 
 #[derive(Clone, Debug)]
+#[derive(serde::Serialize)]
 pub struct ContractDeclaration {
     pub module: ModuleId,
     pub name: StringId,
@@ -2332,6 +2492,7 @@ pub struct ContractDeclaration {
 }
 
 #[derive(Default)]
+#[derive(serde::Serialize)]
 pub struct Program {
     next_func: u32,
     next_module: u32,
@@ -2342,13 +2503,17 @@ pub struct Program {
     next_resume: u32,
 
     pub functions: Vec<Function>,
+    #[serde(skip)]
     function_index: HashMap<FuncId, usize>,
     pub modules: Vec<ModuleInfo>,
+    #[serde(skip)]
     module_index: HashMap<ModuleId, usize>,
     pub classes: Vec<ClassInfo>,
+    #[serde(skip)]
     class_index: HashMap<ClassId, usize>,
     pub foreign_functions: Vec<ForeignFunctionInfo>,
     pub structural_layouts: Vec<StructuralLayoutInfo>,
+    #[serde(skip)]
     structural_layout_index: HashMap<Type, StructuralLayoutId>,
     /// Source names of declared interfaces and type aliases with their
     /// resolved contract, so the runtime can name contracts (`typeof`).
@@ -2357,9 +2522,12 @@ pub struct Program {
     /// bytecode at the owning module's entry, rather than guessing from Type.
     pub contract_declarations: Vec<ContractDeclaration>,
 
+    #[serde(serialize_with = "serialize_hir_strings")]
     strings: Vec<CompactString>,
+    #[serde(skip)]
     string_index: HashMap<CompactString, StringId>,
     methods: Vec<MethodSignature>,
+    #[serde(skip)]
     method_index: HashMap<MethodSignature, MethodSymbol>,
 }
 
@@ -2477,6 +2645,15 @@ impl Program {
     pub fn function_mut(&mut self, id: FuncId) -> Option<&mut Function> {
         let index = *self.function_index.get(&id)?;
         self.functions.get_mut(index)
+    }
+
+    /// Remove unreachable function bodies without renumbering public FuncIds.
+    pub(crate) fn retain_functions(&mut self, mut retain: impl FnMut(&Function) -> bool) {
+        self.functions.retain(|function| retain(function));
+        self.function_index.clear();
+        for (index, function) in self.functions.iter().enumerate() {
+            self.function_index.insert(function.id, index);
+        }
     }
 
     pub fn add_module(&mut self, name: impl AsRef<str>, variable_count: u32) -> ModuleId {
@@ -2694,6 +2871,7 @@ impl<'p> Builder<'p> {
             deopts: Vec::new(),
             exception_regions: Vec::new(),
             profiles: ProfileData::default(),
+            specialization: None,
         };
 
         let mut block_params = Vec::with_capacity(params.len());

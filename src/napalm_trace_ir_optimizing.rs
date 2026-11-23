@@ -82,6 +82,9 @@ fn passes(promote_loop_representations: bool) -> TraceOptimize {
         .with_pass(LoopInvariantGuardHoisting)
         .with_pass(LoopUnswitching)
         .with_pass(LoopInvariantCodeMotion)
+        // Reads whose operands only became invariant through guard hoisting
+        // (e.g. `s[i - 1]` inside a loop over j) can now leave the loop too.
+        .with_pass(LoopInvariantLoadHoisting)
         // Late fixed-point cleanup after the structural loop transforms.
         .with_pass(ConversionSimplification)
         .with_pass(TraceCanonicalization {
@@ -95,6 +98,20 @@ fn passes(promote_loop_representations: bool) -> TraceOptimize {
         .with_pass(AlgebraicSimplification)
         .with_pass(HeapFactPropagation)
         .with_pass(GuardCoalescing)
+        .with_pass(RedundantGuardElimination)
+        .with_pass(GlobalValueNumbering)
+        // Late memory round: GVN has just merged index computations that only
+        // became equal once RangeAnalysis dropped their overflow checks (e.g.
+        // two `j - 1`), so repeated reads now share one key, and loop-carried
+        // reuse (`cur[j - 1]` = last iteration's `cur[j]`) is visible.
+        .with_pass(RedundantLoadElimination)
+        .with_pass(LoopCarriedGuardElimination)
+        // Unbox the loop-carried memory phis it introduced (same rules as the
+        // first canonicalization; nothing else is new to it).
+        .with_pass(TraceCanonicalization {
+            promote_loop_representations,
+            promote_integer_induction: false,
+        })
         .with_pass(RedundantGuardElimination)
         .with_pass(GlobalValueNumbering)
         .with_pass(SparseConditionalConstantPropagation)
@@ -160,6 +177,38 @@ fn preheader_values(trace: &Trace) -> HashSet<TraceValueId> {
     available
 }
 
+/// Snapshot membership test for `trace.preheader`. Node ids are dense arena
+/// indices, so a byte mask replaces the hashed set the passes used to build:
+/// one zeroed allocation and a single load per query. Like a collected set it
+/// is a snapshot: nodes appended afterwards (including new preheader nodes)
+/// read as absent.
+pub(crate) struct PreheaderMask {
+    bits: Vec<bool>,
+    empty: bool,
+}
+
+impl PreheaderMask {
+    pub(crate) fn new(trace: &Trace) -> Self {
+        let mut bits = vec![false; trace.nodes.len()];
+        for &id in &trace.preheader {
+            if let Some(bit) = bits.get_mut(id) {
+                *bit = true;
+            }
+        }
+        Self { bits, empty: trace.preheader.is_empty() }
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, id: &usize) -> bool {
+        self.bits.get(*id).copied().unwrap_or(false)
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.empty
+    }
+}
+
 fn native_loop(trace: &Trace) -> bool {
     matches!(trace.anchor.kind, TraceKind::Loop)
         && matches!(trace.terminator, TraceTerminator::LoopBack)
@@ -198,7 +247,7 @@ impl TraceOptimization for GlobalValueNumbering {
                 constants.insert(key, value.id);
             }
         }
-        let preheader: HashSet<_> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let order: Vec<_> = trace
             .preheader
             .iter()
@@ -240,7 +289,7 @@ impl TraceOptimization for LoopInvariantCodeMotion {
             return false;
         }
         let mut available = preheader_values(trace);
-        let preheader: HashSet<_> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let mut changed = false;
         for id in 0..trace.nodes.len() {
             if preheader.contains(&id) {
@@ -275,17 +324,21 @@ impl TraceOptimization for PartialRedundancyElimination {
             return false;
         }
         let mut changed = false;
-        let preheader: HashSet<_> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let body: Vec<_> = (0..trace.nodes.len())
             .filter(|id| !preheader.contains(id))
             .collect();
+        // `preheader_values` scans every value. It depends only on the trace,
+        // which changes solely at the end of a successful elimination below,
+        // so recompute it lazily after a change instead of once per body node.
+        let mut available_cache = None;
         // Bounded to the original nodes. Newly introduced phis may enable a
         // later pipeline pass, but cannot grow this pass's candidate set.
         for &id in &body {
             let Some(key) = expression(trace, id) else {
                 continue;
             };
-            let available = preheader_values(trace);
+            let available = &*available_cache.get_or_insert_with(|| preheader_values(trace));
             let mut initial = key.clone();
             let mut backedge = key.clone();
             let mut has_phi = false;
@@ -339,6 +392,7 @@ impl TraceOptimization for PartialRedundancyElimination {
             };
             let next = trace.nodes[redundant].results[0];
             let source = trace.nodes[id].source;
+            available_cache = None;
             for phi in guarded_inputs {
                 let exit = phi.entry_exit.unwrap();
                 let value = TraceValueId(trace.values.len() as u32);
@@ -627,8 +681,13 @@ impl TraceCanonicalization {
             boxed_backedge: TraceValueId,
             raw_backedge: TraceValueId,
             rep: TraceRep,
+            /// The backedge is a Box of `raw_backedge` (exits may then box the
+            /// raw value themselves); otherwise it is a tagged value that a
+            /// body guard unboxed to `raw_backedge`.
+            boxed: bool,
         }
 
+        let preheader = PreheaderMask::new(trace);
         let mut candidates = Vec::new();
         for (phi_index, phi) in trace.loop_phis.iter().enumerate() {
             if phi.rep != TraceRep::Tagged || phi.entry_exit.is_some() {
@@ -637,14 +696,30 @@ impl TraceCanonicalization {
             let Some(backedge) = phi.backedge.map(|v| trace.canonical_value(v)) else {
                 continue;
             };
-            let Some((_, producer)) = Self::producer(trace, backedge) else {
-                continue;
+            let boxed_raw = match Self::producer(trace, backedge) {
+                Some((_, TraceInst::BoxF64 { value })) => Some((trace.canonical_value(value), TraceRep::F64)),
+                Some((_, TraceInst::BoxInt32 { value })) => Some((trace.canonical_value(value), TraceRep::Int32)),
+                Some((_, TraceInst::BoxUInt32 { value })) => Some((trace.canonical_value(value), TraceRep::UInt32)),
+                _ => None,
             };
-            let (raw_backedge, rep) = match producer {
-                TraceInst::BoxF64 { value } => (trace.canonical_value(value), TraceRep::F64),
-                TraceInst::BoxInt32 { value } => (trace.canonical_value(value), TraceRep::Int32),
-                TraceInst::BoxUInt32 { value } => (trace.canonical_value(value), TraceRep::UInt32),
-                _ => continue,
+            // A tagged backedge (e.g. a loop-carried memory phi whose next
+            // value is a heap read) that a body guard unboxes: every body node
+            // runs before the backedge, so that guard's raw result is the
+            // backedge's value on every iteration that reaches it.
+            let guarded_raw = || trace.nodes.iter().find_map(|node| {
+                if preheader.contains(&node.id) {
+                    return None;
+                }
+                let rep = match node.kind {
+                    TraceInst::GuardF64 { value, .. } if trace.canonical_value(value) == backedge => TraceRep::F64,
+                    TraceInst::GuardInt32 { value, .. } if trace.canonical_value(value) == backedge => TraceRep::Int32,
+                    _ => return None,
+                };
+                node.results.first().map(|&result| (trace.canonical_value(result), rep))
+            });
+            let boxed = boxed_raw.is_some();
+            let Some((raw_backedge, rep)) = boxed_raw.or_else(guarded_raw) else {
+                continue;
             };
             if trace.value(raw_backedge).map(|v| v.rep) != Some(rep) {
                 continue;
@@ -699,6 +774,7 @@ impl TraceCanonicalization {
                 boxed_backedge: backedge,
                 raw_backedge,
                 rep,
+                boxed,
             });
         }
 
@@ -772,7 +848,16 @@ impl TraceCanonicalization {
             }
 
             // Any exit that used the boxed backedge can materialize the raw value
-            // directly into its original Tagged target representation.
+            // directly into its original Tagged target representation. (A
+            // guarded tagged backedge keeps its exact word in exits.)
+            if !candidate.boxed {
+                match candidate.rep {
+                    TraceRep::F64 => trace.stats.promoted_f64_loop_phis += 1,
+                    TraceRep::Int32 => trace.stats.promoted_i32_loop_phis += 1,
+                    _ => {}
+                }
+                continue;
+            }
             let canonical_values: Vec<_> = (0..trace.values.len())
                 .map(|index| trace.canonical_value(TraceValueId(index as u32)))
                 .collect();
@@ -882,7 +967,7 @@ impl TraceCanonicalization {
             id
         }
 
-        let preheader: HashSet<usize> = trace.preheader.iter().copied().collect();
+        let preheader = PreheaderMask::new(trace);
         let integral_constant = |trace: &Trace, value: TraceValueId| -> Option<i64> {
             match &trace.value(trace.canonical_value(value))?.origin {
                 TraceValueOrigin::Constant(TraceConstant::F64Bits(bits)) => {
@@ -1351,27 +1436,35 @@ impl TraceCanonicalization {
         }
     }
 
-    fn used_values(trace: &Trace) -> HashSet<TraceValueId> {
-        let mut used = HashSet::default();
+    /// Dense used-value mask indexed by canonical value id. It grows on demand
+    /// so a malformed out-of-range reference still counts as a use (the
+    /// verifier reports it) exactly as the former hashed set did.
+    fn used_values(trace: &Trace) -> Vec<bool> {
+        let mut used = vec![false; trace.values.len()];
+        let mut mark = |value: TraceValueId| {
+            let index = trace.canonical_value(value).0 as usize;
+            if index >= used.len() {
+                used.resize(index + 1, false);
+            }
+            used[index] = true;
+        };
         for node in &trace.nodes {
             let mut kind = node.kind.clone();
-            kind.visit_operands(|value| {
-                used.insert(trace.canonical_value(*value));
-            });
+            kind.visit_operands(|value| mark(*value));
         }
         for exit in &trace.exits {
             for frame in &exit.frames {
                 for write in &frame.writes {
                     if let SnapshotValue::Value(value) = write.value {
-                        used.insert(trace.canonical_value(value));
+                        mark(value);
                     }
                 }
             }
         }
         for phi in &trace.loop_phis {
-            used.insert(trace.canonical_value(phi.initial));
+            mark(phi.initial);
             if let Some(backedge) = phi.backedge {
-                used.insert(trace.canonical_value(backedge));
+                mark(backedge);
             }
         }
         used
@@ -1379,6 +1472,7 @@ impl TraceCanonicalization {
 
     fn remove_dead_box_nodes(&self, trace: &mut Trace) {
         let used = Self::used_values(trace);
+        let is_used = |value: TraceValueId| used.get(value.0 as usize).copied().unwrap_or(false);
         let canonical_values: Vec<_> = (0..trace.values.len())
             .map(|index| trace.canonical_value(TraceValueId(index as u32)))
             .collect();
@@ -1387,7 +1481,7 @@ impl TraceCanonicalization {
             let Some(result) = node.results.first().copied() else {
                 continue;
             };
-            if used.contains(&canonical_values[result.0 as usize]) {
+            if is_used(canonical_values[result.0 as usize]) {
                 continue;
             }
             if matches!(

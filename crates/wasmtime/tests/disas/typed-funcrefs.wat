@@ -115,10 +115,10 @@
 
 ;; function u0:0(i64 vmctx, i64, i32, i32, i32, i32) -> i32 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32, v3: i32, v4: i32, v5: i32):
@@ -130,14 +130,14 @@
 ;;
 ;; function u0:1(i64 vmctx, i64, i32, i32, i32, i32) -> i32 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 93 ""
 ;;     region3 = 117 ""
 ;;     region4 = 120 ""
 ;;     region5 = 100 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     sig0 = (i64 vmctx, i32, i64) -> i64 tail
 ;;     sig1 = (i64 vmctx, i64, i32, i32, i32, i32) -> i32 tail
 ;;     fn0 = colocated u805306368:6 sig0
@@ -165,12 +165,12 @@
 ;;                                     v69 = iconst.i64 16
 ;; @005b                               v40 = iadd.i64 v11, v69  ; v69 = 16
 ;; @005b                               v43 = load.i64 user6 aligned region3 v40
-;;                                     v70 = iconst.i64 -2
-;;                                     v71 = band v43, v70  ; v70 = -2
+;; @0048                               v70 = iconst.i64 -2
+;; @005b                               v71 = band v43, v70  ; v70 = -2
 ;; @005b                               brif v43, block5(v71), block4
 ;;
 ;;                                 block4 cold:
-;;                                     v72 = iconst.i32 0
+;; @003c                               v72 = iconst.i32 0
 ;;                                     v68 = iconst.i64 2
 ;; @005b                               v49 = call fn0(v0, v72, v68)  ; v72 = 0, v68 = 2
 ;; @005b                               jump block5(v49)
@@ -188,14 +188,14 @@
 ;;
 ;; function u0:2(i64 vmctx, i64, i32, i32, i32, i32) -> i32 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 93 ""
 ;;     region3 = 117 ""
 ;;     region4 = 120 ""
 ;;     region5 = 100 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     sig0 = (i64 vmctx, i64, i32, i32, i32, i32) -> i32 tail
 ;;     sig1 = (i64 vmctx, i32, i64) -> i64 tail
 ;;     fn0 = colocated u805306368:6 sig1
@@ -223,12 +223,12 @@
 ;;                                     v69 = iconst.i64 16
 ;; @0087                               v40 = iadd.i64 v11, v69  ; v69 = 16
 ;; @0087                               v43 = load.i64 user6 aligned region3 v40
-;;                                     v70 = iconst.i64 -2
-;;                                     v71 = band v43, v70  ; v70 = -2
+;; @0075                               v70 = iconst.i64 -2
+;; @0087                               v71 = band v43, v70  ; v70 = -2
 ;; @0087                               brif v43, block5(v71), block4
 ;;
 ;;                                 block4 cold:
-;;                                     v72 = iconst.i32 0
+;; @0069                               v72 = iconst.i32 0
 ;;                                     v68 = iconst.i64 2
 ;; @0087                               v49 = call fn0(v0, v72, v68)  ; v72 = 0, v68 = 2
 ;; @0087                               jump block5(v49)
@@ -246,14 +246,14 @@
 ;;
 ;; function u0:3(i64 vmctx, i64, i32, i32, i32, i32) -> i32 tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 250 ""
 ;;     region3 = 120 ""
 ;;     region4 = 100 ""
 ;;     region5 = 135 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     sig0 = (i64 vmctx, i64, i32, i32, i32, i32) -> i32 tail
 ;;     stack_limit = gv2
 ;;

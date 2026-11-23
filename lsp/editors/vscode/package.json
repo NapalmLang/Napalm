@@ -1,0 +1,143 @@
+{
+  "name": "napalm-language",
+  "displayName": "Napalm Language",
+  "description": "Napalm syntax highlighting, native self-hosted LSP server, branded file icons and extension logo.",
+  "version": "0.1.1",
+  "publisher": "napalm-local",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "napalm",
+    "syntax",
+    "highlighting",
+    "language"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "napalm",
+        "aliases": [
+          "Napalm",
+          "napalm"
+        ],
+        "extensions": [
+          ".napalm"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/flame-32.png",
+          "dark": "./icons/flame-32.png"
+        }
+      },
+      {
+        "id": "napalm-burning",
+        "aliases": [
+          "Napalm Compiled Bytecode"
+        ],
+        "extensions": [
+          ".burning"
+        ],
+        "icon": {
+          "light": "./icons/flame-32.png",
+          "dark": "./icons/flame-32.png"
+        }
+      },
+      {
+        "id": "napalm-fire",
+        "aliases": [
+          "Napalm Fire File"
+        ],
+        "extensions": [
+          ".fire"
+        ],
+        "icon": {
+          "light": "./icons/flame-32.png",
+          "dark": "./icons/flame-32.png"
+        }
+      },
+      {
+        "id": "napalm-orange",
+        "aliases": [
+          "Napalm Orange File"
+        ],
+        "extensions": [
+          ".orange"
+        ],
+        "icon": {
+          "light": "./icons/flame-32.png",
+          "dark": "./icons/flame-32.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "napalm",
+        "scopeName": "source.napalm",
+        "path": "./syntaxes/napalm.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Napalm",
+      "properties": {
+        "napalm.languageServerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for Napalm LSP executable. By default, the packaged executable inside this extension is used. Absolute path or workspace-relative path."
+        }
+      }
+    },
+    "iconThemes": [
+      {
+        "id": "napalm-file-icons",
+        "label": "Napalm File Icons",
+        "path": "./themes/napalm-file-icon-theme.json"
+      }
+    ]
+  },
+  "files": [
+    "extension.js",
+    "server",
+    "syntaxes",
+    "language-configuration.json",
+    "icons",
+    "README.md",
+    "themes"
+  ],
+  "scripts": {
+    "test": "node --test ./tests/*.test.mjs",
+    "configure:icons": "node ./scripts/configure-icons.mjs",
+    "package:bundled": "node --experimental-strip-types ../../build-vscode.ts",
+    "test:bundling": "node --test ./tests/bundling.test.mjs",
+    "build:vsix": "node --experimental-strip-types ../../build-vscode.ts",
+    "test:builder": "node --experimental-strip-types --test ../../tests/build-vscode.test.mjs",
+    "typecheck": "tsc -p ../../tsconfig.build-vscode.json"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^4.1.1",
+    "typescript": "^7.0.2",
+    "@types/node": "^26.6.6"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:napalm"
+  ],
+  "dependencies": {
+    "vscode-languageclient": "^11.0.0"
+  },
+  "icon": "./icons/extension-logo-256.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Brugarolas/Napalm.git"
+  },
+  "homepage": "https://github.com/Brugarolas/Napalm",
+  "bugs": {
+    "url": "https://github.com/Brugarolas/Napalm/issues"
+  }
+}
+

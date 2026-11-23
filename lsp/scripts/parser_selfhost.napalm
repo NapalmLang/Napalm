@@ -1,0 +1,27 @@
+// Run from the repository root:
+// napalm lsp/scripts/parser_selfhost.napalm
+// Parse the real Napalm LSP sources using the parser implemented in Napalm.
+import {parse} from "../src/parser";
+
+const files = [
+    "lsp/src/lexer.napalm",
+    "lsp/src/parser.napalm",
+    "lsp/src/server.napalm",
+    "lsp/src/documents.napalm",
+    "lsp/src/positions.napalm",
+    "lsp/src/transport.napalm"
+];
+
+for (const fileName of files) {
+    const source = Fs.readText(fileName);
+    const output = parse(source);
+    if (output.diagnostics.length > 0) {
+        System.print("Parser failed on " + fileName);
+        System.print(JSON.stringify(output.diagnostics));
+        throw "Self-hosting parser regression";
+    }
+    if (output.ast.kind !== "Module" || output.ast.body.length === 0) {
+        throw "Invalid self-hosted AST: " + fileName;
+    }
+}
+System.print("Napalm parser self-hosting smoke tests passed");

@@ -1,0 +1,19 @@
+// Command-line AST inspection tool; never use this helper as the LSP process.
+// Run: napalm lsp/scripts/parse_file.napalm <source.napalm>
+import {parse} from "../src/parser";
+
+const args = Process.args;
+if (args.length !== 1) {
+    Process.stderr.writeText("Usage: parse_file.napalm <source.napalm>\n");
+    Process.exit(2);
+}
+const fileName = args[0];
+const source = Fs.readText(fileName);
+const parsed = parse(source);
+Process.stdout.writeText(JSON.stringify({
+    file: fileName,
+    ast: parsed.ast,
+    diagnostics: parsed.diagnostics
+}));
+Process.stdout.writeText("\n");
+if (parsed.diagnostics.length > 0) Process.exit(1);

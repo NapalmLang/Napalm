@@ -9,10 +9,15 @@ use smallvec::SmallVec;
 use compact_str::CompactString;
 use crate::napalm_collections::{HashMap, HashSet};
 
+#[path = "napalm_generators.rs"]
+mod generators;
+
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq)]
 #[logos(skip r"[ \t\r]+")]
 #[logos(skip(r"//[^\r\n]*", allow_greedy = true))]
 enum Kind {
+    #[token("[[[", mx_block)]
+    MxBlock,
     #[token("/*", comment)]
     Comment,
     #[token("\n")]
@@ -27,9 +32,19 @@ enum Kind {
     #[token("'", string)]
     #[token("`", string)]
     String,
-    #[regex(r"===|!==|>>>|\?\?=|&&=|\|\|=|\*\*=|\?\.|\?\?|\.\.\.|\|>|==|!=|<=|>=|=>|\+\+|--|\+=|-=|\*=|/=|%=|\*\*|&&|\|\||<<|>>|[{}()\[\],;:.?+*/%~!&|^=<>@-]")]
+    #[regex(r"===|!==|>>>|\?\?=|&&=|\|\|=|\*\*=|<<=|>>=|&=|\|=|\^=|\?\.|\?\?|\.\.\.|\|>|==|!=|<=|>=|=>|\+\+|--|\+=|-=|\*=|/=|%=|\*\*|&&|\|\||<<|>>|[{}()\[\],;:.?+*/%~!&|^=<>@-]")]
     Symbol,
     Eof,
+}
+
+fn mx_block(lex: &mut logos::Lexer<'_, Kind>) -> bool {
+    if let Some(end) = crate::napalm_mx_front::block_end(lex.remainder()) {
+        lex.bump(end);
+        true
+    } else {
+        lex.bump(lex.remainder().len());
+        false
+    }
 }
 
 fn comment(lex: &mut logos::Lexer<'_, Kind>) -> bool {
@@ -71,6 +86,11 @@ fn quoted_end(bytes: &[u8], start: usize, depth: usize) -> Option<usize> {
 fn interpolation_end(bytes: &[u8], mut i: usize, depth: usize) -> Option<usize> {
     let mut braces = 0;
     while i < bytes.len() {
+        if bytes[i..].starts_with(b"[[[") {
+            let body = std::str::from_utf8(&bytes[i + 3..]).ok()?;
+            i += 3 + crate::napalm_mx_front::block_end(body)?;
+            continue;
+        }
         match bytes[i] {
             b'\'' | b'"' | b'`' => i = quoted_end(bytes, i, depth)?,
             b'/' if bytes[i..].starts_with(b"//") => {
@@ -153,7 +173,7 @@ struct Parser<'a> {
     source: &'a str,
     arena: &'a Bump,
     tokens: BumpVec<'a, Tok>,
-    // Only splitting a `>>` token mutates the stream during type lookahead.
+    // Splitting closing-angle tokens mutates the stream during type lookahead.
     token_splits: SmallVec<[(usize, Tok); 4]>,
     pos: usize,
     depth: usize,
@@ -165,9 +185,17 @@ struct Parser<'a> {
     /// the corresponding FunctionBody is assembled. This keeps the existing AST
     /// parameter representation compact while preserving TypeScript annotations.
     parameter_types: HashMap<Span, TypeAnnotation>,
+    /// Declared type of a defaulted `name: T = value` parameter, keyed by its
+    /// synthetic parameter span. The call boundary accepts `T | null` (an
+    /// omitted argument arrives as `null`); the body binding itself is `T`.
+    parameter_default_types: HashMap<Span, TypeAnnotation>,
+    /// Number of synthesized parameter statements (defaults, destructuring)
+    /// prepended to the most recently parsed function body.
+    parameter_prefix_len: usize,
     /// Direct `this.name` writes in the current constructor (including lexical closures).
     constructor_properties: Option<Vec<Ident>>,
     synthetic_span: usize,
+    generator: Option<generators::GeneratorSignature>,
     /// Module-level interfaces and type aliases, pre-scanned before parsing
     /// statements so a class may implement a contract declared after it.
     contracts: HashMap<String, ContractInfo>,
@@ -309,6 +337,8 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
     if let Some((base, args)) = split_generic_type(source) {
         let arguments = split_type_top_level(args, ',');
         return match base {
+            "Generator" => TypeAnnotation::new(K::BuiltinGeneric("Generator".into(),
+                arguments.first().map(|part| Box::new(classify_variable_type(part, span)))), span),
             "Array" | "ReadonlyArray" | "List" => {
                 let element = arguments
                     .first()
@@ -355,6 +385,7 @@ fn classify_compact_type(source: &str, span: Span) -> TypeAnnotation {
         "boolean" | "bool" => K::Bool,
         "number" | "num" => K::Num,
         "string" => K::String,
+        "generator" => K::BuiltinGeneric("Generator".into(), None),
         "object" => K::Opaque(source.to_owned()),
         "function" | "fn" => K::Closure,
         "true" | "false" => K::Bool,
@@ -483,6 +514,11 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Ok(kind) => tokens.push(Tok { kind, span }),
+                Err(_) if source[span.as_range()].starts_with("[[[") => diagnostics.push(Diagnostic::error(
+                    "MX-L002",
+                    "unterminated MX block; expected `]]]`",
+                    span,
+                )),
                 Err(_) => diagnostics.push(Diagnostic::error(
                     "NAPALM-L001",
                     "invalid token or unterminated string/comment",
@@ -508,8 +544,11 @@ impl<'a> Parser<'a> {
             immutable: HashSet::default(),
             parameter_patterns: HashMap::default(),
             parameter_types: HashMap::default(),
+            parameter_default_types: HashMap::default(),
+            parameter_prefix_len: 0,
             constructor_properties: None,
             synthetic_span: source.len() + 1,
+            generator: None,
             contracts: HashMap::default(),
             class_summaries: HashMap::default(),
             generic_classes: HashMap::default(),
@@ -1131,6 +1170,10 @@ impl<'a> Parser<'a> {
                 return self.error("a `concurrent` function is already asynchronous at its call boundary; use `launch` + `await` instead of `async concurrent`");
             }
             self.expect("function")?;
+            let generator = self.eat("*");
+            if generator && (async_ || concurrent_) {
+                return self.error("async and concurrent generators are not supported");
+            }
             let name = if default_export && self.at("(") {
                 Spanned::new("<default>".into(), self.peek().span)
             } else {
@@ -1147,7 +1190,11 @@ impl<'a> Parser<'a> {
                 self.boundary()?;
                 return Ok(Vec::new());
             }
-            let body = self.function_body(params, return_type, start)?;
+            let body = if generator {
+                self.generator_body(params, return_type, start)?
+            } else {
+                self.function_body(params, return_type, start)?
+            };
             let initializer = Expr::new(
                 if concurrent_ {
                     ExprKind::ConcurrentClosure(body)
@@ -1858,8 +1905,14 @@ impl<'a> Parser<'a> {
         if self.at("switch") {
             return self.error("`switch` is recognized JavaScript/TypeScript syntax but is not lowered yet");
         }
-        let kind = if self.eat("if") {
+        let kind = if self.at("if") || self.at("unless") {
+            // `unless (c)` is sugar for `if (!(c))`, including its `else` branch.
+            let negate = self.eat("unless");
+            if !negate {
+                self.bump();
+            }
             let condition = self.condition()?;
+            let condition = if negate { negated(condition) } else { condition };
             let then_branch = Box::new(self.statement()?);
             self.lines();
             let else_branch = if self.eat("else") {
@@ -1872,8 +1925,14 @@ impl<'a> Parser<'a> {
                 then_branch,
                 else_branch,
             }
-        } else if self.eat("while") {
+        } else if self.at("while") || self.at("until") {
+            // `until (c)` is sugar for `while (!(c))`.
+            let negate = self.eat("until");
+            if !negate {
+                self.bump();
+            }
             let condition = self.condition()?;
+            let condition = if negate { negated(condition) } else { condition };
             StmtKind::While {
                 condition,
                 body: Box::new(self.statement()?),
@@ -1882,8 +1941,12 @@ impl<'a> Parser<'a> {
         } else if self.eat("do") {
             let body = Box::new(self.statement()?);
             self.lines();
-            self.expect("while")?;
+            let negate = self.eat("until");
+            if !negate {
+                self.expect("while")?;
+            }
             let condition = self.condition()?;
+            let condition = if negate { negated(condition) } else { condition };
             self.eat(";");
             StmtKind::DoWhile { body, condition }
         } else if self.eat("for") {
@@ -1962,6 +2025,13 @@ impl<'a> Parser<'a> {
                 } else {
                     Some(self.expr(0)?)
                 };
+                let value = if let Some(returned) = self.generator.as_ref().and_then(|g| g.returned.clone()) {
+                    let span = self.end(start);
+                    Some(Expr::new(ExprKind::TypedCollection {
+                        expression: Box::new(value.unwrap_or_else(|| Expr::new(ExprKind::Null, span))),
+                        annotation: returned,
+                    }, span))
+                } else { value };
                 StmtKind::Return(value)
             } else if self.eat("throw") {
                 if self.peek().kind == Kind::Line {
@@ -2181,19 +2251,26 @@ impl<'a> Parser<'a> {
                 return self.error("rest parameters are not implemented yet");
             }
             let pattern = self.binding_pattern()?;
-            let param = match pattern {
-                BindingPattern::Ident(name) => name,
-                pattern => {
-                    if property { return self.error("parameter properties require a simple identifier"); }
-                    let span = pattern.span();
-                    self.parameter_patterns.insert(span, pattern);
-                    Spanned::new(compact_str::format_compact!("<parameter:{}>", span.start), span)
-                }
+            let property_name = match &pattern {
+                BindingPattern::Ident(name) => Some(name.clone()),
+                _ if property => return self.error("parameter properties require a simple identifier"),
+                _ => None,
             };
             // Optionality is a type-system marker: an omitted argument arrives as
             // `null`, so `x?: T` is checked as `T | null`.
             let optional = self.eat("?");
-            let annotation = self.variable_annotation()?.map(|annotation| {
+            let declared = self.variable_annotation()?;
+            let default = if self.eat("=") {
+                if optional {
+                    return self.error("a parameter cannot be both optional and have a default value");
+                }
+                self.lines();
+                Some(self.expr(1)?)
+            } else {
+                None
+            };
+            let defaulted = default.is_some();
+            let annotation = declared.clone().map(|annotation| {
                 if !optional || matches!(annotation.kind, TypeAnnotationKind::Null) {
                     return annotation;
                 }
@@ -2201,14 +2278,34 @@ impl<'a> Parser<'a> {
                 let null = TypeAnnotation::new(TypeAnnotationKind::Null, span);
                 TypeAnnotation::new(TypeAnnotationKind::Union(vec![annotation, null]), span)
             });
-            if let Some(annotation) = annotation.as_ref() {
+            let param = match (pattern, default) {
+                (BindingPattern::Ident(name), None) => name,
+                (pattern, default) => {
+                    // `x = value` reuses destructuring defaults: the argument is
+                    // bound to an untyped synthetic parameter (an omitted
+                    // argument arrives as `null`) and the body starts with
+                    // `let x: T = <parameter> ?? value`. Defaults are evaluated
+                    // on every call, in parameter order, so later defaults may
+                    // read earlier parameters; `T` is checked after the default
+                    // has been substituted.
+                    let pattern = match default {
+                        Some(value) => BindingPattern::Default { pattern: Box::new(pattern), value },
+                        None => pattern,
+                    };
+                    let span = pattern.span();
+                    if defaulted && let Some(declared) = declared.clone() {
+                        self.parameter_default_types.insert(span, declared);
+                    }
+                    self.parameter_patterns.insert(span, pattern);
+                    let prefix = if defaulted { DEFAULT_PARAMETER_PREFIX } else { "<parameter:" };
+                    Spanned::new(compact_str::format_compact!("{prefix}{}>", span.start), span)
+                }
+            };
+            if !defaulted && let Some(annotation) = annotation.as_ref() {
                 self.parameter_types.insert(param.span, annotation.clone());
             }
-            if self.eat("=") {
-                return self.error("default parameters are not implemented yet");
-            }
             if property {
-                properties.push((param.clone(), annotation));
+                properties.push((property_name.unwrap(), annotation));
             }
             params.push(param);
             self.lines();
@@ -2233,11 +2330,41 @@ impl<'a> Parser<'a> {
     fn parameter_bindings(&mut self, params: &[Ident]) -> Result<Vec<Stmt>> {
         let mut prefix = Vec::new();
         for param in params {
-            if let Some(pattern) = self.parameter_patterns.remove(&param.span) {
-                let source = Expr::new(ExprKind::Name(param.clone()), param.span);
-                self.expand_binding_pattern(pattern, source, false, &mut prefix)?;
+            let Some(pattern) = self.parameter_patterns.remove(&param.span) else { continue };
+            let source = Expr::new(ExprKind::Name(param.clone()), param.span);
+            match (pattern, self.parameter_default_types.remove(&param.span)) {
+                // `pattern: T = value`: the declared `T` constrains the value
+                // after the default has been substituted.
+                (BindingPattern::Default { pattern, value }, Some(annotation)) => {
+                    let span = param.span;
+                    let initializer = Expr::new(
+                        ExprKind::Logical { left: Box::new(source), operator: LogicalOp::Nullish, right: Box::new(value) },
+                        span,
+                    );
+                    let (name, rest) = match *pattern {
+                        BindingPattern::Ident(name) => (name, None),
+                        pattern => {
+                            // A fresh synthetic span: the pattern's own
+                            // temporaries already use `Span::empty(span.start)`.
+                            let temporary = Span::empty(self.synthetic_span);
+                            self.synthetic_span += 1;
+                            let name = compact_str::format_compact!("<parameter-default:{}>", span.start);
+                            (Spanned::new(name, temporary), Some(pattern))
+                        }
+                    };
+                    let binding = Expr::new(ExprKind::Name(name.clone()), span);
+                    prefix.push(Stmt {
+                        span,
+                        kind: StmtKind::Variable { shared: false, name, annotation: Some(annotation), initializer: Some(initializer) },
+                    });
+                    if let Some(pattern) = rest {
+                        self.expand_binding_pattern(pattern, binding, false, &mut prefix)?;
+                    }
+                }
+                (pattern, _) => self.expand_binding_pattern(pattern, source, false, &mut prefix)?,
             }
         }
+        self.parameter_prefix_len = prefix.len();
         Ok(prefix)
     }
 
@@ -2248,7 +2375,10 @@ impl<'a> Parser<'a> {
         start: usize,
     ) -> Result<FunctionBody> {
         self.lines();
-        let block = self.block()?;
+        let enclosing_generator = self.generator.take();
+        let block = self.block();
+        self.generator = enclosing_generator;
+        let block = block?;
         let StmtKind::Block(body_statements) = block.kind else {
             unreachable!()
         };
@@ -2323,7 +2453,7 @@ impl<'a> Parser<'a> {
 
     fn type_close(&mut self) -> Result<()> {
         self.lines();
-        if self.at(">>") {
+        if matches!(self.text(), ">>" | ">>=" | ">=") {
             let original = self.peek();
             let span = original.span;
             self.token_splits.push((self.pos, original));
@@ -2772,7 +2902,7 @@ impl<'a> Parser<'a> {
                 );
                 continue;
             }
-            if min <= 1 && matches!(self.text(), "=" | "+=" | "-=" | "*=" | "/=" | "%=") {
+            if min <= 1 && matches!(self.text(), "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "|=" | "&=" | "^=" | "<<=" | ">>=") {
                 let op = self.text();
                 self.bump();
                 if op == "=" { self.destructuring_target(&left)?; }
@@ -2787,7 +2917,7 @@ impl<'a> Parser<'a> {
                 } else {
                     ExprKind::Update {
                         target: Box::new(left),
-                        operator: infix(&op[..1]).unwrap().1,
+                        operator: infix(&op[..op.len() - 1]).unwrap().1,
                         value,
                         postfix: false,
                     }
@@ -3211,6 +3341,10 @@ impl<'a> Parser<'a> {
         false
     }
     fn closure(&mut self, start: usize, async_: bool, function: bool) -> Result<Expr> {
+        let generator = function && self.eat("*");
+        if generator && async_ {
+            return self.error("async generators are not supported");
+        }
         if self.at("<") {
             self.type_parameters()?;
         }
@@ -3234,7 +3368,9 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let body = if function {
+        let body = if generator {
+            self.generator_body(params, return_type, start)?
+        } else if function {
             self.function_body(params, return_type, start)?
         } else {
             self.expect("=>")?;
@@ -3242,7 +3378,10 @@ impl<'a> Parser<'a> {
             if self.at("{") {
                 self.function_body(params, return_type, start)?
             } else {
-                let value = self.expr(1)?;
+                let enclosing_generator = self.generator.take();
+                let value = self.expr(1);
+                self.generator = enclosing_generator;
+                let value = value?;
                 let param_types = self.take_parameter_types(&params);
                 let mut statements = self.parameter_bindings(&params)?;
                 let kind = if statements.is_empty() { FunctionBodyKind::Expression(Box::new(value)) }
@@ -3298,7 +3437,10 @@ impl<'a> Parser<'a> {
         let body = if self.at("{") {
             self.function_body(params, None, start)?
         } else {
-            let value = self.expr(1)?;
+            let enclosing_generator = self.generator.take();
+            let value = self.expr(1);
+            self.generator = enclosing_generator;
+            let value = value?;
             let param_types = self.take_parameter_types(&params);
             FunctionBody {
                 params,
@@ -3319,6 +3461,17 @@ impl<'a> Parser<'a> {
     }
 
     fn prefix(&mut self) -> Result<Expr> {
+        if self.peek().kind == Kind::MxBlock {
+            let span = self.peek().span;
+            self.pos += 1;
+            return match crate::napalm_mx_front::parse(&self.source[span.start + 3..span.end - 3], span.start + 3) {
+                Ok(block) => Ok(Expr::new(ExprKind::Mx(Box::new(block)), span)),
+                Err(diagnostic) => { self.diagnostics.push(diagnostic); Err(()) }
+            };
+        }
+        if self.at("yield") {
+            return self.generator_yield();
+        }
         if self.listen_ahead() {
             return self.listen_expression();
         }
@@ -3510,14 +3663,16 @@ impl<'a> Parser<'a> {
                     let type_start = self.peek().span.start;
                     self.type_arguments()?;
                     let type_end = self.tokens[self.pos - 1].span.end;
-                    if matches!(collection_name.as_str(), "Map" | "Set" | "ConcurrentMap" | "ConcurrentSet" | "Emitter" | "Channel") {
+                    if matches!(collection_name.as_str(), "Map" | "Set" | "ConcurrentMap" | "ConcurrentSet" | "Event" | "Emitter" | "Channel" | "Receiver") {
                         let spelling = format!("{}{}", collection_name, &self.source[type_start..type_end]);
                         let annotation = classify_variable_type(&spelling, self.end(start));
                         if matches!(annotation.kind, TypeAnnotationKind::Never) {
                             return self.error(match collection_name.as_str() {
                                 "Map" => "Map expects two type arguments",
                                 "Set" => "Set expects one type argument",
-                                "Emitter" => "Emitter expects one event type argument",
+                                "Event" => "Event expects one payload type argument",
+                                "Receiver" => "Receiver expects one payload type argument",
+                                "Emitter" => "Emitter expects one payload type argument",
                                 "Channel" => "Channel expects one message type argument",
                                 _ => "invalid generic constructor",
                             });
@@ -3780,6 +3935,7 @@ impl<'a> Parser<'a> {
                 let close = interpolation_end(bytes, i + 2, 1).ok_or(())?;
                 let mut nested = Parser::new(self.source, i + 2, close, self.arena);
                 nested.synthetic_span = self.synthetic_span;
+                nested.generator = self.generator.clone();
                 nested.constructor_properties = self.constructor_properties.take();
                 nested.contracts = std::mem::take(&mut self.contracts);
                 nested.class_summaries = std::mem::take(&mut self.class_summaries);
@@ -3961,6 +4117,7 @@ impl<'a> Parser<'a> {
         let decorator_parameter = ast.ident("payloadParameter");
         let mut constructor = None;
         let mut constructor_properties = Vec::new();
+        let mut constructor_parameter_prefix = 0;
         // Instance properties with a field initializer / parameter property, and
         // plain declared fields that still need a constructor assignment.
         let mut initialized_properties = HashSet::<CompactString>::default();
@@ -3993,12 +4150,16 @@ impl<'a> Parser<'a> {
                 }
             }
 
-            // Napalm historically allowed Wren-style class methods without a
+            // Napalm historically allowed Napalm-style class methods without a
             // keyword, while the TypeScript-like surface also accepts the explicit
             // `function name(...)` spelling used by ordinary declarations. Treat
             // `function` as a compatibility marker only; it does not change the
             // method ABI or AST representation.
             let explicit_function = self.eat("function");
+            let generator = self.eat("*");
+            if generator && async_ {
+                return self.error("async generators are not supported");
+            }
 
             // ES/TypeScript static initialization blocks map naturally to the
             // synthetic class initializer already used for static field values.
@@ -4076,16 +4237,17 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // `computed name() { ... }` creates a lazy cached property. The
-            // implementation body is stored as a zero-argument closure in one hidden
-            // fixed-layout field. Native reactive state owns the logical cache/version;
-            // a second hidden field only anchors managed cached values to the instance
-            // for GC and is never read by the getter. The public getter brackets closure
-            // execution with internal begin/finish hooks without changing the ABI.
+            // `computed name() { ... }` creates a lazy cached property. Its body
+            // is compiled as the public getter itself; three hidden fixed-layout
+            // fields hold the cached value, the reactive epoch at which it was
+            // last validated and the VM's bookkeeping. They are what marks the getter as a
+            // reactive-memoized function for the lowerer: the VM's call boundary
+            // answers a still-valid read without running the body and collects
+            // dependencies when it does run.
             //
-            // `watch name() { ... }` similarly stores a closure, but the reactive runtime
-            // schedules it as a microtask and re-schedules it when any dependency
-            // written during the previous run changes.
+            // `watch name() { ... }` stores a closure that the reactive runtime
+            // schedules as a microtask and re-schedules when any dependency
+            // read during the previous run changes.
             let reactive_member = if self.eat("computed") {
                 Some(true)
             } else if self.eat("watch") {
@@ -4121,18 +4283,14 @@ impl<'a> Parser<'a> {
                         "a watcher requires a function body"
                     });
                 }
-                // Computed/watch bodies are wrapped by reactive machinery whose
-                // public getter is synthesized separately; keep them unconstrained.
+                // Computed/watch bodies run under reactive machinery; keep
+                // their result unconstrained.
                 let body = self.function_body(Vec::new(), None, member_start)?;
                 if is_computed {
-                    let local_span = Span::empty(self.synthetic_span);
-                    self.synthetic_span += 1;
-                    let (callback_field, cache_field, getter, initializer) =
-                        synthesize_computed_property(&member, body, local_span);
-                    fields.push(callback_field);
-                    fields.push(cache_field);
+                    let (hidden_fields, getter) =
+                        synthesize_computed_property(&member, body, self.end(member_start));
+                    fields.extend(hidden_fields);
                     methods.push(getter);
-                    initializers.push(initializer);
                 } else {
                     let (field, initializer) = synthesize_watcher(&member, body);
                     fields.push(field);
@@ -4175,6 +4333,9 @@ impl<'a> Parser<'a> {
                         params,
                     },
                 };
+                if generator && (is_constructor || access.is_some() || foreign || type_only_member) {
+                    return self.error("generators require an ordinary implemented method");
+                }
                 if is_constructor && (is_static || async_ || access.is_some()) {
                     return self.error("a constructor cannot be static, async or an accessor");
                 }
@@ -4224,9 +4385,14 @@ impl<'a> Parser<'a> {
                     // Constructors always yield the new instance; `async` methods
                     // declare `Promise<T>`. Neither annotation constrains `return`.
                     let return_type = return_type.filter(|_| !is_constructor && !async_);
-                    let body = self.function_body(body_params, return_type, member_start)?;
+                    let body = if generator {
+                        self.generator_body(body_params, return_type, member_start)?
+                    } else {
+                        self.function_body(body_params, return_type, member_start)?
+                    };
                     if is_constructor {
                         constructor_properties = self.constructor_properties.take().unwrap();
+                        constructor_parameter_prefix = self.parameter_prefix_len;
                     }
                     Some(body)
                 };
@@ -4546,7 +4712,9 @@ impl<'a> Parser<'a> {
                         None => return self.error("a derived constructor with fields must call super() directly before initializing fields"),
                     }
                 } else {
-                    0
+                    // Parameter properties read the parameters after their
+                    // defaults and destructuring have been applied.
+                    constructor_parameter_prefix
                 };
                 let mut constructor_initializers = Vec::with_capacity(
                     parameter_initializers.len() + initializers.len() + watch_initializers.len(),
@@ -4669,78 +4837,26 @@ fn instance_field_expr(storage: &Ident) -> Expr {
     Expr::new(ExprKind::Field(storage.clone()), storage.span)
 }
 
+/// Hidden storage of a `computed` property, in slot order: its cached value,
+/// the reactive epoch at which that value was last known to be current, and
+/// the VM's observer record. The lowerer pairs them with the getter of the
+/// same name by these exact spellings.
+pub(crate) const COMPUTED_HIDDEN_FIELDS: [&str; 3] = ["cache", "epoch", "state"];
+
+pub(crate) fn computed_hidden_field_name(kind: &str, member: &str) -> compact_str::CompactString {
+    compact_str::format_compact!("__reactive_computed_{kind}${member}")
+}
+
 fn synthesize_computed_property(
     member: &Ident,
     body: FunctionBody,
-    local_span: Span,
-) -> (ClassFieldDecl, ClassFieldDecl, MethodDecl, Stmt) {
-    let callback_storage = hidden_reactive_field(member, "computed");
-    let cache_storage = hidden_reactive_field(member, "computed_cache");
-    let callback_local = Spanned::new(
-        compact_str::format_compact!("<reactive:computed-local:{}>", member.value),
-        local_span,
-    );
-    let span = member.span;
-    let closure = Expr::new(ExprKind::Closure(body), span);
-    let callback_field = || instance_field_expr(&callback_storage);
-    let callback = || Expr::new(ExprKind::Name(callback_local.clone()), span);
-    let cache = || instance_field_expr(&cache_storage);
-
-    let callback_decl = Stmt {
-        kind: StmtKind::Variable {
-                    shared: false,
-            name: callback_local.clone(),
-            annotation: None,
-            initializer: Some(callback_field()),
-        },
-        span,
-    };
-
-    let begin = reactive_static_call("__beginComputed", vec![callback()], span);
-    let evaluate = invoke(callback(), "call", Vec::new(), span);
-    let finish = reactive_static_call(
-        "__finishComputed",
-        vec![callback(), evaluate],
-        span,
-    );
-    // Native state owns dirty/version metadata and mirrors the current value here.
-    // The hidden field is both the precise-GC anchor and the getter's cache-hit
-    // return path; runtime brackets suppress this implementation-only read from
-    // the parent reactive dependency graph.
-    let cache_anchor = Expr::new(
-        ExprKind::Assign {
-            target: Box::new(cache()),
-            value: Box::new(finish),
-        },
-        span,
-    );
-    let abort = reactive_static_call("__abortComputed", vec![callback()], span);
-    let guarded_eval = Stmt {
-        kind: StmtKind::If {
-            condition: begin,
-            then_branch: Box::new(Stmt {
-                kind: StmtKind::Try {
-                    body: Box::new(Stmt {
-                        kind: StmtKind::Block(vec![Stmt {
-                            kind: StmtKind::Expression(cache_anchor),
-                            span,
-                        }]),
-                        span,
-                    }),
-                    catch: None,
-                    finally_branch: Some(Box::new(Stmt {
-                        kind: StmtKind::Block(vec![Stmt {
-                            kind: StmtKind::Expression(abort),
-                            span,
-                        }]),
-                        span,
-                    })),
-                },
-                span,
-            }),
-            else_branch: None,
-        },
-        span,
+    span: Span,
+) -> ([ClassFieldDecl; 3], MethodDecl) {
+    let hidden = |storage: compact_str::CompactString| ClassFieldDecl {
+        storage: Spanned::new(storage, member.span),
+        annotation: None,
+        initializer: None,
+        is_static: false,
     };
     let getter = MethodDecl {
         signature: MethodSignatureAst::Getter { name: member.clone() },
@@ -4749,52 +4865,10 @@ fn synthesize_computed_property(
         is_foreign: false,
         is_constructor: false,
         attributes: Vec::new(),
-        body: Some(FunctionBody {
-            params: Vec::new(),
-            param_types: Vec::new(),
-            return_type: None,
-            kind: FunctionBodyKind::Statements(vec![
-                callback_decl,
-                guarded_eval,
-                // __beginComputed/__abortComputed arrange for this one hidden
-                // cache-anchor load to bypass dependency tracking. Returning the
-                // field directly removes a second native runtime call from every
-                // computed cache hit.
-                Stmt {
-                    kind: StmtKind::Return(Some(cache())),
-                    span,
-                },
-            ]),
-            span,
-        }),
+        body: Some(body),
         span,
     };
-    let initializer = Stmt {
-        kind: StmtKind::Expression(Expr::new(
-            ExprKind::Assign {
-                target: Box::new(callback_field()),
-                value: Box::new(reactive_static_call("__registerComputed", vec![closure], span)),
-            },
-            span,
-        )),
-        span,
-    };
-    (
-        ClassFieldDecl {
-            storage: callback_storage,
-            annotation: None,
-            initializer: None,
-            is_static: false,
-        },
-        ClassFieldDecl {
-            storage: cache_storage,
-            annotation: None,
-            initializer: None,
-            is_static: false,
-        },
-        getter,
-        initializer,
-    )
+    (COMPUTED_HIDDEN_FIELDS.map(|kind| hidden(computed_hidden_field_name(kind, &member.value))), getter)
 }
 
 fn synthesize_watcher(
@@ -4878,7 +4952,7 @@ fn erase_unknown_type_parameters(argument: &str, known: &HashSet<String>) -> Str
     const BUILTIN: &[&str] = &[
         "ConcurrentMap", "ConcurrentSet", "Number", "String", "Boolean", "Array", "List", "Map", "Set", "Promise", "Event",
         "Emitter", "Channel", "Receiver", "Date", "Function", "Fn", "Object", "Range", "Fiber",
-        "Record", "Proxy",
+        "Record", "Proxy", "Bytes", "ByteBuffer",
     ];
     let mut out = String::with_capacity(argument.len());
     let mut word = String::new();
@@ -5139,6 +5213,7 @@ fn rewrite_enum_member_references(
     current_member: &str,
 ) {
     match &mut expr.kind {
+        ExprKind::Mx(_) => {}
         ExprKind::Name(name) if name.value != current_member && members.contains(name.value.as_str()) => {
             let member = name.value.clone();
             let span = name.span;
@@ -5147,6 +5222,7 @@ fn rewrite_enum_member_references(
         ExprKind::Unary { operand, .. }
         | ExprKind::TypedCollection { expression: operand, .. }
         | ExprKind::Grouped(operand)
+        | ExprKind::GeneratorYield { value: operand, .. }
         | ExprKind::Await(operand)
         | ExprKind::TypeOf(operand)
         | ExprKind::Launch(operand)
@@ -5638,6 +5714,18 @@ fn promote_shared_initializer(expr: &mut Expr) {
     }
 }
 
+/// Logical negation used by `unless`/`until`, which desugar to `if`/`while`.
+fn negated(condition: Expr) -> Expr {
+    let span = condition.span;
+    Expr::new(
+        ExprKind::Unary {
+            operator: UnaryOp::Not,
+            operand: Box::new(condition),
+        },
+        span,
+    )
+}
+
 fn invoke(receiver: Expr, name: &str, args: Vec<Expr>, span: Span) -> Expr {
     Expr::new(
         ExprKind::Invoke(InvokeExpr {
@@ -5916,6 +6004,7 @@ fn validate_bindings(
                 ExprKind::Unary { operand, .. }
                 | ExprKind::TypedCollection { expression: operand, .. }
         | ExprKind::Grouped(operand)
+                | ExprKind::GeneratorYield { value: operand, .. }
                 | ExprKind::Await(operand)
                 | ExprKind::TypeOf(operand)
                 | ExprKind::Launch(operand)
@@ -6014,6 +6103,23 @@ mod napalm_syntax_tests {
             const shifted = 8 >> 1;
         "#);
         assert_eq!(module.statements.len(), 5);
+    }
+
+    #[test]
+    fn bitwise_assignment_tokens_preserve_generic_type_closings() {
+        // >>= must still close two nested types followed by an initializer.
+        assert_parses("let nested: Array<Array<number>>=[[1]]; nested[0][0] >>= 1;");
+
+        let source = "<Outer<Inner>>= 1";
+        let arena = Bump::new();
+        let mut parser = Parser::new(source, 0, source.len(), &arena);
+        let original: Vec<_> = parser.tokens.iter().map(|t| (t.kind, t.span)).collect();
+        for _ in 0..3 {
+            assert!(!parser.try_call_type_arguments());
+            assert_eq!(parser.pos, 0);
+            assert!(parser.diagnostics.is_empty());
+            assert_eq!(parser.tokens.iter().map(|t| (t.kind, t.span)).collect::<Vec<_>>(), original);
+        }
     }
 
     fn assert_parses(source: &str) -> ModuleAst {
@@ -6301,6 +6407,12 @@ mod napalm_syntax_tests {
             .diagnostics
             .iter()
             .any(|d| d.message.contains("rest parameters are not implemented yet")));
+
+        let optional_default = parse("future-syntax.np", "function f(x?: number = 1) { return x; }");
+        assert!(optional_default
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("cannot be both optional and have a default value")));
     }
 
     #[test]
@@ -6514,8 +6626,15 @@ mod napalm_syntax_tests {
             &method.signature,
             MethodSignatureAst::PrefixOperator { operator: OperatorName::Minus }
         )));
-        assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed$magnitude2")));
-        assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_computed_cache$magnitude2")));
+        for kind in COMPUTED_HIDDEN_FIELDS {
+            let name = computed_hidden_field_name(kind, "magnitude2");
+            assert!(class.fields.iter().any(|field| field.storage.value == name), "{name}");
+        }
+        // The body is the getter itself: no closure, no initializer.
+        assert!(class.methods.iter().any(|method| matches!(
+            &method.signature,
+            MethodSignatureAst::Getter { name } if name.value == "magnitude2"
+        )));
         assert!(class.fields.iter().any(|field| field.storage.value.contains("__reactive_watch$traceMagnitude")));
     }
 

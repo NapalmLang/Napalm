@@ -14,6 +14,36 @@ fn napalm_strings_search_positions_and_overlapping_matches() {
 }
 
 #[test]
+fn napalm_strings_hash_code_matches_java() {
+    // Java: "polygenelubricants".hashCode() == Integer.MIN_VALUE (wraps).
+    run_napalm(r#"
+        let built = 'ab';
+        built = built + 'c';
+        const result = [''.hashCode(), 'abc'.hashCode(), built.hashCode(),
+            'hello'.hashCode(), 'é'.hashCode(), '😀'.hashCode(),
+            'polygenelubricants'.hashCode()];
+    "#, "[0, 96354, 96354, 99162322, 233, 1772899, -2147483648]");
+}
+
+#[test]
+fn napalm_strings_concatenation_shares_buffers_safely() {
+    // Appends into the newest String's buffer must never disturb older views
+    // sharing it, nor branches grown from the same prefix.
+    run_napalm(r#"
+        let s = 'x'.repeat(70);
+        const a = s + 'A';
+        const b = s + 'B';
+        const c = a + 'C';
+        const d = a + 'D';
+        System.gc();
+        let grow = '';
+        const snaps = [];
+        for (let i = 0; i < 40; i++) { grow = grow + i; if (i % 13 == 0) { snaps.add(grow); } }
+        const result = [a.length, b[70], c[71], d[71], s.length, c == s + 'AC', snaps, grow.length];
+    "#, "[71, B, C, D, 70, true, [0, 012345678910111213, 01234567891011121314151617181920212223242526, 0123456789101112131415161718192021222324252627282930313233343536373839], 70]");
+}
+
+#[test]
 fn napalm_strings_subscripts_use_scalar_indices() {
     run_napalm(r#"
         const text: string = 'aé😀';

@@ -34,7 +34,6 @@ pub trait InputStream: Pollable {
     /// read.
     async fn blocking_read(&mut self, size: usize) -> StreamResult<Bytes> {
         if size == 0 {
-            self.ready().await;
             return self.read(size);
         }
 
@@ -280,12 +279,20 @@ impl Pollable for Box<dyn OutputStream> {
     async fn ready(&mut self) {
         (**self).ready().await
     }
+
+    fn type_name(&self) -> &'static str {
+        (**self).type_name()
+    }
 }
 
 #[async_trait::async_trait]
 impl Pollable for Box<dyn InputStream> {
     async fn ready(&mut self) {
         (**self).ready().await
+    }
+
+    fn type_name(&self) -> &'static str {
+        (**self).type_name()
     }
 }
 

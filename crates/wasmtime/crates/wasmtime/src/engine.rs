@@ -408,6 +408,13 @@ impl Engine {
         if !cfg!(has_native_signals) && self.tunables().signals_based_traps {
             return Err("signals-based-traps disabled at compile time -- cannot be enabled".into());
         }
+
+        if self.tunables().mmu_interruption {
+            if !cfg!(has_mmu_interruption_runtime) {
+                return Err("MMU interruption runtime support was disabled at compile time".into());
+            }
+        }
+
         if !cfg!(has_virtual_memory) && self.tunables().memory_init_cow {
             return Err("virtual memory disabled at compile time -- cannot enable CoW".into());
         }
@@ -428,6 +435,12 @@ incompatible with Cranelift and Wasmtime -- use \
 information about this check\
 "
             .into());
+        }
+
+        // Use of asan compatible codegen required in an asan build, optional
+        // otherwise.
+        if cfg!(asan) && !self.tunables().asan_stack_switching {
+            return Err("asan enabled at compile time: asan stack switching required".into());
         }
 
         Ok(())
@@ -524,6 +537,7 @@ information about this check\
             | "probestack_size_log2" // probestack above asserted disabled
             | "regalloc" // shouldn't change semantics
             | "enable_incremental_compilation_cache_checks" // shouldn't change semantics
+            | "separate_constant_pool" // where constants live, not what code does
             | "enable_atomics" => return Ok(()),
 
             // Everything else is unknown and needs to be added somewhere to
@@ -603,6 +617,10 @@ information about this check\
             // is safe to enable it regardless of whether the host supports it
             // or not.
             "use_bti" => return Ok(()),
+            // `CSDB` is encoded in the hint space, so CPUs that don't
+            // implement it run it as a `NOP`, and it is safe to enable
+            // regardless of the host.
+            "use_csdb" => return Ok(()),
 
             // s390x features to detect
             "has_vxrs_ext2" => "vxrs_ext2",

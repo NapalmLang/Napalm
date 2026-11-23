@@ -1,0 +1,125 @@
+// Run: napalm lsp/scripts/lexer_smoke.napalm
+// Tests the standalone lexer, without Rust frontend calls or filesystem access.
+import {tokenize, tokenText} from "../src/lexer";
+
+function expect(condition, message) {
+    if (!condition) throw "lexer smoke: " + message;
+}
+
+function tokenAt(source, kind, spelling, occurrence = 0) {
+    const input = Bytes.fromUtf8(source);
+    const result = tokenize(source);
+    let seen = 0;
+    for (const token of result.tokens) {
+        if (token.kind === kind && tokenText(input, token) === spelling) {
+            if (seen === occurrence) return token;
+            seen++;
+        }
+    }
+    throw "missing " + kind + " token: " + spelling;
+}
+
+function hasDiagnostic(output, code) {
+    for (const diagnostic of output.diagnostics) {
+        if (diagnostic.code === code) return true;
+    }
+    return false;
+}
+
+function assertNoErrors(source) {
+    const output = tokenize(source);
+    expect(output.diagnostics.length === 0, "unexpected error for " + source);
+    expect(output.tokens[output.tokens.length - 1].kind === "eof", "missing EOF token");
+    return output;
+}
+
+// Keywords, identifiers, operators, punctuation, numbers, and shebangs.
+const basics = "#!/usr/bin/env napalm\r\n" +
+    "const sharedObject = 0xAB_CD + 0b10_01 + 0o7_1 + 1_000 + .25 + 1.25e-2;\n" +
+    "concurrent function run() { return sharedObject |> transform; }";
+assertNoErrors(basics);
+expect(tokenAt(basics, "comment.shebang", "#!/usr/bin/env napalm").startByte === 0,
+    "initial shebang");
+expect(tokenAt(basics, "keyword", "const").range.start.line === 1, "keyword position");
+expect(tokenAt(basics, "identifier", "sharedObject").kind === "identifier", "identifier");
+expect(tokenAt(basics, "number", "0xAB_CD").kind === "number", "hex literal");
+expect(tokenAt(basics, "number", "0b10_01").kind === "number", "binary literal");
+expect(tokenAt(basics, "number", "0o7_1").kind === "number", "octal literal");
+expect(tokenAt(basics, "number", "1_000").kind === "number", "decimal separator");
+expect(tokenAt(basics, "number", ".25").kind === "number", "leading decimal point");
+expect(tokenAt(basics, "number", "1.25e-2").kind === "number", "scientific notation");
+expect(tokenAt(basics, "operator", "|>").kind === "operator", "pipeline");
+
+const operations = "a === b !== c >>> 1; value ??= 0; fn?.(x); a **= 3; " +
+    "obj.x++; x => x + 1; @memoize function calc() {}";
+assertNoErrors(operations);
+for (const operator of ["===", "!==", ">>>", "??=", "?.", "**=", "++", "=>"]) {
+    tokenAt(operations, "operator", operator);
+}
+tokenAt(operations, "punctuation", "@");
+
+// Both kinds of comments are retained as trivia; LF/CRLF positions are stable.
+const commented = "a/* block\n comment */b // line\r\nc";
+assertNoErrors(commented);
+expect(tokenAt(commented, "comment.block", "/* block\n comment */").range.end.line === 1,
+    "block-comment multiline range");
+expect(tokenAt(commented, "comment.line", "// line").range.start.line === 1,
+    "line comment range");
+expect(tokenAt(commented, "identifier", "c").range.start.line === 2,
+    "CRLF counted as one line break");
+
+// Valid UTF-8 text is byte-addressed, but LSP columns use UTF-16 code units.
+const unicode = "const message = \"A😀é\";\r\nlet next = 3;";
+assertNoErrors(unicode);
+const literal = tokenAt(unicode, "string", "\"A😀é\"");
+expect(literal.endByte - literal.startByte === 9, "string span counts UTF-8 bytes");
+expect(literal.range.end.character - literal.range.start.character === 6,
+    "string LSP range counts UTF-16 units");
+expect(tokenAt(unicode, "keyword", "let").range.start.line === 1,
+    "Unicode does not corrupt subsequent positions");
+
+// Nested template interpolations produce ordered, non-overlapping tokens.
+const template = "const text = `Hello ${person.name} ${`x=${n}`}`;";
+const expanded = assertNoErrors(template);
+const templateBytes = Bytes.fromUtf8(template);
+let lastEnd = 0;
+let starts = 0;
+let ends = 0;
+for (const token of expanded.tokens) {
+    expect(token.startByte >= lastEnd, "token spans are sorted and non-overlapping");
+    expect(token.endByte >= token.startByte, "nonnegative token span");
+    lastEnd = token.endByte;
+    if (token.kind === "template.expression.start") starts++;
+    if (token.kind === "template.expression.end") ends++;
+}
+expect(starts === 3 && ends === 3, "nested template interpolation delimiters");
+expect(tokenAt(template, "template.text", "Hello ").kind === "template.text",
+    "template text retained");
+expect(tokenAt(template, "identifier", "person").kind === "identifier",
+    "interpolated expression tokenized");
+
+// Recovery after malformed input must leave later tokens available.
+const malformed = tokenize("const a = \"unterminated\nconst b = 42;\n0b102; /* missing");
+expect(hasDiagnostic(malformed, "NAPALM-LEX-001"), "unclosed string diagnostic");
+expect(hasDiagnostic(malformed, "NAPALM-LEX-003"), "invalid numeric diagnostic");
+expect(hasDiagnostic(malformed, "NAPALM-LEX-002"), "unclosed block comment diagnostic");
+expect(tokenAt("const a = \"unterminated\nconst b = 42;", "identifier", "b").range.start.line === 1,
+    "lexing continues after an unclosed string");
+expect(hasDiagnostic(tokenize("const bad = \"\\q\";"), "NAPALM-LEX-004"),
+    "invalid string escape diagnostic");
+expect(hasDiagnostic(tokenize("const bad = `abc"), "NAPALM-LEX-005"),
+    "unclosed template diagnostic");
+expect(hasDiagnostic(tokenize("const bad = `${x`"), "NAPALM-LEX-007"),
+    "unclosed template interpolation diagnostic");
+expect(hasDiagnostic(tokenize("§"), "NAPALM-LEX-008"),
+    "unexpected Unicode source character diagnostic");
+
+const empty = assertNoErrors("");
+expect(empty.tokens.length === 1 && empty.tokens[0].startByte === 0,
+    "empty source contains only EOF");
+const bom = "\u{feff}const ok = 1;";
+assertNoErrors(bom);
+expect(tokenAt(bom, "keyword", "const").range.start.character === 0,
+    "UTF-8 BOM is invisible in LSP position space");
+
+System.print("Napalm lexer smoke tests passed");

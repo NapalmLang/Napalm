@@ -6,6 +6,7 @@ use crate::isa::riscv64::settings as riscv_settings;
 use crate::isa::{
     Builder as IsaBuilder, FunctionAlignment, IsaFlagsHashKey, OwnedTargetIsa, TargetIsa,
 };
+use crate::loop_analysis::LoopAnalysis;
 use crate::machinst::CompiledCode;
 use crate::machinst::{
     CompiledCodeStencil, MachInst, MachTextSectionBuilder, Reg, SigSet, TextSectionBuilder, VCode,
@@ -68,6 +69,7 @@ impl Riscv64Backend {
         &self,
         func: &Function,
         domtree: &DominatorTree,
+        loop_analysis: &LoopAnalysis,
         regalloc_ctx: &mut regalloc2::Ctx,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<VCode<inst::Inst>> {
@@ -77,6 +79,7 @@ impl Riscv64Backend {
         compile::compile::<Riscv64Backend>(
             func,
             domtree,
+            loop_analysis,
             regalloc_ctx,
             self,
             abi,
@@ -92,11 +95,12 @@ impl TargetIsa for Riscv64Backend {
         &self,
         func: &Function,
         domtree: &DominatorTree,
+        loop_analysis: &LoopAnalysis,
         regalloc_ctx: &mut regalloc2::Ctx,
         want_disasm: bool,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<CompiledCodeStencil> {
-        let vcode = self.compile_vcode(func, domtree, regalloc_ctx, ctrl_plane)?;
+        let vcode = self.compile_vcode(func, domtree, loop_analysis, regalloc_ctx, ctrl_plane)?;
 
         let want_disasm = want_disasm || log::log_enabled!(log::Level::Debug);
         let emit_result = vcode.emit(&regalloc_ctx.output, want_disasm, &self.flags, ctrl_plane)?;
@@ -294,6 +298,7 @@ fn isa_constructor(
     shared_flags: Flags,
     builder: &shared_settings::Builder,
 ) -> CodegenResult<OwnedTargetIsa> {
+    super::check_no_separate_constant_pool(&shared_flags, "riscv64")?;
     let isa_flags = riscv_settings::Flags::new(&shared_flags, builder);
 
     // The RISC-V backend does not work without at least the G extension enabled.

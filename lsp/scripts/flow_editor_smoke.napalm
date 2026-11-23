@@ -1,0 +1,35 @@
+// Execute from the repository root with: napalm lsp/scripts/flow_editor_smoke.napalm
+import {buildModuleIndex, updateModuleIndex} from "../src/module_index";
+import {inferSymbolAt, hoverAt, completionAt, signatureHelpAt} from "../src/intelligence";
+import {semanticTokensAt, renameAt, prepareRenameAt} from "../src/editor_features";
+
+function require(condition, message) {
+    if (!condition) throw "LSP milestone 7: " + message;
+}
+
+const source = "let value: string | null = null;\n" +
+    "if (value !== null) {\n  const selected = value;\n}\n" +
+    "function greet(name: string, age: number): string { return name; }\n" +
+    "const result = greet(\"Ada\", 42);\n";
+const uri = Uri.fromFilePath(Path.resolve("lsp/scripts/m7_virtual.napalm"));
+const documents = new Map();
+documents.set(uri, {uri: uri, text: source, version: 1});
+const index = buildModuleIndex(documents, [Process.cwd()]);
+
+require(inferSymbolAt(index, uri, {line: 2, character: 19}) === "String", "flow narrowing");
+require(inferSymbolAt(index, uri, {line: 4, character: 9}).contains("String"), "function hover type");
+const help = signatureHelpAt(index, uri, {line: 5, character: 29});
+require(help !== null && help.signatures.length === 1, "signature help");
+require(help.activeParameter === 1, "active argument");
+const tokens = semanticTokensAt(index, uri, null);
+require(tokens.data.length > 5 && tokens.data.length % 5 === 0, "semantic token encoding");
+const preparation = prepareRenameAt(index, uri, {line: 4, character: 9});
+require(preparation !== null && preparation.placeholder === "greet", "prepare rename");
+const edit = renameAt(index, uri, {line: 4, character: 9}, "welcome");
+require(edit !== null && edit.changes.get(uri).length >= 2, "symbol rename");
+require(renameAt(index, uri, {line: 4, character: 9}, "if") === null, "keyword rename rejected");
+const next = updateModuleIndex(index, documents, [Process.cwd()], []);
+require(next.stats.parsed === 0 && next.stats.reused === 1, "cache reused");
+require(hoverAt(next, uri, {line: 4, character: 9}) !== null, "hover from reused analysis");
+require(completionAt(next, uri, {line: 5, character: 6}).items.length > 0, "completion preserved");
+System.print("Napalm LSP milestone 7 smoke tests passed");

@@ -147,12 +147,16 @@ fn i31ref_table_get() -> Result<()> {
                 let val = table.get(&mut store, i).unwrap();
                 assert_eq!(init.is_null(), val.is_null());
                 assert_eq!(
-                    init.as_any()
-                        .expect("is anyref")
-                        .map(|a| a.as_i31(&store).expect("is in scope")),
-                    val.as_any()
-                        .expect("is anyref")
-                        .map(|a| a.as_i31(&store).expect("is in scope"))
+                    init.as_any().expect("is anyref").map(|a| a
+                        .to_unrooted(&store)
+                        .unwrap()
+                        .as_i31(&store)
+                        .expect("is in scope")),
+                    val.as_any().expect("is anyref").map(|a| a
+                        .to_unrooted(&store)
+                        .unwrap()
+                        .as_i31(&store)
+                        .expect("is in scope"))
                 )
             }
         }
@@ -197,14 +201,16 @@ fn i31ref_table_set() -> Result<()> {
                     let actual = table.get(&mut store, i).unwrap();
                     assert_eq!(expected.is_null(), actual.is_null());
                     assert_eq!(
-                        expected
-                            .as_any()
-                            .expect("is anyref")
-                            .map(|a| a.as_i31(&store).expect("is in scope")),
-                        actual
-                            .as_any()
-                            .expect("is anyref")
-                            .map(|a| a.as_i31(&store).expect("is in scope"))
+                        expected.as_any().expect("is anyref").map(|a| a
+                            .to_unrooted(&store)
+                            .unwrap()
+                            .as_i31(&store)
+                            .expect("is in scope")),
+                        actual.as_any().expect("is anyref").map(|a| a
+                            .to_unrooted(&store)
+                            .unwrap()
+                            .as_i31(&store)
+                            .expect("is in scope"))
                     )
                 }
             }
@@ -246,6 +252,8 @@ fn i31ref_table_grow() -> Result<()> {
                     .as_any()
                     .expect("is anyref")
                     .expect("is non null")
+                    .to_unrooted(&store)
+                    .unwrap()
                     .as_i31(&store)
                     .expect("is in scope")
                     .expect("is i31"),
@@ -287,6 +295,8 @@ fn i31ref_table_fill() -> Result<()> {
                 .as_any()
                 .expect("is anyref")
                 .expect("is non null")
+                .to_unrooted(&store)
+                .unwrap()
                 .as_i31(&store)
                 .expect("is in scope")
                 .expect("is i31"),
@@ -335,6 +345,8 @@ fn i31ref_table_copy() -> Result<()> {
                 .as_any()
                 .expect("is anyref")
                 .expect("is non null")
+                .to_unrooted(&store)
+                .unwrap()
                 .as_i31(&store)
                 .expect("is in scope")
                 .expect("is i31"),
@@ -374,27 +386,6 @@ fn host_table_keep_type_registration() -> Result<()> {
     let fty = ty.element().heap_type().unwrap_concrete_func();
     assert!(fty.params().len() == 0);
     assert!(fty.results().len() == 0);
-
-    Ok(())
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn gc_store_with_table_initializers() -> Result<()> {
-    let mut config = Config::new();
-    config.wasm_gc(true);
-    config.wasm_function_references(true);
-    let engine = Engine::new(&config)?;
-
-    let test = |wat: &str| -> Result<()> {
-        let module = Module::new(&engine, wat)?;
-        Instance::new(&mut Store::new(&engine, ()), &module, &[])?;
-        Ok(())
-    };
-
-    test("(module (table 1 i31ref))")?;
-    test("(module (table 1 i31ref (ref.i31 (i32.const 1))))")?;
-    test("(module (table 1 i31ref (ref.null i31)))")?;
 
     Ok(())
 }

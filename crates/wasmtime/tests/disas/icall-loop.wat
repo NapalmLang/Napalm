@@ -24,16 +24,17 @@
 
 ;; function u0:0(i64 vmctx, i64, i32) tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 93 ""
 ;;     region3 = 117 ""
 ;;     region4 = 130 ""
 ;;     region5 = 134 ""
-;;     region6 = 120 ""
-;;     region7 = 100 ""
+;;     region6 = 160 ""
+;;     region7 = 120 ""
+;;     region8 = 100 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     sig0 = (i64 vmctx, i64) -> i32 tail
 ;;     sig1 = (i64 vmctx, i32, i64) -> i64 tail
 ;;     fn0 = colocated u805306368:6 sig1
@@ -50,44 +51,44 @@
 ;; @002b                               v10 = iadd v7, v9
 ;; @002b                               v12 = select_spectre_guard v5, v11, v10  ; v11 = 0
 ;; @002b                               v14 = iconst.i64 -2
-;; @002b                               v17 = iconst.i32 0
 ;; @002b                               v20 = load.i64 notrap aligned readonly can_move region4 v0+40
 ;; @002b                               v21 = load.i32 notrap aligned readonly can_move region5 v20
 ;; @0027                               jump block2
 ;;
 ;;                                 block2:
 ;; @002b                               v13 = load.i64 user6 aligned region3 v12
-;;                                     v29 = iconst.i64 -2
-;;                                     v30 = band v13, v29  ; v29 = -2
+;; @002b                               v29 = iconst.i64 -2
+;; @002b                               v30 = band v13, v29  ; v29 = -2
 ;; @002b                               brif v13, block5(v30), block4
 ;;
 ;;                                 block4 cold:
-;;                                     v31 = iconst.i32 0
-;; @002b                               v19 = call fn0(v0, v31, v6)  ; v31 = 0
+;; @002b                               v17 = iconst.i32 0
+;; @002b                               v19 = call fn0(v0, v17, v6)  ; v17 = 0
 ;; @002b                               jump block5(v19)
 ;;
 ;;                                 block5(v16: i64):
-;; @002b                               v22 = load.i32 user7 aligned readonly region1 v16+16
+;; @002b                               v22 = load.i32 user7 aligned readonly region6 v16+16
 ;; @002b                               v23 = icmp eq v22, v21
 ;; @002b                               trapz v23, user8
-;; @002b                               v25 = load.i64 notrap aligned readonly region6 v16+8
-;; @002b                               v26 = load.i64 notrap aligned readonly region7 v16+24
+;; @002b                               v25 = load.i64 notrap aligned readonly region7 v16+8
+;; @002b                               v26 = load.i64 notrap aligned readonly region8 v16+24
 ;; @002b                               v27 = call_indirect sig0, v25(v26, v0)
 ;; @002e                               jump block2
 ;; }
 ;;
 ;; function u0:1(i64 vmctx, i64) tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 93 ""
 ;;     region3 = 117 ""
 ;;     region4 = 130 ""
 ;;     region5 = 134 ""
-;;     region6 = 120 ""
-;;     region7 = 100 ""
+;;     region6 = 160 ""
+;;     region7 = 120 ""
+;;     region8 = 100 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     sig0 = (i64 vmctx, i64) -> i32 tail
 ;;     sig1 = (i64 vmctx, i32, i64) -> i64 tail
 ;;     fn0 = colocated u805306368:6 sig1
@@ -98,31 +99,29 @@
 ;;                                     v34 = iconst.i64 8
 ;; @0038                               v9 = iadd v6, v34  ; v34 = 8
 ;; @0038                               v13 = iconst.i64 -2
-;; @0038                               v16 = iconst.i32 0
-;;                                     v33 = iconst.i64 1
 ;; @0038                               v19 = load.i64 notrap aligned readonly can_move region4 v0+40
 ;; @0038                               v20 = load.i32 notrap aligned readonly can_move region5 v19
 ;; @0034                               jump block2
 ;;
 ;;                                 block2:
-;;                                     v35 = iadd.i64 v6, v34  ; v34 = 8
+;; @0038                               v35 = iadd.i64 v6, v34  ; v34 = 8
 ;; @0038                               v12 = load.i64 user6 aligned region3 v35
-;;                                     v36 = iconst.i64 -2
-;;                                     v37 = band v12, v36  ; v36 = -2
+;; @0038                               v36 = iconst.i64 -2
+;; @0038                               v37 = band v12, v36  ; v36 = -2
 ;; @0038                               brif v12, block5(v37), block4
 ;;
 ;;                                 block4 cold:
-;;                                     v38 = iconst.i32 0
-;;                                     v39 = iconst.i64 1
-;; @0038                               v18 = call fn0(v0, v38, v39)  ; v38 = 0, v39 = 1
+;; @0038                               v16 = iconst.i32 0
+;;                                     v33 = iconst.i64 1
+;; @0038                               v18 = call fn0(v0, v16, v33)  ; v16 = 0, v33 = 1
 ;; @0038                               jump block5(v18)
 ;;
 ;;                                 block5(v15: i64):
-;; @0038                               v21 = load.i32 user7 aligned readonly region1 v15+16
+;; @0038                               v21 = load.i32 user7 aligned readonly region6 v15+16
 ;; @0038                               v22 = icmp eq v21, v20
 ;; @0038                               trapz v22, user8
-;; @0038                               v24 = load.i64 notrap aligned readonly region6 v15+8
-;; @0038                               v25 = load.i64 notrap aligned readonly region7 v15+24
+;; @0038                               v24 = load.i64 notrap aligned readonly region7 v15+8
+;; @0038                               v25 = load.i64 notrap aligned readonly region8 v15+24
 ;; @0038                               v26 = call_indirect sig0, v24(v25, v0)
 ;; @003b                               jump block2
 ;; }

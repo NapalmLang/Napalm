@@ -1,5 +1,127 @@
 // Production frontend -> HIR -> optimizer -> bytecode -> interpreter/JIT.
 #[test]
+fn napalm_bitwise_assignments_values_precedence_and_captures() {
+    run_napalm(r#"
+        let bits = 0;
+        const values = [bits |= 5, bits &= 3, bits ^= 2, bits <<= 2, bits >>= 1];
+        let left = 1;
+        let right = 2;
+        const chained = (left |= right <<= 1 + 1);
+        let shifted = 3;
+        shifted <<= 1 + 1;
+        shifted >>= 1;
+        let mixed = 1;
+        mixed |= 2 & 6;
+        let negative = -1;
+        negative >>= 1;
+        let wrapped = 1;
+        wrapped <<= 33;
+        let fractional = 7.9;
+        fractional &= 3;
+        function captured() { bits ^= 3; return bits; }
+        const capturedValue = captured();
+        const result = [values, bits, chained, left, right, shifted, mixed,
+                        negative, wrapped, fractional, capturedValue];
+    "#, "[[5, 1, 3, 12, 6], 5, 9, 9, 8, 6, 3, 2147483647, 2, 3, 5]");
+}
+
+#[test]
+fn napalm_bitwise_assignments_evaluate_destinations_once_in_order() {
+    run_napalm(r#"
+        let log = '';
+        class Box {
+            value = 5;
+            get bits() { log += 'g'; return this.value; }
+            set bits(value) { log += 's'; this.value = value; }
+        }
+        const box = new Box();
+        function receiver() { log += 'r'; return box; }
+        function rhs(value) { log += 'v'; return value; }
+        const values = [receiver().bits |= rhs(2), receiver().bits &= rhs(6),
+                        receiver().bits ^= rhs(3), receiver().bits <<= rhs(1),
+                        receiver().bits >>= rhs(1)];
+        const items = [5];
+        function list() { log += 'l'; return items; }
+        function key() { log += 'k'; return 0; }
+        list()[key()] |= rhs(2);
+        list()[key()] &= rhs(6);
+        list()[key()] ^= rhs(3);
+        list()[key()] <<= rhs(1);
+        list()[key()] >>= rhs(1);
+        const object = {bits: 1};
+        object.bits |= 2;
+        object['bits'] <<= 1;
+        let current = 1;
+        function change() { current = 8; return 2; }
+        current |= change();
+        const result = [values, box.value, items[0], object.bits, current, log];
+    "#, "[[7, 6, 5, 10, 5], 5, 5, 6, 3, rgvsrgvsrgvsrgvsrgvslkvlkvlkvlkvlkv]");
+}
+
+#[test]
+fn napalm_bitwise_assignments_in_native_loops() {
+    run_napalm_checked(r#"
+        let bits = 0;
+        for (let i = 0; i < 100; i++) {
+            bits |= 5;
+            bits &= 7;
+            bits ^= 2;
+            bits <<= 1;
+            bits >>= 1;
+        }
+        const result = bits;
+    "#, "5", true);
+}
+
+#[test]
+fn napalm_bitwise_assignments_reject_invalid_destinations() {
+    for op in ["|=", "&=", "^=", "<<=", ">>="] {
+        for (source, message) in [
+            (format!("const bits = 1; bits {op} 2;"), "immutable binding"),
+            (format!("const bits = 1; function change() {{ bits {op} 2; }}"), "immutable binding"),
+            (format!("(1 + 2) {op} 3;"), "invalid assignment target"),
+            (format!("let bits = 1; [bits] {op} 2;"), "invalid assignment target"),
+        ] {
+            let parsed = crate::napalm_front_main::parse("test.napalm", &source);
+            assert!(parsed.has_errors(), "accepted {source}");
+            assert!(parsed.diagnostics.iter().any(|d| d.message.contains(message)),
+                "{source}: {:?}", parsed.diagnostics);
+        }
+    }
+}
+
+#[test]
+fn napalm_uncaught_throw_displays_value_and_source_location() {
+    for (source, expected) in [
+        (r#"function expect(ok, message) { if (!ok) throw message; }
+            expect(false, "script argument count");"#, "script argument count"),
+        ("throw 42;", "42"),
+        (r#"Fiber.abort("explicit abort");"#, "explicit abort"),
+        (r#"Fiber.new(() => { throw "child error"; }).call();"#, "child error"),
+    ] {
+        let (program, entry, manifest) = compile_typescript_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            let error = vm.run_module(entry).unwrap_err();
+            assert_eq!(error.message, format!("fiber aborted: {expected}"), "jit={jit}");
+            assert_eq!(error.source_file.as_deref(), Some("typed_runtime_test.napalm"));
+            assert!(error.source_line.is_some() && error.source_column.is_some());
+        }
+    }
+}
+
+#[test]
+fn napalm_uncaught_throw_in_transferred_fiber_displays_value() {
+    let (program, entry, manifest) = compile_typescript_module(
+        r#"Fiber.new(() => { throw "detached error"; }).transfer();"#,
+    );
+    let mut vm = source_vm(&program, &manifest);
+    let error = vm.run_module(entry).unwrap_err();
+    assert_eq!(error.message, "unhandled fiber error: detached error");
+}
+
+#[test]
 fn napalm_destructuring_assignments_parameters_and_captures() {
     run_napalm(r#"
         function swap(pair) { let [a, b] = pair; [a, b] = [b, a]; return [a, b]; }
@@ -18,6 +140,107 @@ fn napalm_destructuring_assignments_parameters_and_captures() {
         for (const [left, {right = 2}] of [[1, {}], [3, {right: 4}]]) sum += left + right;
         const result = [swap([1, 2]), arrow({x: [4, 5, 6]}, []), new Box({value: 1}).add([2, 3]), a, rest, object.value, x, returned, sum];
     "#, "[[2, 1], [4, [5, 6], 3], 6, 7, [8, 9], 11, 12, [11, 12], 10]");
+}
+
+#[test]
+fn napalm_default_parameters_in_functions_and_closures() {
+    run_napalm(r#"
+        function peek(distance = 0) { return distance; }
+        function greet(name: string = "world", punct: string = "!") { return name + punct; }
+        // Defaults run on every call, left to right, and may read earlier parameters.
+        function chain(a: number, b: number = a * 2, c = a + b) { return [a, b, c]; }
+        let calls = 0;
+        function counted(x = ++calls) { return x; }
+        counted(); counted(); counted(10);
+        // An explicit null also selects the default (omitted arguments are null).
+        function explicit(x: string = "d") { return x; }
+        // The parameter is an ordinary mutable binding.
+        function bump(x = 1) { x = x + 1; return x; }
+        const arrow = (x = 4) => x * x;
+        const block = (x: number = 2) => { return x + 1; };
+        const anonymous = function (x = "f") { return x; };
+        function* gen(limit = 3) { for (let i = 0; i < limit; i++) yield i; }
+        const generated = [];
+        for (const value of gen()) generated.push(value);
+        interface Pair { a: number; b: number; }
+        function product({ a, b }: Pair = { a: 3, b: 4 }) { return a * b; }
+        function sum({ a, b } = { a: 1, b: 2 }) { return a + b; }
+        const result = [
+            peek(), peek(3), greet(), greet("ana"), greet("bob", "?"),
+            chain(1), chain(1, 5), chain(1, 5, 0), calls, explicit(null),
+            bump(), bump(5), arrow(), arrow(3), block(), anonymous(), generated,
+            product(), product({ a: 2, b: 5 }), sum(), sum({ a: 10, b: 20 }),
+        ];
+    "#, "[0, 3, world!, ana!, bob?, [1, 2, 3], [1, 5, 6], [1, 5, 0], 2, d, 2, 6, 16, 9, 3, f, [0, 1, 2], 12, 10, 3, 30]");
+}
+
+#[test]
+fn napalm_default_parameters_in_methods_and_constructors() {
+    run_napalm(r#"
+        class Lexer {
+            constructor(public source: string = "", public pos: number = 0) {}
+            peek(distance = 0) { return this.pos + distance; }
+            static make(n: number = 5) { return n * 2; }
+        }
+        class A { peek(d = 0) { return d; } }
+        // `super.peek()` reaches A's own implementation, not this override.
+        class B extends A { peek(d = 10) { return super.peek() + d; } }
+        class P { constructor(public x: number, public y: number = x + 1) {} }
+        class Q extends P { tag = "q"; constructor(x = 3) { super(x); } }
+        class R extends P {}
+        // An explicitly declared shorter arity wins over the default adapter.
+        class S { m(a = 1) { return "full " + a; } m() { return "explicit"; } }
+        const lexer = new Lexer();
+        const q = new Q();
+        const b = new B();
+        const result = [
+            lexer.source === "", lexer.pos, lexer.peek(), lexer.peek(2), new Lexer("x", 5).pos,
+            Lexer.make(), Lexer.make(1), b.peek(), b.peek(1),
+            q.x, q.y, q.tag, new P(1).y, new P(1, 9).y, new R(4).y,
+            new S().m(), new S().m(2),
+        ];
+    "#, "[true, 0, 0, 2, 5, 10, 2, 10, 1, 3, 4, q, 2, 9, 5, explicit, full 2]");
+}
+
+#[test]
+fn napalm_unless_and_until_negate_if_and_while() {
+    run_napalm(r#"
+        const events = [];
+        function classify(n) {
+            unless (n > 0) return "non-positive";
+            unless (n % 2 == 0) {
+                return "odd";
+            } else unless (n > 10) {
+                return "small even";
+            } else {
+                return "big even";
+            }
+        }
+        let n = 0;
+        until (n >= 3) n++;
+        let countdown = 3;
+        until (countdown == 0) {
+            events.add(countdown);
+            countdown--;
+        }
+        let once = 0;
+        do { once++; } until (true);
+        let loops = 0;
+        do {
+            loops++;
+        }
+        until (loops >= 4)
+        unless (null) events.add("falsy");
+        const result = [classify(-1), classify(3), classify(4), classify(12), n, events, once, loops];
+    "#, "[non-positive, odd, small even, big even, 3, [3, 2, 1, falsy], 1, 4]");
+}
+
+#[test]
+fn napalm_unless_and_until_require_parenthesized_conditions() {
+    for source in ["unless x { }", "until x { }", "do { } until x;", "do { } until"] {
+        let parsed = crate::napalm_front_main::parse("bad.nap", source);
+        assert!(parsed.has_errors(), "accepted invalid syntax: {source}");
+    }
 }
 
 #[test]
@@ -207,18 +430,20 @@ fn native_decorators_validate_durations_options_and_targets() {
 
 #[test]
 fn native_decorators_debounce_throttle_edges_and_async_adoption() {
+    // Bursts must fit inside each window even on a loaded machine (timers may
+    // fire late, never early), so windows are 100 ms and waits 250 ms.
     run_napalm(r#"
         let calls = 0;
-        @debounce(15, {leading: true, trailing: true})
+        @debounce(100, {leading: true, trailing: true})
         function single(value) { calls++; return value; }
         const first = single(1);
         await first;
-        await Timer.delay(50);
+        await Timer.delay(250);
         const singleCalls = calls;
         const next = [single(2), single(3), single(4)];
         const both = await Promise.all(next);
-        await Timer.delay(50);
-        @throttle(15, {leading: false})
+        await Timer.delay(250);
+        @throttle(100, {leading: false})
         async function trailing(value) {
             await Timer.delay(1);
             return value * 2;
@@ -235,15 +460,18 @@ fn native_decorators_debounce_throttle_edges_and_async_adoption() {
 
 #[test]
 fn native_decorators_expiry_is_per_key_and_does_not_refresh_on_hit() {
+    // Timers may fire late (loaded machine, parallel tests) but never early.
+    // Each wait (250 ms) stays far below the expiry (400 ms) while both together
+    // (>= 500 ms) always exceed it: up to 150 ms of lateness per wait is safe.
     run_napalm(r#"
         let calls = 0;
-        @memoizeExpiring(200)
+        @memoizeExpiring(400)
         function value(key) { calls++; return calls; }
         const first = value("a");
-        await Timer.delay(100);
+        await Timer.delay(250);
         const second = value("a");
         const other = value("b");
-        await Timer.delay(130);
+        await Timer.delay(250);
         const expired = value("a");
         const stillLive = value("b");
         const result = [first, second, other, expired, stillLive, calls];
@@ -550,11 +778,45 @@ fn napalm_destructuring_and_spread_report_catchable_errors() {
     "#, "5");
 }
 
+#[test]
+fn napalm_aot_passes_preserve_semantics() {
+    // Inlined throws inside try/catch, folded recursion, -0.0 and NaN, branchy
+    // helpers in loops and a contract check fed by a constant.
+    run_napalm(r#"
+        function clamp(x: number, lo: number, hi: number): number {
+            if (x < lo) { return lo; }
+            if (x > hi) { return hi; }
+            return x;
+        }
+        function fact(n: number): number { if (n <= 1) { return 1; } return n * fact(n - 1); }
+        function sum(n: number, acc: number): number { if (n == 0) { return acc; } return sum(n - 1, acc + n); }
+        function risky(x: number): number { if (x > 5) { throw "big"; } return x * 2; }
+        function inverse(x: number): number { return 1 / x; }
+        function isNan(x: number): number { if (x != x) { return 1; } return 2; }
+        let counter = 0;
+        function bump(): number { counter = counter + 1; return counter; }
+        let total = 0;
+        for (let i = 0; i < 10; i++) { total = total + clamp(i, 2, 7); }
+        let caught = 0;
+        for (let i = 3; i < 8; i++) { try { total = total + risky(i); } catch (e) { caught++; } }
+        const twice = bump() + bump();
+        const result = [total, fact(10), sum(100, 0), caught, inverse(-0.0) < 0, isNan(0 / 0), isNan(1), twice, counter];
+    "#, "[69, 3628800, 5050, 2, true, 1, 2, 3, 2]");
+}
+
 fn run_napalm(source: &str, expected: &str) {
     run_napalm_checked(source, expected, false);
 }
 
+/// Every program also runs through the `--build` pipeline (AOT HIR passes to a
+/// fixed point) and must produce the same result as normal compilation.
 fn run_napalm_checked(source: &str, expected: &str, require_native: bool) {
+    for build in [false, true] {
+        run_napalm_pipeline(source, expected, require_native && !build, build);
+    }
+}
+
+fn run_napalm_pipeline(source: &str, expected: &str, require_native: bool, build: bool) {
     let parsed = crate::napalm_front_main::parse("test.nap", source);
     assert!(!parsed.has_errors(), "{:#?}", parsed.diagnostics);
     let mut hir = Program::new();
@@ -562,7 +824,11 @@ fn run_napalm_checked(source: &str, expected: &str, require_native: bool) {
     let output = lower_module(&mut hir, "test.nap", source, "test", &parsed.module);
     assert!(!output.has_errors(), "{:#?}", output.diagnostics);
     let entry = output.lowered.unwrap().entry;
-    let program = compile_program(&mut hir).unwrap();
+    let program = if build {
+        crate::napalm_build_pipeline::compile_program(&mut hir).unwrap()
+    } else {
+        compile_program(&mut hir).unwrap()
+    };
     for enabled in [false, true] {
         let mut vm = source_vm(&program, &manifest);
         vm.set_jit_options(enabled.then(|| TracingJitOptions {
@@ -591,7 +857,7 @@ fn run_napalm_checked(source: &str, expected: &str, require_native: bool) {
         assert_eq!(
             context.format_value(value),
             expected,
-            "jit={enabled}, {result:?}"
+            "build={build}, jit={enabled}, {result:?}"
         );
     }
 }

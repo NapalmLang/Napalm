@@ -13,9 +13,9 @@ Napalm's performance does not come from a single optimization. The engine is des
 
 These are mostly compile-time engineering choices, but they keep runtime metadata compact and predictable.
 
-## 2. Wren IR: SSA for a dynamic language
+## 2. Napalm IR: SSA for a dynamic language
 
-The high-level/mid-level IR (WIR) is SSA-based and keeps Wren semantics explicit long enough for safe specialization.
+The high-level/mid-level IR (WIR) is SSA-based and keeps Napalm semantics explicit long enough for safe specialization.
 
 Key properties:
 
@@ -26,7 +26,7 @@ Key properties:
 - fixed instance-field slots;
 - explicit cells for captured mutable variables;
 - immutable captures passed directly by value;
-- internal `Int32`, `F64`, and raw-pointer representations that are not exposed as Wren source types;
+- internal `Int32`, `F64`, and raw-pointer representations that are not exposed as Napalm source types;
 - explicit guards, OSR/resume metadata, and deoptimization snapshots;
 - structured exception regions represented as metadata, not normal-path control opcodes.
 
@@ -139,7 +139,7 @@ around them and preserving exceptions and the native loop watchdog.
 - **2 return-transfer registers**;
 - a small special-register bank for `this`, closure, module, Fiber, error/resume values and scratch state.
 
-General registers are raw 64-bit slots and can contain either NaN-boxed Wren values or internal unboxed representations.
+General registers are raw 64-bit slots and can contain either NaN-boxed Napalm values or internal unboxed representations.
 
 ### Encoding
 
@@ -228,7 +228,7 @@ Repeated generic numeric invokes can be rewritten to direct numeric handlers for
 - shifts;
 - unary numeric operations.
 
-This removes repeated generic Wren method lookup on stable numeric sites.
+This removes repeated generic Napalm method lookup on stable numeric sites.
 
 ### Method dispatch caches
 
@@ -245,7 +245,7 @@ Dense `MethodSymbol`-indexed class method tables avoid hashing on cache misses.
 
 String-key Maps can use a shape/slot representation and their own four-entry PIC. A hit can resolve shape + slot without rehashing the key. Maps can fall back to the general dictionary representation when shape assumptions no longer fit.
 
-This makes repeated object-like Map access substantially cheaper while preserving Wren Map semantics.
+This makes repeated object-like Map access substantially cheaper while preserving Napalm Map semantics.
 
 ## 6. Precise moving StickyImmix GC
 
@@ -255,7 +255,7 @@ Important design choices:
 
 - per-PC reference maps identify exactly which VM registers contain managed references;
 - VM roots, Fiber state, globals, async state and event-loop payloads participate in root discovery;
-- a stable handle table lets a compact NaN-boxed `Value` survive object movement without rewriting every Wren value;
+- a stable handle table lets a compact NaN-boxed `Value` survive object movement without rewriting every Napalm value;
 - moving object addresses are reloaded after safepoints;
 - object descriptors precisely trace Lists, Maps, Cells, closures, instances, Fibers/async state and other managed object layouts;
 - object-remembering write barriers support generational collection;
@@ -292,7 +292,7 @@ The JIT is deliberately split into four layers:
 
 A compiled trace receives one compact activation structure containing pointers to architectural register banks and side-exit storage.
 
-Loop values such as induction variables and accumulators can remain in native registers for the entire native loop. Wren architectural registers do **not** need to be written back on every iteration.
+Loop values such as induction variables and accumulators can remain in native registers for the entire native loop. Napalm architectural registers do **not** need to be written back on every iteration.
 
 ### Sparse side exits
 
@@ -314,9 +314,119 @@ before eligible recursive functions switch to whole-function native code.
 Rejected functions and functions awaiting sufficient runtime profiles retain
 their normal tracing entry and loop paths.
 
+### Whole-function tier v2: typed SSA
+
+The typed-SSA generation of the whole-function tier is tried first; v1 remains
+the fallback (and the non-speculative tier after repeated deopts).
+`NAPALM_WFJIT_V2=0` disables v2. `NAPALM_JIT_EVENTS=1` reports, for each
+function, whether v2 compiled it (with a summary: return type, parameter types,
+native self-calls, helpers, allocations, back edges, inlined calls) or why it
+declined.
+
+- **Background compilation.** When a function becomes hot, its IR is built
+  on the VM thread, the only phase that reads live profiles and quickening
+  state. Everything code generation needs is captured with it: frame layout,
+  GC maps and allocation sites. Lowering and Cranelift then run on a worker
+  thread (`napalm-wfjit`) with a `JITModule` of its own. Meanwhile the
+  function keeps running in the interpreter or the tracer, and the entry is
+  installed at the next call that finds the result ready. A code generation
+  failure falls back to v1 on the next tier-up. `NAPALM_WFJIT_SYNC=1` (and
+  unit tests) wait for each compilation, for deterministic tiering. The
+  synchronous v1 generator is unchanged.
+- **IR** (`src/napalm_wfjit_ir.rs`). A backend-neutral IR with blocks, typed block
+  parameters (`Tagged`, `F64`, `Bool`), one value per instruction and explicit
+  deoptimization states. Basic blocks are translated in reverse postorder, with
+  backward liveness iterated to a fixpoint. Cranelift lowers it in
+  `src/napalm_wfjit_lower.rs`; the IR is designed so that an LLVM lowering can
+  consume it as well.
+- **No register bank.** Napalm GPRs are SSA values. Numbers stay unboxed `f64`,
+  `true`/`false` stay unboxed Booleans. NaN is canonicalized only when a value
+  becomes a tagged word again.
+- **When registers reach memory.** The live GPRs are stored only when the
+  interpreter or the GC can observe them: a deoptimization, a host helper call
+  (`RuntimeOp`, top frame only), an allocation, or a native self-call of an
+  allocating recursion.
+- **Coverage.** Natively: moves, constants, module loads, branches, loops,
+  numeric quickening, identity, Map PICs, class fields, small literals and typed
+  arrays (inline TLAB path), self-calls, inlining. Calls run through helpers that
+  let the callee tier up: `CallDirect` (direct call), profiled monomorphic
+  `Invoke` and resolved `InvokeMethodDirect` (receiver class guarded natively),
+  and everything else (polymorphic `Invoke`, `InvokeSuper`, `CallClosure`,
+  `CallPrimitive`, `new`) through the interpreter's generic call path, run to
+  completion. Any other op v1 accepts, plus `throw`, executes through its own
+  handler; its operands are not modelled, so it reads every GPR and every GPR
+  live afterwards is reloaded from the bank.
+- **Deoptimization.** A failed guard (type, shape, class, epoch) materializes the
+  live GPRs into the interpreter-owned top frame and resumes at the guarded op.
+  Nested native frames unwind and the top frame replays its outermost self-call,
+  so native recursion needs a replay-safe body (no stores, no host helpers;
+  allocation is fine). Otherwise calls to itself go through the direct-call
+  helper, which gives every level a real interpreter frame.
+- **Native self-call ABI.** The body uses Cranelift's `tail` convention,
+  `(vm, frame, depth, args...[, this])`; methods recurse through a static
+  `CallDirect` or a dispatched call guarded on the receiver class. A parameter
+  becomes an unboxed `F64` when every self-call passes a Number. When every
+  return is a Number (or a Boolean) the body returns raw `f64` bits (or 0/1) and
+  self-call results stay unboxed. The host-ABI entry trampoline checks the method
+  epoch, unboxes the specialized parameters (with guards) and boxes the result.
+- **Allocating recursion.** With allocation in a natively recursive body, nested
+  frames get a register bank on the native stack, linked as a GC shadow frame;
+  before each self-call a frame publishes its live registers and root map.
+- **Loops.** Loop headers carry every live GPR as a block parameter, typed as on
+  entry until a back edge disagrees (then rebuilt as `Tagged`). Each back edge
+  counts iterations: after 1000 (once per loop), whenever a loop trace exists for
+  the header, or when the heap goes shared, the body deopts to the header so the
+  interpreter, the loop tracer or the shared-mode quantum takes over.
+- **Exception handlers and closures.** With handlers, every GPR is treated as
+  live (handlers are reached by edges liveness does not see) and after each
+  helper the interpreter must stand at the op's successor; otherwise a handler of
+  this frame caught an exception and the body leaves. Closure captures are read
+  from their registers at entry; hot closures enter the tier through the closure
+  call path.
+- **Deopt policy.** Repeated speculative failures, but not depth-limit bailouts,
+  drop the function back to the non-speculative v1 tier.
+- **Inliner.** Callees are translated into the caller's IR (call-site arguments
+  become the callee's SSA registers; returns join at a block parameter). Three
+  kinds of call can be inlined:
+  - static `CallDirect`;
+  - `InvokeMethodDirect`, whose method descriptor resolves to a class slot;
+  - VM-profiled monomorphic `Invoke`, which gets a `GuardClass` on the receiver.
+
+  The callee bodies are collected up front: a breadth-first search, 3 levels
+  deep, of at most 24 callees. Limits: depth 3, 96 ops per callee and 480
+  inlined ops per root. Before any effect, a guard that fails inside an inlined
+  body deoptimizes to the caller's call op, so the interpreter replays the whole
+  call. After an effect (a store) replaying is wrong, so the deopt rebuilds the
+  inlined frames instead. The runtime enters each inlined call as the
+  interpreter would, fills the callee registers and resumes the innermost frame
+  at the failed op.
+
+  An inlined body may itself make calls whose target is statically known
+  (`CallDirect`, profiled or resolved method calls): `CallExplicit` enters the
+  target with explicit arguments, as if the root frame were executing its
+  outermost call op. The root's live GPRs are in its bank. Every inlined frame
+  is published as a GC shadow frame (zeroed native stack bank, callee GC map
+  at the current op) for the duration of the call. The result lands in the
+  root op's destination register, which stays dead until the inlined call
+  returns. An exception unwinds from the root's call site (inlined bodies have
+  no handlers). Async and concurrent targets are declined before any effect;
+  the body then deoptimizes with rebuilt frames and the interpreter makes the
+  call. A call is an effect, so later guards rebuild frames too.
+
+  Declines:
+  - recursive inlining (a callee already being translated);
+  - stores, or calls from inlined bodies, when the root recurses natively
+    (nested frames replay the outermost self-call);
+  - other helpers (polymorphic `Invoke`, generic ops), allocations and loops
+    inside an inlined body;
+  - memoized callees that make calls.
+
+  A declined site stays a `RuntimeOp`. `NAPALM_JIT_EVENTS=1` prints each
+  `v2 inlined` and `v2 inline declined` decision.
+
 ### Bounded language-call inlining
 
-The recorder can inline bounded Wren calls when it can prove the call target and safely reproduce the call/return path. Method-table epoch guards protect inlined dynamic dispatch assumptions.
+The recorder can inline bounded Napalm calls when it can prove the call target and safely reproduce the call/return path. Method-table epoch guards protect inlined dynamic dispatch assumptions.
 
 Every inlined guard exits to the caller's call instruction and replays it, so no exit may follow a callee effect. Within that rule:
 
@@ -403,7 +513,7 @@ Napalm's `try`/`catch` implementation uses protected ranges and handler metadata
 
 - catch blocks are cold handler entries;
 - exact error state is materialized at the catch safepoint;
-- call frames retain enough call-site information to unwind across Wren calls;
+- call frames retain enough call-site information to unwind across Napalm calls;
 - hot code inside a protected region remains traceable/JIT-able;
 - an actual exceptional edge returns to the baseline interpreter when required;
 - escape/SROA conservatively preserves objects whose exceptional state must remain observable.
@@ -421,9 +531,9 @@ The engine contains verifier/test infrastructure for:
 - exception handler ranges;
 - trace SSA and side-exit state;
 - interpreter/JIT differential execution;
-- original Wren checksum compatibility for core benchmark kernels.
+- original Napalm checksum compatibility for core benchmark kernels.
 
-For the existing `jit.wren`, the test suite already checks known Wren-compatible results for `integratePi`, `xorshift` and Mandelbrot with the JIT both disabled and enabled.
+For the existing `jit.Napalm`, the test suite already checks known Napalm-compatible results for `integratePi`, `xorshift` and Mandelbrot with the JIT both disabled and enabled.
 
 ---
 

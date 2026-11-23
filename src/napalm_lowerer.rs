@@ -33,7 +33,7 @@ use crate::napalm_ir::{
 };
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use crate::napalm_collections::{HashMap, HashSet};
+use crate::napalm_collections::{HashMap, HashSet, SmallMap, SmallMap16};
 use smallvec::SmallVec;
 use compact_str::{CompactString, ToCompactString};
 use bumpalo::{Bump, collections::Vec as BumpVec};
@@ -236,6 +236,14 @@ fn byte_span_to_char_range(source: &str, span: Span) -> std::ops::Range<usize> {
 // Source type retention and static assignment checking
 // =============================================================================
 
+/// Static type of an unannotated variable or field from its initializer.
+/// A `null` initializer is a placeholder for a value assigned later, so the
+/// binding stays `any` instead of being constrained to `null`.
+fn infer_binding_type_annotation(initializer: &Expr) -> Option<TypeAnnotation> {
+    infer_surface_type_annotation(initializer)
+        .filter(|annotation| !matches!(annotation.kind, TypeAnnotationKind::Null))
+}
+
 fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
     use TypeAnnotationKind as K;
 
@@ -270,6 +278,7 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
         ExprKind::Map(_) => direct(K::Map),
         ExprKind::Closure(_) | ExprKind::AsyncClosure(_) | ExprKind::ConcurrentClosure(_) => direct(K::Closure),
         ExprKind::TypedCollection { annotation, .. } => Some(annotation.clone()),
+        ExprKind::GeneratorYield { next_type, .. } => next_type.clone(),
         ExprKind::Grouped(inner) => infer_surface_type_annotation(inner),
         ExprKind::Unary { operator, operand } => match operator {
             UnaryOp::Not => direct(K::Bool),
@@ -382,7 +391,8 @@ fn infer_surface_type_annotation(expr: &Expr) -> Option<TypeAnnotation> {
         | ExprKind::Subscript { .. }
         | ExprKind::DestructureGet { .. }
         | ExprKind::DestructureRest { .. }
-        | ExprKind::OptionalChain { .. } => None,
+        | ExprKind::OptionalChain { .. }
+        | ExprKind::Mx(_) => None,
     }
 }
 
@@ -511,6 +521,7 @@ fn resolve_type_annotation_with(
                 "Channel" => Some(BuiltinId::Channel),
                 "Receiver" => Some(BuiltinId::Receiver),
                 "Promise" => Some(BuiltinId::Promise),
+                "Generator" => Some(BuiltinId::Generator),
                 _ => None,
             };
             builtin.map_or(Type::Top, |builtin| {
@@ -539,6 +550,18 @@ fn resolve_type_annotation_with(
             "Channel" => Type::Builtin(BuiltinId::Channel, None),
             "Receiver" => Type::Builtin(BuiltinId::Receiver, None),
             "Promise" => Type::Builtin(BuiltinId::Promise, None),
+            "Bytes" => Type::Builtin(BuiltinId::Bytes, None),
+            "ByteBuffer" => Type::Builtin(BuiltinId::ByteBuffer, None),
+            "FileInfo" => Type::Builtin(BuiltinId::FileInfo, None),
+            "File" => Type::Builtin(BuiltinId::File, None),
+            "InputStream" => Type::Builtin(BuiltinId::InputStream, None),
+            "OutputStream" => Type::Builtin(BuiltinId::OutputStream, None),
+            // `Package` is a common class name: a user class keeps priority.
+            "Package" if !classes.contains_key("Package") => Type::Builtin(BuiltinId::Package, None),
+            "Regex" if !classes.contains_key("Regex") => Type::Builtin(BuiltinId::Regex, None),
+            "RegexBuilder" if !classes.contains_key("RegexBuilder") => Type::Builtin(BuiltinId::RegexBuilder, None),
+            "RegexMatch" if !classes.contains_key("RegexMatch") => Type::Builtin(BuiltinId::RegexMatch, None),
+            "RegexCaptures" if !classes.contains_key("RegexCaptures") => Type::Builtin(BuiltinId::RegexCaptures, None),
             "Function" | "Fn" => Type::Closure(None),
             "Map" => Type::Map,
             "Set" => Type::Set(None),
@@ -591,10 +614,22 @@ fn requires_runtime_contract(ty: &Type) -> bool {
         Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
         Type::GenericInstance { .. } => true,
         Type::Builtin(
-            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet,
+            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet | BuiltinId::Generator,
             Some(_),
         ) => true,
         Type::Union(ts) => ts.iter().any(requires_runtime_contract),
+        _ => false,
+    }
+}
+
+/// Conservative: can a value of this static type be a Generator, so that an
+/// abrupt `for..of` exit must close it?
+fn may_be_generator(ty: &Type) -> bool {
+    match ty {
+        // `Fiber.current` inside a generator body observes the generator object.
+        Type::Top | Type::Fiber | Type::Builtin(BuiltinId::Generator, _) => true,
+        Type::Cell(inner) => may_be_generator(inner),
+        Type::Union(ts) => ts.iter().any(may_be_generator),
         _ => false,
     }
 }
@@ -888,7 +923,9 @@ impl<'a> BindingTypes<'a> {
 
 struct Analyzer<'ast> {
     analysis: RootAnalysis<'ast>,
-    scopes: Vec<HashMap<CompactString, BindingId>>,
+    /// Lexical scope stack. Block scopes hold a handful of names, so each
+    /// push is an inline table instead of a fresh hashed allocation.
+    scopes: Vec<SmallMap16<CompactString, BindingId>>,
     current_function: FunctionNodeId,
     function_stack: Vec<FunctionNodeId>,
     module_root: bool,
@@ -913,7 +950,7 @@ impl<'ast> Analyzer<'ast> {
         };
         let mut analyzer = Self {
             analysis: RootAnalysis::new(root),
-            scopes: vec![HashMap::default()],
+            scopes: vec![SmallMap16::default()],
             current_function: FunctionNodeId(0),
             function_stack: vec![FunctionNodeId(0)],
             module_root: true,
@@ -948,7 +985,7 @@ impl<'ast> Analyzer<'ast> {
         };
         let mut analyzer = Self {
             analysis: RootAnalysis::new(root),
-            scopes: vec![HashMap::default()],
+            scopes: vec![SmallMap16::default()],
             current_function: FunctionNodeId(0),
             function_stack: vec![FunctionNodeId(0)],
             module_root: false,
@@ -1042,6 +1079,7 @@ impl<'ast> Analyzer<'ast> {
         }?;
         match annotation.kind {
             TypeAnnotationKind::List(Some(element)) => Some(*element),
+            TypeAnnotationKind::BuiltinGeneric(name, Some(element)) if name == "Generator" => Some(*element),
             _ => None,
         }
     }
@@ -1092,7 +1130,7 @@ impl<'ast> Analyzer<'ast> {
     }
 
     fn push_scope(&mut self) {
-        self.scopes.push(HashMap::default());
+        self.scopes.push(SmallMap16::default());
     }
 
     fn pop_scope(&mut self) {
@@ -1109,7 +1147,7 @@ impl<'ast> Analyzer<'ast> {
                 } else {
                     let source_type = annotation
                         .clone()
-                        .or_else(|| initializer.as_ref().and_then(infer_surface_type_annotation));
+                        .or_else(|| initializer.as_ref().and_then(infer_binding_type_annotation));
                     let binding = self.declare_typed(name, source_type);
                     self.analysis.bindings[binding.0 as usize].shared = *shared;
                     if let Some(initializer) = initializer {
@@ -1224,6 +1262,11 @@ impl<'ast> Analyzer<'ast> {
 
     fn visit_expr(&mut self, expr: &'ast Expr) {
         match &expr.kind {
+            ExprKind::Mx(block) => {
+                for name in crate::napalm_mx_front::parameters(block) {
+                    self.note_binding_use(&Ident::new(name.value.as_str().into(), name.span), false);
+                }
+            }
             ExprKind::Null | ExprKind::Bool(_) | ExprKind::Number(_) | ExprKind::String(_) => {}
             ExprKind::InterpolatedString(parts) => {
                 for part in parts {
@@ -1326,7 +1369,7 @@ impl<'ast> Analyzer<'ast> {
                     }
                 }
             }
-            ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => self.visit_expr(value),
+            ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => self.visit_expr(value),
             ExprKind::Closure(body) => self.visit_closure(body, false, false),
             ExprKind::AsyncClosure(body) => self.visit_closure(body, true, false),
             ExprKind::ConcurrentClosure(body) => self.visit_closure(body, false, true),
@@ -1458,6 +1501,15 @@ impl SymbolTable {
         self.get(name, kind, arity)
             .unwrap_or_else(|| panic!("method symbol was not preinterned: {name}/{arity:?}"))
     }
+}
+
+/// What a default-parameter arity adapter forwards to.
+#[derive(Clone, Copy, Debug)]
+enum DefaultArityTarget {
+    /// The class's own full-arity method body (instance or static).
+    Method(FuncId),
+    /// The class's own full-arity constructor body (`<init>new`).
+    Initializer(FuncId),
 }
 
 #[derive(Clone, Debug)]
@@ -1951,7 +2003,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
 
             let source_type = annotation
                 .clone()
-                .or_else(|| initializer.as_ref().and_then(infer_surface_type_annotation));
+                .or_else(|| initializer.as_ref().and_then(infer_binding_type_annotation));
             if source_type.as_ref().is_some_and(|a| invalid_structural_annotation(a, &self.interface_types)) {
                 self.diagnostics.push(Diagnostic::error("NAPALM-T002", "unsupported field type in object interface", name.span));
             }
@@ -2108,6 +2160,15 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     instance.extend(method_instance);
                 }
             }
+            // The hidden cache/epoch storage of `computed` properties is only
+            // ever touched by the VM, so no method body mentions it.
+            instance.extend(
+                class
+                    .fields
+                    .iter()
+                    .filter(|field| !field.is_static && field.storage.value.starts_with("__reactive_computed_"))
+                    .map(|field| field.storage.value.as_str()),
+            );
 
             // Declared accessors (including the accessors synthesized for typed
             // class fields) keep their method semantics. A `this.x = ...` write to
@@ -2280,7 +2341,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     )
                 })
                 .or_else(|| {
-                    field.initializer.as_ref().and_then(infer_surface_type_annotation).map(
+                    field.initializer.as_ref().and_then(infer_binding_type_annotation).map(
                         |annotation| {
                             resolve_type_annotation(
                                 &annotation,
@@ -2534,6 +2595,41 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 };
                 if let Some(function) = self.compile_function_node(module, &analysis, FunctionNodeId(0), spec) {
                     self.method_functions.insert(method.span, function);
+                    // A getter whose class declares the matching hidden fields
+                    // is the body of a `computed` property.
+                    if let (MethodSignatureAst::Getter { name }, false) = (&method.signature, method.is_static) {
+                        use crate::napalm_front_main::{computed_hidden_field_name, COMPUTED_HIDDEN_FIELDS};
+                        let slots = COMPUTED_HIDDEN_FIELDS.map(|kind| {
+                            class_plan.fields.get(computed_hidden_field_name(kind, &name.value).as_str()).map(|slot| slot.0)
+                        });
+                        if let [Some(cache), epoch, state] = slots {
+                            // The VM addresses all three from the cache slot.
+                            if epoch == cache.checked_add(1) && state == cache.checked_add(2) {
+                                if let Some(function) = self.program.function_mut(function) {
+                                    function.memoization = ir::MemoizationKind::Reactive { cache_slot: cache };
+                                }
+                            } else {
+                                self.error(
+                                    "NAPALM-L900",
+                                    format!("internal error: storage of computed property '{}' is not contiguous", name.value),
+                                    method.span,
+                                );
+                            }
+                        }
+                    }
+                    // Trailing defaulted parameters may be omitted. Dispatch is
+                    // by (name, arity), so every shorter arity gets an adapter
+                    // that pads with null (selecting the defaults) and forwards,
+                    // unless the class declares that arity explicitly.
+                    let required = if kind == MethodKind::Method {
+                        front::required_parameter_count(&params)
+                    } else {
+                        arity
+                    };
+                    let declared = |shorter: usize| class.methods.iter().any(|other| {
+                        other.is_static == method.is_static
+                            && method_signature_key(&other.signature) == Some((name.clone(), kind, shorter))
+                    });
                     if method.is_constructor {
                         plans.push(MethodPlan {
                             symbol: body_symbol,
@@ -2545,7 +2641,45 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                         plans.push(MethodPlan {
                             symbol, function: Some(factory), foreign: None, bind_static: true,
                         });
+                        for shorter in (required..arity).filter(|&shorter| !declared(shorter)) {
+                            let receiver = Type::Instance(ClassSet::singleton(class_plan.id));
+                            let label = format!("{}.<init>{name}/{shorter}<defaults>", class_plan.name);
+                            let initializer = self.compile_default_arity_adapter(
+                                module, label, FunctionKind::Method, receiver, shorter, arity,
+                                DefaultArityTarget::Initializer(function),
+                            );
+                            let init_symbol = self.program.intern_method(
+                                &compact_str::format_compact!("<init>{name}"), MethodKind::Method, shorter as u8,
+                            );
+                            plans.push(MethodPlan {
+                                symbol: init_symbol, function: Some(initializer), foreign: None, bind_static: false,
+                            });
+                            let factory =
+                                self.compile_constructor_factory(module, &class_plan, &name, shorter, Some(initializer));
+                            let symbol = self.program.intern_method(&name, MethodKind::Method, shorter as u8);
+                            plans.push(MethodPlan {
+                                symbol, function: Some(factory), foreign: None, bind_static: true,
+                            });
+                        }
                         continue;
+                    }
+                    for shorter in (required..arity).filter(|&shorter| !declared(shorter)) {
+                        let (function_kind, receiver) = if method.is_static {
+                            (FunctionKind::StaticMethod, Type::Class(ClassSet::singleton(class_plan.id)))
+                        } else {
+                            (FunctionKind::Method, Type::Instance(ClassSet::singleton(class_plan.id)))
+                        };
+                        let label = format!("{}.{name}/{shorter}<defaults>", class_plan.name);
+                        let adapter = self.compile_default_arity_adapter(
+                            module, label, function_kind, receiver, shorter, arity,
+                            DefaultArityTarget::Method(function),
+                        );
+                        plans.push(MethodPlan {
+                            symbol: self.program.intern_method(&name, kind, shorter as u8),
+                            function: Some(adapter),
+                            foreign: None,
+                            bind_static,
+                        });
                     }
                     plans.push(MethodPlan {
                         symbol,
@@ -2637,6 +2771,40 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             builder.emit1(Inst::CallDirect { conv: ir::CallConv::Napalm, callee, args }, Type::Top);
         }
         builder.ret(instance);
+        builder.finish()
+    }
+
+    /// `name/arity` of a method whose omitted trailing parameters have
+    /// defaults: pad the missing arguments with null (which selects each
+    /// default) and call this class's own full-arity implementation directly.
+    /// A direct call (rather than dynamic dispatch) keeps `super.m()` inside an
+    /// override of `m(x = ...)` from re-entering the override.
+    fn compile_default_arity_adapter(
+        &mut self,
+        module: ModuleId,
+        label: String,
+        kind: FunctionKind,
+        receiver: Type,
+        arity: usize,
+        target_arity: usize,
+        target: DefaultArityTarget,
+    ) -> FuncId {
+        let mut params = vec![receiver.clone()];
+        params.extend((0..arity).map(|_| Type::Top));
+        let (callee, returns_receiver) = match target {
+            DefaultArityTarget::Initializer(callee) => (callee, true),
+            DefaultArityTarget::Method(callee) => (callee, false),
+        };
+        let result = if returns_receiver { receiver } else { Type::Top };
+        let mut builder = Builder::new(self.program, module, label, kind, params, result);
+        let this = builder.param(0);
+        let mut args = vec![this];
+        args.extend((1..=arity).map(|index| builder.param(index)));
+        while args.len() <= target_arity {
+            args.push(builder.const_null());
+        }
+        let value = builder.emit1(Inst::CallDirect { conv: ir::CallConv::Napalm, callee, args }, Type::Top);
+        builder.ret(if returns_receiver { this } else { value });
         builder.finish()
     }
 
@@ -2886,7 +3054,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         }
 
         // Captures must be declared before *any* emitted instruction.
-        let mut capture_values = HashMap::default();
+        let mut capture_values = Env::default();
         for binding in &node.captures {
             let info = analysis.binding(*binding);
             let mode = if info.mutated && !info.shared {
@@ -3015,6 +3183,12 @@ struct MethodContext<'a> {
     static_field_types: &'a HashMap<CompactString, Type>,
 }
 
+/// Lowering environment: binding -> current storage. Cloned at every branch
+/// and join, and usually holds a function's few live locals, so it is inline.
+/// Inline iteration follows insertion order, which keeps join block-parameter
+/// order deterministic for typical functions.
+type Env = SmallMap<BindingId, Storage>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Storage {
     Value(ValueId),
@@ -3042,6 +3216,10 @@ struct ExceptionRegionBuild {
 
 #[derive(Clone, Debug)]
 enum ExitAction {
+    IteratorClose {
+        sequence: ValueId,
+        region: ExceptionRegionId,
+    },
     Defer {
         body: Box<Stmt>,
         region: ExceptionRegionId,
@@ -3103,7 +3281,7 @@ struct FunctionCompiler<'p, 'a, 'd> {
     builder: Builder<'p>,
     context: FunctionCompilerContext<'a>,
     diagnostics: &'d mut Vec<Diagnostic>,
-    env: HashMap<BindingId, Storage>,
+    env: Env,
     binding_types: BindingTypes<'a>,
     loops: Vec<LoopContext>,
     constructor_this: Option<ValueId>,
@@ -3120,7 +3298,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         builder: Builder<'p>,
         context: FunctionCompilerContext<'a>,
         diagnostics: &'d mut Vec<Diagnostic>,
-        env: HashMap<BindingId, Storage>,
+        env: Env,
         shared_binding_types: &'a HashMap<BindingId, StaticBindingType>,
     ) -> Self {
         Self {
@@ -3187,7 +3365,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn binding_flow_type(
         &self,
         binding: BindingId,
-        env: &HashMap<BindingId, Storage>,
+        env: &Env,
     ) -> Type {
         match env.get(&binding).copied() {
             // Captured mutable bindings carry the Cell itself through CFG edges;
@@ -3237,7 +3415,11 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             resolve_type_annotation(annotation, self.context.top_level_classes, self.context.interface_types)
         } else if initializer.is_some() {
             let actual = semantic_source_type(self.builder.value_type(value));
-            if matches!(actual, Type::Top) {
+            if matches!(actual, Type::Null) {
+                // `let x = null` is a placeholder for a value assigned later,
+                // not a `null`-only binding: without an annotation it is `any`.
+                Type::Top
+            } else if matches!(actual, Type::Top) {
                 self.context
                     .analysis
                     .binding(binding)
@@ -3529,11 +3711,19 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         if depth >= self.exit_actions.len() || self.current_terminated() {
             return;
         }
+        let saved_actions = self.exit_actions.clone();
         let actions = self.exit_actions[depth..].to_vec();
         let saved_suppressed = self.suppressed_regions.clone();
 
-        for action in actions.into_iter().rev() {
+        for (offset, action) in actions.into_iter().enumerate().rev() {
+            // A resumed return in cleanup must not execute that cleanup again.
+            self.exit_actions.truncate(depth + offset);
             match action {
+                ExitAction::IteratorClose { sequence, region } => {
+                    self.suppressed_regions.insert(region);
+                    self.split_cleanup_path();
+                    self.close_generator_iterator(sequence);
+                }
                 ExitAction::Defer {
                     body,
                     region,
@@ -3565,6 +3755,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
         }
 
+        self.exit_actions = saved_actions;
         self.suppressed_regions = saved_suppressed;
     }
 
@@ -4028,8 +4219,8 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn join_predecessors(
         &mut self,
-        predecessors: Vec<(ir::BlockId, HashMap<BindingId, Storage>)>,
-        fallback: HashMap<BindingId, Storage>,
+        predecessors: Vec<(ir::BlockId, Env)>,
+        fallback: Env,
     ) {
         match predecessors.len() {
             0 => {
@@ -4104,7 +4295,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let preheader_env = self.env.clone();
 
         let header = self.new_block(&[]);
-        let mut header_params = HashMap::default();
+        let mut header_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             let param = self.builder.add_block_param(header, ty);
@@ -4122,7 +4313,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             })
             .collect();
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::default();
+        let mut exit_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             let param = self.builder.add_block_param(exit, ty);
@@ -4182,14 +4373,14 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let preheader_env = self.env.clone();
 
         let body_block = self.new_block(&[]);
-        let mut body_params = HashMap::default();
+        let mut body_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             body_params.insert(*binding, self.builder.add_block_param(body_block, ty));
         }
 
         let condition_block = self.new_block(&[]);
-        let mut condition_params = HashMap::default();
+        let mut condition_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             condition_params.insert(
@@ -4199,7 +4390,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
 
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::default();
+        let mut exit_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &preheader_env);
             exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
@@ -4260,20 +4451,32 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
     fn lower_for(&mut self, name: &Ident, iterable: &Expr, body: &Stmt) {
         let sequence = self.lower_expr(iterable);
+        let action_depth = self.exit_actions.len();
+        // Only a Generator needs IteratorClose. A protecting region disables
+        // deforestation/loop fusion for the whole body, so statically known
+        // Lists, Ranges, Maps... keep exactly the pre-generator lowering.
+        let close = may_be_generator(self.builder.value_type(sequence)).then(|| {
+            let handler = self.new_block(&[Type::Top]);
+            let error = self.builder.block_param(handler, 0);
+            let region = self.create_exception_region(handler, error);
+            self.active_regions.push(region);
+            self.exit_actions.push(ExitAction::IteratorClose { sequence, region });
+            (handler, error)
+        });
         let carried = self.loop_carried_bindings(iterable, body);
         let base_env = self.env.clone();
         let iterator_initial = self.builder.const_null();
 
         let header = self.new_block(&[]);
         let iterator_param = self.builder.add_block_param(header, Type::Top);
-        let mut header_params = HashMap::default();
+        let mut header_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             header_params.insert(*binding, self.builder.add_block_param(header, ty));
         }
         let body_block = self.new_block(&[]);
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::default();
+        let mut exit_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
@@ -4328,12 +4531,30 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             self.builder.jump(header, back);
         }
 
+        if let Some((handler, error)) = close {
+            self.exit_actions.truncate(action_depth);
+            self.active_regions.pop();
+            self.builder.position_at(handler);
+            self.close_generator_iterator(sequence);
+            self.builder.emit0(Inst::FiberAbort { error });
+        }
+
         self.builder.seal_block(exit);
         self.builder.position_at(exit);
+        if close.is_some() {
+            self.split_cleanup_path();
+            self.close_generator_iterator(sequence);
+        }
         self.env = base_env;
         for binding in &carried {
             self.env.insert(*binding, Storage::Value(exit_params[binding]));
         }
+    }
+
+    fn close_generator_iterator(&mut self, sequence: ValueId) {
+        let builtin = self.builder.intern_method("__close", MethodKind::Method, 1);
+        let generator = self.lower_name(&front::Spanned::new("Generator".into(), Span::empty(0)));
+        self.builder.invoke(generator, builtin, vec![sequence]);
     }
 
     fn lower_break(&mut self, span: Span) {
@@ -4426,7 +4647,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn values_for_bindings(
         &self,
         bindings: &[BindingId],
-        env: &HashMap<BindingId, Storage>,
+        env: &Env,
     ) -> Vec<ValueId> {
         bindings
             .iter()
@@ -4440,6 +4661,31 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
     fn lower_expr(&mut self, expr: &Expr) -> ValueId {
         self.set_source(expr.span);
         match &expr.kind {
+            ExprKind::Mx(block) => {
+                // The schema belongs to the runtime connection. Persist the
+                // validated template as an ordinary WIR constant (also in .burning)
+                // and capture lexical values now, not when execute is called.
+                let Some(body) = self.context.source.get(block.span.as_range()) else {
+                    self.error("MX-B001", "MX template span is outside its source", expr.span);
+                    return self.builder.const_null();
+                };
+                let payload = self.builder.const_string(body);
+                let captures = crate::napalm_mx_front::parameters(block).into_iter().map(|n|
+                    Expr::new(ExprKind::Name(Ident::new(n.value.as_str().into(), n.span)), n.span)
+                ).collect::<Vec<_>>();
+                // $parameters name lexical bindings, including inside methods;
+                // they must not turn into implicit getters on `this`.
+                let implicit_this = self.context.implicit_this;
+                self.context.implicit_this = false;
+                let values = self.lower_list(&captures);
+                self.context.implicit_this = implicit_this;
+                let receiver = self.builder.emit1(Inst::LoadModuleVar {
+                    module: self.context.module,
+                    slot: self.context.module_layout.get(BuiltinId::DatabaseQuery.binding_name()).expect("DatabaseQuery builtin is reserved"),
+                }, Type::Top);
+                let method = self.builder.intern_method("__capture", MethodKind::Method, 2);
+                self.builder.invoke_typed(receiver, method, vec![payload, values], Type::Builtin(BuiltinId::DatabaseQuery, None))
+            }
             ExprKind::Null => self.builder.const_null(),
             ExprKind::Bool(value) => self.builder.const_bool(*value),
             ExprKind::Number(value) => self.builder.const_num(*value),
@@ -4526,9 +4772,51 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 self.bind_interface(settled, &settled_type)
             }
             ExprKind::Launch(call) => self.lower_launch(call, expr.span),
+            ExprKind::GeneratorYield { value, delegated, yield_type, next_type } => {
+                self.lower_generator_yield(value, *delegated, yield_type.as_ref(), next_type.as_ref(), expr.span)
+            }
             ExprKind::TypeOf(operand) => self.lower_typeof(operand),
             ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => self.lower_closure(body),
         }
+    }
+
+    fn lower_generator_yield(&mut self, expression: &Expr, delegated: bool,
+        yielded: Option<&TypeAnnotation>, resumed: Option<&TypeAnnotation>, span: Span) -> ValueId {
+        let value = self.lower_expr(expression);
+        let packet = if delegated { value } else {
+            let expected = yielded.map(|t| resolve_type_annotation(t, self.context.top_level_classes,
+                self.context.interface_types)).unwrap_or(Type::Top);
+            let value = self.bind_interface(value, &expected);
+            self.builder.emit1(Inst::FiberYield { value }, Type::List(None))
+        };
+        let subscript = self.builder.intern_method("[]", MethodKind::SubscriptGetter, 1);
+        let zero = self.builder.const_num(0.0);
+        let one = self.builder.const_num(1.0);
+        let mode = self.builder.invoke(packet, subscript, vec![zero]);
+        let value = self.builder.invoke(packet, subscript, vec![one]);
+        let returning = self.new_block(&[]);
+        let other = self.new_block(&[]);
+        let equal = self.builder.intern_method("==", MethodKind::Method, 1);
+        let is_return = self.builder.invoke(mode, equal, vec![one]);
+        self.builder.branch(is_return, returning, vec![], other, vec![]);
+        let env = self.env.clone();
+        self.builder.position_at(returning);
+        let value_return = self.check_return(value, span, true);
+        self.emit_exit_actions_from(0);
+        if !self.current_terminated() { self.builder.ret(value_return); }
+        self.env = env;
+        self.builder.position_at(other);
+        let throwing = self.new_block(&[]);
+        let next = self.new_block(&[]);
+        let two = self.builder.const_num(2.0);
+        let is_throw = self.builder.invoke(mode, equal, vec![two]);
+        self.builder.branch(is_throw, throwing, vec![], next, vec![]);
+        self.builder.position_at(throwing);
+        self.builder.emit0(Inst::FiberAbort { error: value });
+        self.builder.position_at(next);
+        let expected = resumed.map(|t| resolve_type_annotation(t, self.context.top_level_classes,
+            self.context.interface_types)).unwrap_or(Type::Top);
+        self.bind_interface(value, &expected)
     }
 
     fn lower_string_literal(&mut self, bytes: &[u8], span: Span) -> ValueId {
@@ -4625,7 +4913,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         }
         if let Some(builtin) = BuiltinId::ALL
             .into_iter()
-            .find(|builtin| builtin.is_native_decorator() && builtin.name() == name.value)
+            .find(|builtin| builtin.binding_name() != builtin.name() && builtin.name() == name.value)
         {
             if let Some(slot) = self.context.module_layout.get(builtin.binding_name()) {
                 return self.builder.emit1(
@@ -4636,6 +4924,13 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     Type::Top,
                 );
             }
+        }
+        // JS-style global numeric constants (aliases of Num.nan/Num.infinity);
+        // any user binding with the same name shadows them above.
+        match name.value.as_str() {
+            "NaN" => return self.builder.const_num(f64::NAN),
+            "Infinity" => return self.builder.const_num(f64::INFINITY),
+            _ => {}
         }
         self.error(
             "NAPALM-L018",
@@ -4855,7 +5150,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         let header = self.new_block(&[]);
         let iterator_param = self.builder.add_block_param(header, Type::Top);
-        let mut header_params = HashMap::default();
+        let mut header_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             header_params.insert(*binding, self.builder.add_block_param(header, ty));
@@ -4863,7 +5158,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
 
         let body = self.new_block(&[]);
         let exit = self.new_block(&[]);
-        let mut exit_params = HashMap::default();
+        let mut exit_params = SmallMap::default();
         for binding in &carried {
             let ty = self.binding_flow_type(*binding, &base_env);
             exit_params.insert(*binding, self.builder.add_block_param(exit, ty));
@@ -5236,6 +5531,12 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return self.lower_contract_check(value, layout, true);
         }
         if operator == BinaryOp::Is {
+            if matches!(&right.kind, ExprKind::Name(name) if name.value == "Generator") {
+                let value = self.lower_expr(left);
+                let generator = self.lower_expr(right);
+                let method = self.builder.intern_method("__is", MethodKind::Method, 1);
+                return self.builder.invoke(generator, method, vec![value]);
+            }
             if let Some(layout) = self.contract_layout_operand(right) {
                 let value = self.lower_expr(left);
                 return self.lower_contract_check(value, layout, false);
@@ -5534,10 +5835,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         // their mutating operation is reached through a pipeline.
         if invoke.args.is_empty() {
             if let Type::Builtin(builtin, Some(expected)) = &receiver_type {
-                if matches!(
-                    (*builtin, invoke.name.value.as_str()),
-                    (BuiltinId::Emitter, "emit") | (BuiltinId::Channel, "send")
-                ) {
+                if matches!((*builtin, invoke.name.value.as_str()), (BuiltinId::Emitter, "emit")) {
                     let actual = self.builder.value_type(input).clone();
                     if assignment_is_known_incompatible(expected, &actual) {
                         self.diagnostics.push(Diagnostic::error(
@@ -5648,15 +5946,16 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         name: &str,
         arity: usize,
     ) -> Type {
-        let Type::Builtin(builtin, _) = receiver_type else {
+        let Type::Builtin(builtin, element) = receiver_type else {
             return Type::Top;
         };
 
         match (*builtin, name, arity) {
-            (BuiltinId::Emitter, "emit", 1) => Type::Num,
-            (BuiltinId::Event, "on" | "once", 1) => Type::Num,
-            (BuiltinId::Event, "off", 1) => Type::Bool,
-            (BuiltinId::Channel, "send", 1) => Type::Bool,
+            (BuiltinId::Emitter, "emit", 1) => Type::Builtin(BuiltinId::Event, element.clone()),
+            (BuiltinId::Emitter, "publish_to" | "publishTo", 1)
+            | (BuiltinId::Receiver, "subscribe_from" | "subscribeFrom", 2) => receiver_type.clone(),
+            (BuiltinId::Emitter, "unpublish_from" | "unpublishFrom", 1)
+            | (BuiltinId::Receiver, "unsubscribe_from" | "unsubscribeFrom", 1) => Type::Bool,
             _ => Type::Top,
         }
     }
@@ -6469,18 +6768,41 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 _ => None,
             }
         });
-        let builtin_constructor_type = invoke.receiver.as_deref().and_then(|receiver| {
+        let builtin_result_type = invoke.receiver.as_deref().and_then(|receiver| {
             let ExprKind::Name(name) = &receiver.kind else { return None; };
-            if invoke.syntax != InvokeSyntax::Method || invoke.name.value != "new" {
+            if invoke.syntax != InvokeSyntax::Method {
                 return None;
             }
-            match name.value.as_str() {
-                "ConcurrentMap" => Some(Type::Builtin(BuiltinId::ConcurrentMap, None)),
-                "ConcurrentSet" => Some(Type::Builtin(BuiltinId::ConcurrentSet, None)),
-                "Map" => Some(Type::Map),
-                "Set" => Some(Type::Set(None)),
-                "Emitter" => Some(Type::Builtin(BuiltinId::Emitter, None)),
-                "Channel" => Some(Type::Builtin(BuiltinId::Channel, None)),
+            match (name.value.as_str(), invoke.name.value.as_str()) {
+                ("Bytes", "empty" | "alloc" | "fromUtf8" | "fromArray") => Some(Type::Builtin(BuiltinId::Bytes, None)),
+                ("ByteBuffer", "new") => Some(Type::Builtin(BuiltinId::ByteBuffer, None)),
+                ("JSON", "stringify") => Some(Type::String),
+                ("Fs", "readText" | "realPath") => Some(Type::String),
+                ("Fs", "readBytes") => Some(Type::Builtin(BuiltinId::Bytes, None)),
+                ("Fs", "exists") => Some(Type::Bool),
+                ("Fs", "stat") => Some(Type::Builtin(BuiltinId::FileInfo, None)),
+                ("Fs", "open") => Some(Type::Builtin(BuiltinId::File, None)),
+                ("Fs", "readDir") => Some(Type::List(None)),
+                ("Process", "cwd") => Some(Type::String),
+                ("Process", "args") => Some(Type::List(None)),
+                ("Process", "getenv") => Some(Type::Union(vec![Type::String, Type::Null])),
+                ("Package", "package") => Some(Type::Builtin(BuiltinId::Package, None)),
+                ("Package", "unpackage") => Some(Type::List(None)),
+                ("Regex", "new") => Some(Type::Builtin(BuiltinId::Regex, None)),
+                ("RegexBuilder", "new") | ("Regex", "builder") => Some(Type::Builtin(BuiltinId::RegexBuilder, None)),
+                ("Regex", "escape") => Some(Type::String),
+                ("Path", "isAbsolute") => Some(Type::Bool),
+                ("Path", "join" | "resolve" | "normalize" | "dirname" | "basename" | "extension" | "relative") => Some(Type::String),
+                ("Uri", "fromFilePath" | "toFilePath") => Some(Type::String),
+                ("Uri", "parse") => Some(Type::Map),
+                ("ConcurrentMap", "new") => Some(Type::Builtin(BuiltinId::ConcurrentMap, None)),
+                ("ConcurrentSet", "new") => Some(Type::Builtin(BuiltinId::ConcurrentSet, None)),
+                ("Map", "new") => Some(Type::Map),
+                ("Set", "new") => Some(Type::Set(None)),
+                ("Event", "new") => Some(Type::Builtin(BuiltinId::Event, None)),
+                ("Emitter", "new") => Some(Type::Builtin(BuiltinId::Emitter, None)),
+                ("Channel", "new") => Some(Type::Builtin(BuiltinId::Channel, None)),
+                ("Receiver", "new") => Some(Type::Builtin(BuiltinId::Receiver, None)),
                 _ => None,
             }
         });
@@ -6548,7 +6870,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         ) {
             return value;
         }
-        if let Some(result_type) = builtin_constructor_type.or(sized_array_type) {
+        if let Some(result_type) = builtin_result_type.or(sized_array_type) {
             if invoke.args.iter().any(|arg| matches!(arg.kind, ExprKind::Spread(_))) {
                 return self.lower_call(receiver, &invoke.name.value, kind, &invoke.args, None, span);
             }
@@ -6582,47 +6904,32 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let arity = invoke.args.len();
         let typed_payload = element.as_deref();
 
+        let event_type = Type::Builtin(BuiltinId::Event, element.clone());
         let result_type = match (*builtin, kind, name, arity) {
-            (BuiltinId::Emitter, MethodKind::Getter, "event", 0) => {
-                Type::Builtin(BuiltinId::Event, element.clone())
-            }
-            (BuiltinId::Emitter, MethodKind::Getter, "listenerCount", 0) => Type::Num,
-            (BuiltinId::Emitter, MethodKind::Getter, "closed", 0) => Type::Bool,
-            (BuiltinId::Emitter, MethodKind::Method, "emit", 1) => Type::Num,
-            (BuiltinId::Emitter, MethodKind::Method, "clear", 0) => Type::Num,
-            (BuiltinId::Emitter, MethodKind::Method, "close", 0) => Type::Bool,
+            (BuiltinId::Event, MethodKind::Getter, "data", 0) => match element {
+                Some(element) => (**element).clone(),
+                None => Type::Top,
+            },
 
-            (BuiltinId::Event, MethodKind::Method, "on", 1)
-            | (BuiltinId::Event, MethodKind::Method, "once", 1) => Type::Num,
-            (BuiltinId::Event, MethodKind::Method, "off", 1) => Type::Bool,
-            (BuiltinId::Event, MethodKind::Getter, "listenerCount", 0) => Type::Num,
-            (BuiltinId::Event, MethodKind::Getter, "closed", 0) => Type::Bool,
-
-            (BuiltinId::Channel, MethodKind::Getter, "receiver", 0) => {
-                Type::Builtin(BuiltinId::Receiver, element.clone())
+            (BuiltinId::Emitter, MethodKind::Method, "publish_to" | "publishTo", 1)
+            | (BuiltinId::Receiver, MethodKind::Method, "subscribe_from" | "subscribeFrom", 2) => {
+                receiver_type.clone()
             }
-            (BuiltinId::Channel, MethodKind::Method, "send", 1) => Type::Bool,
-            (BuiltinId::Channel, MethodKind::Method, "close", 0) => Type::Bool,
-            (BuiltinId::Channel, MethodKind::Getter, "closed", 0) => Type::Bool,
-            (BuiltinId::Channel, MethodKind::Getter, "length", 0)
-            | (BuiltinId::Channel, MethodKind::Getter, "capacity", 0) => Type::Num,
-
-            (BuiltinId::Receiver, MethodKind::Method, "receive", 0) => {
-                let result = match element {
-                    Some(element) => Type::Union(vec![(**element).clone(), Type::Null]),
-                    None => Type::Top,
-                };
-                Type::Builtin(BuiltinId::Promise, Some(Box::new(result)))
+            (BuiltinId::Receiver, MethodKind::Method, "subscribe_from" | "subscribeFrom", 1) => {
+                self.diagnostics.push(Diagnostic::error(
+                    "NAPALM-T006",
+                    format!("Receiver.{name}(channel, handler) requires a handler for that channel"),
+                    span,
+                ));
+                receiver_type.clone()
             }
-            (BuiltinId::Receiver, MethodKind::Method, "tryReceive", 0) => {
-                match element {
-                    Some(element) => Type::Union(vec![(**element).clone(), Type::Null]),
-                    None => Type::Top,
-                }
-            }
-            (BuiltinId::Receiver, MethodKind::Method, "close", 0) => Type::Bool,
-            (BuiltinId::Receiver, MethodKind::Getter, "closed", 0) => Type::Bool,
-            (BuiltinId::Receiver, MethodKind::Getter, "length", 0) => Type::Num,
+            (BuiltinId::Emitter, MethodKind::Method, "unpublish_from" | "unpublishFrom", 1)
+            | (BuiltinId::Receiver, MethodKind::Method, "unsubscribe_from" | "unsubscribeFrom", 1) => Type::Bool,
+            (BuiltinId::Emitter, MethodKind::Method, "emit", 0 | 1) => event_type,
+            (BuiltinId::Emitter | BuiltinId::Receiver, MethodKind::Getter, "channelCount", 0)
+            | (BuiltinId::Channel, MethodKind::Getter, "emitterCount" | "receiverCount", 0) => Type::Num,
+            (BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver, MethodKind::Method, "close", 0)
+            | (BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver, MethodKind::Getter, "closed", 0) => Type::Bool,
 
             _ => return None,
         };
@@ -6631,12 +6938,76 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             return None;
         }
 
-        let mut args = self.lower_call_args(&invoke.args, span);
-        if matches!(
-            (*builtin, kind, name),
-            (BuiltinId::Emitter, MethodKind::Method, "emit")
-                | (BuiltinId::Channel, MethodKind::Method, "send")
-        ) {
+        let args = self.lower_call_args(&invoke.args, span);
+        if let Some(message) = self.endpoint_connection_mismatch(receiver_type, name, args.first().copied()) {
+            self.diagnostics.push(Diagnostic::error("NAPALM-T006", message, invoke.args[0].span));
+        }
+        self.finish_native_endpoint_invoke(receiver, *builtin, typed_payload, invoke, kind, args, result_type)
+    }
+
+    /// Connections are only legal between endpoints with the same payload type.
+    /// Report it statically when both sides are known to be typed differently.
+    fn endpoint_connection_mismatch(&self, receiver_type: &Type, name: &str, channel: Option<ValueId>) -> Option<String> {
+        let Type::Builtin(owner @ (BuiltinId::Emitter | BuiltinId::Receiver), owner_element) = receiver_type else {
+            return None;
+        };
+        let connecting = match owner {
+            BuiltinId::Emitter => matches!(name, "publish_to" | "publishTo"),
+            _ => matches!(name, "subscribe_from" | "subscribeFrom"),
+        };
+        if !connecting { return None; }
+        let channel_type = semantic_source_type(self.builder.value_type(channel?));
+        // Interfaces and class instances display structurally; recover the
+        // declared name so the message reads `Emitter<Noded>`, not `Emitter<interface>`.
+        let payload_name = |ty: &Type| -> String {
+            let declared = match ty {
+                Type::Instance(classes) => match classes.as_slice() {
+                    [class] => self.context.top_level_classes
+                        .iter().find(|(_, id)| *id == class).map(|(name, _)| name.to_string()),
+                    _ => None,
+                },
+                Type::Interface(_) | Type::Record(_) => self.context.interface_types
+                    .iter().find(|(_, contract)| *contract == ty).map(|(name, _)| name.to_string()),
+                _ => None,
+            };
+            declared.unwrap_or_else(|| display_source_type(ty))
+        };
+        let display = |builtin: BuiltinId, element: &Option<Box<Type>>| match element {
+            Some(element) => format!("{}<{}>", builtin.name(), payload_name(element)),
+            None => builtin.name().to_string(),
+        };
+        match &channel_type {
+            Type::Builtin(BuiltinId::Channel, channel_element) => {
+                // An untyped static type may still hold a typed endpoint at runtime,
+                // so only two known, different payload types are a static error.
+                match (owner_element, channel_element) {
+                    (Some(a), Some(b)) if a != b => Some(format!(
+                        "cannot connect {} to {}: payload types must match",
+                        display(*owner, owner_element), display(BuiltinId::Channel, channel_element),
+                    )),
+                    _ => None,
+                }
+            }
+            Type::Builtin(other, element) => Some(format!(
+                "{}.{name} expects a Channel, got {}", owner.name(), display(*other, element),
+            )),
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_native_endpoint_invoke(
+        &mut self,
+        receiver: ValueId,
+        builtin: BuiltinId,
+        typed_payload: Option<&Type>,
+        invoke: &front::InvokeExpr,
+        kind: MethodKind,
+        mut args: Vec<ValueId>,
+        result_type: Type,
+    ) -> Option<ValueId> {
+        let name = invoke.name.value.as_str();
+        if matches!((builtin, kind, name), (BuiltinId::Emitter, MethodKind::Method, "emit")) {
             if let (Some(expected), Some(value)) = (typed_payload, args.first().copied()) {
                 let actual = self.builder.value_type(value).clone();
                 if assignment_is_known_incompatible(expected, &actual) {
@@ -6709,7 +7080,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         let base_value = self.lower_expr(base);
         let join = self.new_block(&[]);
         let result_param = self.builder.add_block_param(join, Type::Top);
-        let mut exits: Vec<(BlockId, ValueId, HashMap<BindingId, Storage>)> = Vec::new();
+        let mut exits: Vec<(BlockId, ValueId, Env)> = Vec::new();
 
         self.lower_optional_chain_path(base_value, segments, 0, span, &mut exits);
 
@@ -6787,7 +7158,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         segments: &[front::OptionalChainSegment],
         index: usize,
         span: Span,
-        exits: &mut Vec<(BlockId, ValueId, HashMap<BindingId, Storage>)>,
+        exits: &mut Vec<(BlockId, ValueId, Env)>,
     ) {
         if index == segments.len() {
             exits.push((self.builder.current_block(), current, self.env.clone()));
@@ -7294,14 +7665,14 @@ fn collect_fields_expr<'a>(expr: &'a Expr, instance: &mut SmallVec<[&'a str; 8]>
                 }
             }
         }
-        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_fields_expr(value, instance, statics),
+        ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_fields_expr(value, instance, statics),
         ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => collect_fields_in_body(body, instance, statics),
         ExprKind::Super(super_expr) => {
             for arg in &super_expr.args {
                 collect_fields_expr(arg, instance, statics)
             }
         }
-        ExprKind::Null
+        ExprKind::Mx(_) | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)
         | ExprKind::String(_)
@@ -7581,7 +7952,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
             collect_method_keys_expr(then_expr, out);
             collect_method_keys_expr(else_expr, out)
         }
-        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_method_keys_expr(value, out),
+        ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_method_keys_expr(value, out),
         ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => collect_method_keys_body(body, out),
         ExprKind::Name(name) => {
             out.insert(MethodKey {
@@ -7595,7 +7966,7 @@ fn collect_method_keys_expr(expr: &Expr, out: &mut HashSet<MethodKey>) {
                 arity: 1,
             });
         }
-        ExprKind::Null
+        ExprKind::Mx(_) | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)
         | ExprKind::String(_)
@@ -7758,7 +8129,7 @@ fn collect_strings_expr<'ast>(expr: &'ast Expr, out: &mut BumpVec<'_, &'ast [u8]
                 }
             }
         }
-        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_strings_expr(value, out),
+        ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_strings_expr(value, out),
         ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => match &body.kind {
             FunctionBodyKind::Expression(expr) => collect_strings_expr(expr, out),
             FunctionBodyKind::Statements(statements) => collect_strings_in_statements(statements, out),
@@ -7768,7 +8139,7 @@ fn collect_strings_expr<'ast>(expr: &'ast Expr, out: &mut BumpVec<'_, &'ast [u8]
                 collect_strings_expr(arg, out)
             }
         }
-        ExprKind::Null
+        ExprKind::Mx(_) | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)
         | ExprKind::Name(_)
@@ -7956,10 +8327,11 @@ fn collect_written_bindings_expr(
         }
         // Do not descend into closures: their writes happen when the closure is
         // invoked, and captured mutable bindings are cells already.
-        ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_written_bindings_expr(value, analysis, out),
+        ExprKind::GeneratorYield { value, .. } | ExprKind::Await(value) | ExprKind::Launch(value) | ExprKind::TypeOf(value) => collect_written_bindings_expr(value, analysis, out),
         ExprKind::Closure(_)
         | ExprKind::AsyncClosure(_)
         | ExprKind::ConcurrentClosure(_)
+        | ExprKind::Mx(_)
         | ExprKind::Null
         | ExprKind::Bool(_)
         | ExprKind::Number(_)
@@ -7978,6 +8350,109 @@ fn collect_written_bindings_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_and_bytebuffer_are_implicitly_bound_in_every_module() {
+        let source = r#"
+            const data: Bytes = Bytes.fromUtf8("Hello");
+            const zero: Bytes = Bytes.empty();
+            const buffer: ByteBuffer = new ByteBuffer(16);
+            buffer.append(data);
+            buffer.append(zero);
+            const result = buffer.length;
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("bytes-globals.napalm", source, "bytes-globals", &module);
+        assert!(
+            !output.has_errors(),
+            "core binary types must be in the module's global scope: {:#?}",
+            output.diagnostics,
+        );
+
+        let lowered = output.lowered.expect("lowered module");
+        let info = output.program.module(lowered.module).expect("module metadata");
+        for builtin in [BuiltinId::Bytes, BuiltinId::ByteBuffer] {
+            assert_eq!(builtin.binding_name(), builtin.name());
+            assert!(BuiltinId::ALL.contains(&builtin));
+            let bindings = info.builtin_bindings.iter()
+                .filter(|binding| binding.builtin == builtin)
+                .collect::<Vec<_>>();
+            assert_eq!(bindings.len(), 1, "missing or duplicate {builtin:?} binding");
+            assert!(bindings[0].slot.0 < info.variable_count);
+        }
+    }
+
+    #[test]
+    fn json_is_bound_and_stringify_has_string_result_type() {
+        let source = r#"
+            const document = JSON.parse("{\"ok\":true}");
+            const serialized: String = JSON.stringify(document);
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("json-globals.napalm", source, "json-globals", &module);
+        assert!(
+            !output.has_errors(),
+            "JSON must be present as an implicit global: {:#?}",
+            output.diagnostics,
+        );
+        let lowered = output.lowered.expect("lowered JSON module");
+        let info = output.program.module(lowered.module).expect("module metadata");
+        let bindings = info.builtin_bindings.iter()
+            .filter(|binding| binding.builtin == BuiltinId::JSON)
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1);
+        assert!(bindings[0].slot.0 < info.variable_count);
+    }
+
+    #[test]
+    fn filesystem_is_bound_as_native_global() {
+        let source = r#"
+            const text: String = Fs.readText("example.txt");
+            const bytes: Bytes = Fs.readBytes("example.dat");
+            const entries = Fs.readDir(".");
+            const metadata: FileInfo = Fs.stat(".");
+            const file: File = Fs.open("example.txt", "r");
+            const exists: Bool = Fs.exists(".");
+            const path: String = Fs.realPath(".");
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("fs-globals.napalm", source, "fs-globals", &module);
+        assert!(
+            !output.has_errors(),
+            "Fs must be available in every module: {:#?}",
+            output.diagnostics,
+        );
+        let lowered = output.lowered.expect("lowered Fs module");
+        let module = output.program.module(lowered.module).expect("module metadata");
+        let bindings = module.builtin_bindings.iter()
+            .filter(|binding| binding.builtin == BuiltinId::Fs)
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1, "Fs must be registered exactly once");
+        assert!(bindings[0].slot.0 < module.variable_count);
+    }
+
+    #[test]
+    fn path_and_uri_are_implicitly_bound_globals() {
+        let source = r#"
+            const joined: String = Path.join("a", "b");
+            const absolute: Bool = Path.isAbsolute("C:\\work");
+            const uri: String = Uri.fromFilePath("C:\\work\\test.napalm");
+            const value = Uri.parse(uri);
+            const back: String = Uri.toFilePath(value);
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("path-uri.napalm", source, "path-uri", &module);
+        assert!(!output.has_errors(), "Path and Uri lowering diagnostics: {:#?}", output.diagnostics);
+        let lowered = output.lowered.expect("lowered module");
+        let info = output.program.module(lowered.module).expect("module metadata");
+        for builtin in [BuiltinId::Path, BuiltinId::Uri] {
+            let bindings = info.builtin_bindings.iter()
+                .filter(|binding| binding.builtin == builtin)
+                .collect::<Vec<_>>();
+            assert_eq!(bindings.len(), 1, "missing or duplicate {builtin:?} registration");
+            assert!(bindings[0].slot.0 < info.variable_count);
+        }
+    }
 
     #[test]
     fn lowers_pipeline_to_ordinary_invoke_without_pipeline_ir() {
@@ -8352,6 +8827,33 @@ class Child is Parent {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "NAPALM-T001"));
+    }
+
+    #[test]
+    fn null_initialized_bindings_default_to_any() {
+        let source = r#"
+            let topLevel = null;
+            topLevel = "text";
+            {
+                let directory = null;
+                directory = "parent";
+                directory = 1;
+                directory = null;
+            }
+            function find() {
+                let found = null;
+                for (const item of [1, 2]) { found = `item ${item}`; }
+                found = [found];
+                return found;
+            }
+        "#;
+        let module = parse_typescript(source);
+        let output = lower_new_program("types.nap", source, "types", &module);
+        assert!(
+            output.diagnostics.iter().all(|diagnostic| diagnostic.code != "NAPALM-T001"),
+            "unexpected type diagnostics: {:#?}",
+            output.diagnostics
+        );
     }
 
     #[test]

@@ -1,4 +1,129 @@
 #[test]
+fn napalm_collections_join_separators_values_and_empty_slots() {
+    run_napalm(r#"
+        const numbers: number[] = [1, 2, 3];
+        const words = ['a', 'é', '😀'];
+        const holes = new Array(3);
+        holes[1] = 'middle';
+        const checks = [numbers.join() === '1,2,3', numbers.join('-') === '1-2-3',
+            words.join('') === 'aé😀', words.join('🌟') === 'a🌟é🌟😀',
+            [].join() === '', [].join('--') === '', ['one'].join('--') === 'one',
+            [null].join() === '', [null, null].join() === ',',
+            [1, null, true, false, ''].join('|') === '1||true|false|',
+            holes.join('/') === '/middle/', new Array(3).join('-') === '--',
+            numbers.join(0) === '10203', numbers.join(null) === '1null2null3',
+            ['a', 'b'].join('\0') === 'a\0b',
+            [[1, 2], [3]].join(';') === '[1, 2];[3]',
+            words.length === 3 && words[1] === 'é' && numbers[2] === 3];
+        const result = checks.reduce((ok, check) => ok && check, true);
+    "#, "true");
+}
+
+#[test]
+fn napalm_collections_list_slice_search_and_reorder() {
+    run_napalm(r#"
+        const xs = [5, 3, 8, 1, 9, 2];
+        const result = [xs.slice(), xs.slice(2), xs.slice(-2), xs.slice(1, -1),
+            xs.slice(4, 1), xs.slice(-100, 100), xs.concat([7]),
+            [1, 2, 3].reverse(), xs.indexOf(8), xs.indexOf(42), xs.includes(9),
+            xs.includes(0), xs.find(x => x > 5), xs.find(x => x > 50),
+            xs.findIndex(x => x > 5), xs.findIndex(x => x > 50),
+            xs.some(x => x > 8), xs.every(x => x > 0), xs.every(x => x > 1),
+            [].every(x => false), [].some(x => true), xs];
+    "#, "[[5, 3, 8, 1, 9, 2], [8, 1, 9, 2], [9, 2], [3, 8, 1, 9], [], [5, 3, 8, 1, 9, 2], \
+         [5, 3, 8, 1, 9, 2, 7], [3, 2, 1], 2, -1, true, false, 8, null, 2, -1, true, true, false, \
+         true, false, [5, 3, 8, 1, 9, 2]]");
+}
+
+#[test]
+fn napalm_collections_list_sort_and_callback_scans() {
+    run_napalm(r#"
+        let total = 0;
+        [1, 2, 3].forEach(x => { total += x; });
+        const shrink = [1, 2, 3, 4, 5];
+        shrink.forEach(x => { shrink.pop(); });
+        const grow = [1, 2];
+        grow.forEach(x => { grow.push(x); });
+        const people = [['ana', 30], ['bo', 25], ['cy', 30], ['di', 25], ['ed', 40]];
+        const stable = people.sort((a, b) => a[1] - b[1]).map(p => p[0]).join(',');
+        const big = [];
+        for (let i = 0; i < 1000; i++) big.push((i * 7919) % 1000);
+        const byCompare = big.slice().sort((a, b) => a - b);
+        const natural = big.slice().sort();
+        let ordered = true;
+        for (let i = 0; i < 1000; i++) {
+            if (byCompare[i] !== i || natural[i] !== i) ordered = false;
+        }
+        let badMixed = false;
+        try { [1, 'a'].sort(); } catch (e) { badMixed = true; }
+        let badCompare = false;
+        try { [2, 1].sort((a, b) => 'x'); } catch (e) { badCompare = true; }
+        const typed = new Array<Number>(3);
+        typed[0] = 3; typed[1] = 1; typed[2] = 2;
+        const result = [total, shrink, grow, stable, ordered, badMixed, badCompare,
+            [10, 9, 1].sort(), ['pear', 'apple', 'Banana'].sort(),
+            [NaN, 3, -Infinity, 0].sort().map(x => x.isNan ? 'nan' : x),
+            [3, 1, 2].sort((a, b) => b - a), typed.sort(), big.length];
+    "#, "[6, [1, 2], [1, 2, 1, 2], bo,di,ana,cy,ed, true, true, true, [1, 9, 10], \
+         [Banana, apple, pear], [-inf, 0, 3, nan], [3, 2, 1], [1, 2, 3], 1000]");
+}
+
+#[test]
+fn napalm_collections_join_virtual_conversion_mutation_and_gc() {
+    run_napalm(r#"
+        let log = '';
+        class Text {
+            constructor(text) { this.text = text; }
+            toString() { log += this.text; System.gc(); return this.text; }
+        }
+        const joined = [new Text('a'), null, new Text('b')].join(new Text('-'));
+        const source: any = [null, 'old', 'tail'];
+        class Change {
+            toString() { source[1] = 'new'; source.push('extra'); return 'first'; }
+        }
+        source[0] = new Change();
+        const changed = source.join('|');
+        class Shrink {
+            toString() { source.clear(); System.gc(); return 'only'; }
+        }
+        source[0] = new Shrink();
+        const shrunk = source.join('|');
+        const cycle: any = [];
+        cycle.push(cycle);
+        const result = [joined, log, changed, shrunk, cycle.join()];
+    "#, "[a--b, -ab, first|new|tail, only|||, [[...]]]");
+}
+
+#[test]
+fn napalm_collections_join_conversion_errors_are_catchable() {
+    run_napalm(r#"
+        class Bad { toString() { return 42; } }
+        class Throwing { toString() { throw 'conversion failed'; } }
+        let errors = 0;
+        try { [new Bad()].join(); } catch (e) { errors++; }
+        try { [].join(new Bad()); } catch (e) { errors++; }
+        try { [new Throwing()].join(); } catch (e) { errors++; }
+        try { [].join(new Throwing()); } catch (e) { errors++; }
+        const result = [errors, ['still', 'works'].join(' ')];
+    "#, "[4, still works]");
+}
+
+#[test]
+fn napalm_collections_join_hot_dispatch_and_gc() {
+    run_napalm_checked(r#"
+        const values = ['é', '😀', 'x'];
+        let total = 0;
+        let last = '';
+        for (let i = 0; i < 100; i++) {
+            last = values.join(i % 2 === 0 ? '' : '-');
+            total += last.length;
+            if (i % 20 === 0) System.gc();
+        }
+        const result = [total, last, new Array(1000).fill('a').join('').length];
+    "#, "[400, é-😀-x, 1000]", true);
+}
+
+#[test]
 fn napalm_collections_instance_protocol_inheritance_overrides_and_gc() {
     run_napalm(r#"
         class Base { name = 'base'; }
@@ -11,6 +136,74 @@ fn napalm_collections_instance_protocol_inheritance_overrides_and_gc() {
         const result = [item.keys(), item.values(), entries, item.size,
             new Empty().keys(), new Empty().size, new Custom().keys()];
     "#, "[[name, value], [base, 42], [[name, base], [value, 42]], 2, [], 0, [custom]]");
+}
+
+#[test]
+fn napalm_collections_instance_subscript_reads_and_writes_fields_by_name() {
+    run_napalm(r#"
+        interface Point { x: number; y: number; }
+        class Base { name = 'base'; }
+        class P extends Base implements Point {
+            constructor() { super(); this.x = 3; this.y = 40; }
+        }
+        function read(p: Point, k: string) { return p[k]; }
+        function write(p: Point, k: string, v: number) { p[k] = v; }
+        const p = new P();
+        const parts = ['na', 'me'];
+        const first = [p['x'], read(p, 'y'), p[parts[0] + parts[1]], p['missing'], p[parts[1]], p[7]];
+        write(p, 'x', 5);
+        p[parts[0] + parts[1]] = 'renamed';
+        p['y'] += 2;
+        let total = 0;
+        const keys = ['x', 'y'];
+        for (let i = 0; i < 200; i++) {
+            const k = keys[i % 2];
+            p[k] = p[k] + 1;
+            total += read(p, k);
+        }
+        const result = [first, p.x, p.y, p.name, total, p.keys()];
+    "#, "[[3, 40, base, null, null, null], 105, 142, renamed, 14800, [name, x, y]]");
+}
+
+#[test]
+fn napalm_collections_instance_subscript_is_reactive() {
+    // Keep the selector immediate: a heap-valued dependency (such as a string
+    // field holding the key) is conservatively invalidated after any GC,
+    // including one requested by another test, and may add an evaluation.
+    run_napalm(r#"
+        let evaluations = 0;
+        class Counter {
+            constructor() { this.hot = 1; this.cold = 100; this.useCold = false; }
+            computed doubled() { evaluations++; return this[this.useCold ? 'cold' : 'hot'] * 2; }
+        }
+        const c = new Counter();
+        const first = [c.doubled, c.doubled];
+        c['hot'] = 5;                    // subscript write invalidates
+        const second = [c.doubled, c.doubled];
+        c.hot = 7;                       // subscript read was tracked
+        const third = c.doubled;
+        System.gc();
+        c['cold'] = 200;                 // unrelated field: still cached
+        const result = [first, second, third, c.doubled, evaluations];
+    "#, "[[2, 2], [10, 10], 14, 14, 3]");
+}
+
+#[test]
+fn napalm_collections_instance_subscript_keeps_field_types_and_layout() {
+    for (source, message) in [
+        ("class P { x: number = 1; } const p = new P(); const k = 'mis' + 'sing'; p[k] = 1;",
+            "cannot add property 'missing' to a class instance"),
+        ("class P { x: number = 1; } const p = new P(); const k = 'x'; p[k] = 'text';",
+            "Class field type error"),
+    ] {
+        let (program, entry, manifest) = compile_typescript_module(source);
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            let error = vm.run_module(entry).unwrap_err();
+            assert!(error.message.contains(message), "jit={jit} {source}: {error:?}");
+        }
+    }
 }
 
 #[test]
@@ -569,10 +762,68 @@ fn shared_whole_function_helper_parks_until_the_lock_is_released() {
 
 #[test]
 fn napalm_collections_contended_shared_lock_parks_tasks() {
-    // One long operation (spreading a large shared List) holds the lock for
-    // longer than the 1 ms spin budget, so contending workers park their task
-    // and are resumed when the lock is released.
-    let before = crate::napalm_interpreter::vm_mutex_parked_tasks();
+    use crate::napalm_bytecode::{ArgReg, IncomingSource, ParameterBinding};
+
+    let mut asm = Assembler::new();
+    asm.emit_abc(Opcode::ListSpread, 2, 0, 1);
+    asm.emit_a(Opcode::Return, 0);
+    let mut chunk = asm.finish().unwrap();
+    let mut references = ReferenceMap::default();
+    references.set_general(Reg(0), true);
+    references.set_general(Reg(1), true);
+    chunk.safepoints.push(SafepointEntry {
+        pc: BytecodePc(0), kind: SafepointKind::RuntimeMutation, references,
+    });
+    let mut program = simple_program(chunk, 3);
+    program.functions[0].kind = FunctionKind::Closure;
+    program.functions[0].arity = 2;
+    for reg in 0..2 {
+        program.functions[0].frame.parameters.push(ParameterBinding {
+            source: IncomingSource::Argument(ArgReg(reg)),
+            destination: Reg(reg), kind: RegisterKind::Value,
+        });
+    }
+    let mut vm = Interpreter::new(&program).unwrap();
+    vm.set_jit_options(None);
+    let _roots = vm.gc_root_registration();
+    let destination = vm.heap.alloc(HeapObject::List(Vec::new()));
+    vm.add_root(destination);
+    let source = vm.heap.alloc(HeapObject::List(vec![Value::TRUE, Value::FALSE]));
+    vm.add_root(source);
+    vm.heap.shared_mode = true;
+    vm.heap.mark_shared_deep(source);
+    vm.is_concurrent_worker = true;
+    let handle = source.heap_handle().unwrap();
+
+    // Hold the source lock until this specific task has parked. Large copies
+    // and concurrent launches do not guarantee contention under every schedule,
+    // and a process-wide parking counter can be changed by unrelated tests.
+    assert!(vm_mutex::VmAdaptativeMutex::try_lock(&vm.heap.handle_table.entry(handle).sync));
+    let result = vm.run_function(FuncId(0), &[destination, source]).unwrap();
+    assert!(matches!(result, ExecutionResult::Suspended(_)));
+    assert_eq!(vm.blocked_on_shared_lock(), Some(handle));
+    assert!(matches!(vm.heap.get(destination), Some(HeapObject::List(values)) if values.is_empty()));
+    assert!(vm.held_locks.is_empty());
+
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let notification = wakes.clone();
+    assert!(vm.park_blocked_task(Box::new(move || {
+        notification.fetch_add(1, Ordering::Release);
+    })).is_ok());
+    assert_eq!(wakes.load(Ordering::Acquire), 0);
+    vm_mutex::VmAdaptativeMutex::unlock(handle, &vm.heap.handle_table.entry(handle).sync);
+    assert_eq!(wakes.load(Ordering::Acquire), 1);
+
+    assert!(matches!(vm.resume_blocked_task().unwrap(), ExecutionResult::Returned(value) if value == destination));
+    assert!(matches!(vm.heap.get(destination), Some(HeapObject::List(values)) if values == &[Value::TRUE, Value::FALSE]));
+    assert_eq!(vm.blocked_on_shared_lock(), None);
+    assert!(vm.held_locks.is_empty());
+    assert!(!vm.shared_op_active);
+    assert_eq!(wakes.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn napalm_collections_shared_list_spread_and_push_are_consistent() {
     run_napalm(r#"
         const shared m = new Map();
         const big = [];
@@ -595,7 +846,6 @@ fn napalm_collections_contended_shared_lock_parks_tasks() {
         for (let i = 1; i < pending.length; i++) pushed += await pending[i];
         const result = [pushed, m.get('big').length, copied >= 6 * 200000];
     "#, "[300, 200300, true]");
-    assert!(crate::napalm_interpreter::vm_mutex_parked_tasks() > before, "no task parked");
 }
 
 #[test]

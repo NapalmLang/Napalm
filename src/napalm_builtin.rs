@@ -5,9 +5,9 @@
 //! owns the method/primitive manifest and the native implementations.
 
 use crate::napalm_interpreter::{
-    fast_random_seed, num_to_u32, BuiltinClass, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
+    fast_random_seed, num_to_u32, BuiltinClass, BytesNative, JsonNative, FsNative, FileNative, PathNative, UriNative, ProcessNative, InputStreamNative, OutputStreamNative, PackageNative, Host, HostContext, Interpreter, NativeBuiltin, RuntimeError, Value,
 };
-use crate::napalm_ir::{Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, PrimitiveId, Program, Type};
+use crate::napalm_ir::{BlockId, Builder, BuiltinId, CaptureMode, CmpKind, FuncId, FunctionKind, Inst, IntBinOp, MethodKind, MethodSymbol, ModuleId, PrimitiveId, Program, Type, ValueId};
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,14 +16,18 @@ use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Local, LocalResult, NaiveDate,
     NaiveDateTime, Offset, TimeZone, Timelike, Utc,
 };
+use crate::napalm_interpreter::{DatabaseMode, MxNative};
+use crate::napalm_interpreter::{RegexNative, PubSubNative};
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum BuiltinTarget {
     Instance(BuiltinClass),
     Static(BuiltinId),
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PrimitiveBinding {
     pub target: BuiltinTarget,
     pub method: MethodSymbol,
@@ -31,6 +35,7 @@ pub struct PrimitiveBinding {
 }
 
 #[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BuiltinManifest {
     bindings: Vec<PrimitiveBinding>,
     native_bindings: Vec<NativeBinding>,
@@ -47,6 +52,7 @@ pub struct BuiltinManifest {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct NativeBinding {
     pub target: BuiltinTarget,
     pub method: MethodSymbol,
@@ -56,6 +62,11 @@ pub struct NativeBinding {
 impl BuiltinManifest {
     pub fn bindings(&self) -> &[PrimitiveBinding] {
         &self.bindings
+    }
+
+    /// The builtin behind a primitive id (JIT specialization, diagnostics).
+    pub fn primitive_kind(&self, primitive: PrimitiveId) -> Option<BuiltinPrimitive> {
+        self.primitives.get(primitive.0 as usize).copied().flatten()
     }
 
     fn register(
@@ -105,6 +116,7 @@ impl BuiltinManifest {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 enum DateField {
     YearLegacy,
     FullYear,
@@ -118,6 +130,7 @@ enum DateField {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 enum DateSetField {
     YearLegacy,
     FullYear,
@@ -130,6 +143,7 @@ enum DateSetField {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize)]
 enum DateStringFormat {
     String,
     UtcString,
@@ -142,7 +156,8 @@ enum DateStringFormat {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum BuiltinPrimitive {
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) enum BuiltinPrimitive {
     RandomNew,
     RandomInt,
     RangeCount,
@@ -203,6 +218,9 @@ enum BuiltinPrimitive {
     NumNan,
 
     StringCount,
+    StringUtf8Length,
+    StringUtf16Length,
+    StringCodePointAt,
     StringAdd,
     StringEq,
     StringNe,
@@ -229,6 +247,7 @@ enum BuiltinPrimitive {
     StringIterate,
     StringIteratorValue,
     StringFromCodePoint,
+    StringHashCode,
 
     ListCount,
     ListConcat,
@@ -247,6 +266,10 @@ enum BuiltinPrimitive {
     ListIterate,
     ListIteratorValue,
     ListToString,
+    ListSlice,
+    ListReverse,
+    ListSortNatural,
+    ListSortAfter,
     ListFilled,
     ListNew,
     ListNewNumber,
@@ -314,6 +337,8 @@ enum BuiltinPrimitive {
     DateSet(DateSetField, bool),
     DateToString(DateStringFormat),
     DateToJson,
+
+    ListJoinStrings,
 }
 
 /// Reserves all method symbols and primitive IDs required by the core runtime.
@@ -333,6 +358,19 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::Bool,
         BuiltinClass::Num,
         BuiltinClass::String,
+        BuiltinClass::Bytes,
+        BuiltinClass::ByteBuffer,
+        BuiltinClass::FileInfo,
+        BuiltinClass::File,
+        BuiltinClass::InputStream,
+        BuiltinClass::OutputStream,
+        BuiltinClass::Package,
+        BuiltinClass::Regex,
+        BuiltinClass::RegexBuilder,
+        BuiltinClass::RegexMatch,
+        BuiltinClass::RegexCaptures,
+        BuiltinClass::Database,
+        BuiltinClass::DatabaseQuery,
         BuiltinClass::List,
         BuiltinClass::Map,
         BuiltinClass::Set,
@@ -340,6 +378,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         BuiltinClass::Range,
         BuiltinClass::Closure,
         BuiltinClass::Fiber,
+        BuiltinClass::Generator,
         BuiltinClass::Promise,
         BuiltinClass::MapEntry,
         BuiltinClass::MapKeys,
@@ -414,6 +453,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     for (name, kind, arity, op) in [
         ("count", MethodKind::Getter, 0, BuiltinPrimitive::StringCount),
         ("length", MethodKind::Getter, 0, BuiltinPrimitive::StringCount),
+        ("utf8Length", MethodKind::Getter, 0, BuiltinPrimitive::StringUtf8Length),
+        ("utf16Length", MethodKind::Getter, 0, BuiltinPrimitive::StringUtf16Length),
+        ("codePointAt", MethodKind::Method, 1, BuiltinPrimitive::StringCodePointAt),
         ("isEmpty", MethodKind::Getter, 0, BuiltinPrimitive::StringIsEmpty),
         ("==", MethodKind::Method, 1, BuiltinPrimitive::StringEq),
         ("!=", MethodKind::Method, 1, BuiltinPrimitive::StringNe),
@@ -447,6 +489,7 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("trimEnd", MethodKind::Method, 0, BuiltinPrimitive::StringTrimEnd),
         ("toUpperCase", MethodKind::Method, 0, BuiltinPrimitive::StringToUpperCase),
         ("toLowerCase", MethodKind::Method, 0, BuiltinPrimitive::StringToLowerCase),
+        ("hashCode", MethodKind::Method, 0, BuiltinPrimitive::StringHashCode),
         ("toString", MethodKind::Getter, 0, BuiltinPrimitive::StringToString),
         ("iterate", MethodKind::Method, 1, BuiltinPrimitive::StringIterate),
         ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::StringIteratorValue),
@@ -495,6 +538,307 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     string_right_add.ret(result);
     manifest.string_right_add = Some(string_right_add.finish());
 
+    // Connections own SQLite resources; query construction captures scalar values.
+    // `Database.open(mode)` for Memory/Temporary, `Database.open(mode, path)`
+    // for the modes that name a file or shared database.
+    for arity in [1, 2] {
+        manifest.register_native(program, static_(BuiltinId::Database), "open", MethodKind::Method, arity, NativeBuiltin::Database(MxNative::Open));
+    }
+    for mode in DatabaseMode::ALL {
+        manifest.register_native(program, static_(BuiltinId::DatabaseMode), mode.name(), MethodKind::Getter, 0, NativeBuiltin::Database(MxNative::Mode(mode)));
+    }
+    manifest.register_native(program, static_(BuiltinId::DatabaseQuery), "__capture", MethodKind::Method, 2, NativeBuiltin::Database(MxNative::Capture));
+    for (name, arity, native) in [
+        ("getVersion", 0, MxNative::GetVersion),
+        ("setVersion", 1, MxNative::SetVersion),
+        ("execute", 1, MxNative::Execute),
+        ("close", 0, MxNative::Close),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::Database), name, MethodKind::Method, arity, NativeBuiltin::Database(native));
+    }
+    manifest.register_native(program, instance(BuiltinClass::Database), "closed", MethodKind::Getter, 0, NativeBuiltin::Database(MxNative::Closed));
+
+    // JSON reuses the fetch stack's codecs.
+    manifest.register_native(
+        program,
+        static_(BuiltinId::JSON),
+        "parse",
+        MethodKind::Method,
+        1,
+        NativeBuiltin::Json(JsonNative::Parse),
+    );
+    manifest.register_native(
+        program,
+        static_(BuiltinId::JSON),
+        "stringify",
+        MethodKind::Method,
+        1,
+        NativeBuiltin::Json(JsonNative::Stringify),
+    );
+
+    // Process streams are native heap objects. The Process.* getters return
+    // VM-rooted singletons: standard descriptors cannot be closed by scripts.
+    for (name, native) in [
+        ("stdin", ProcessNative::Stdin),
+        ("stdout", ProcessNative::Stdout),
+        ("stderr", ProcessNative::Stderr),
+        ("args", ProcessNative::Args),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Process), name,
+            MethodKind::Getter, 0, NativeBuiltin::Process(native));
+    }
+    for (name, arity, native) in [
+        ("cwd", 0, ProcessNative::Cwd),
+        ("chdir", 1, ProcessNative::Chdir),
+        ("getenv", 1, ProcessNative::Getenv),
+        ("exit", 1, ProcessNative::Exit),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Process), name,
+            MethodKind::Method, arity, NativeBuiltin::Process(native));
+    }
+    for (name, arity, native) in [
+        ("read", 1, InputStreamNative::Read),
+        ("readExact", 1, InputStreamNative::ReadExact),
+        ("readLine", 0, InputStreamNative::ReadLine),
+        ("close", 0, InputStreamNative::Close),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::InputStream), name,
+            MethodKind::Method, arity, NativeBuiltin::InputStream(native));
+    }
+    for (name, arity, native) in [
+        ("write", 1, OutputStreamNative::Write),
+        ("writeAll", 1, OutputStreamNative::WriteAll),
+        ("writeText", 1, OutputStreamNative::WriteText),
+        ("flush", 0, OutputStreamNative::Flush),
+        ("close", 0, OutputStreamNative::Close),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::OutputStream), name,
+            MethodKind::Method, arity, NativeBuiltin::OutputStream(native));
+    }
+
+    // Lexical path operations are platform-independent; the runtime selects the
+    // appropriate path syntax from the input (Windows drive/UNC or POSIX).
+    // Variadic calls must have a dispatch entry at each legal call arity.
+    for arity in 0..=16u8 {
+        manifest.register_native(program, static_(BuiltinId::Path), "join",
+            MethodKind::Method, arity, NativeBuiltin::Path(PathNative::Join));
+        manifest.register_native(program, static_(BuiltinId::Path), "resolve",
+            MethodKind::Method, arity, NativeBuiltin::Path(PathNative::Resolve));
+    }
+    for (name, arity, native) in [
+        ("normalize", 1, PathNative::Normalize),
+        ("dirname", 1, PathNative::Dirname),
+        ("basename", 1, PathNative::Basename),
+        ("extension", 1, PathNative::Extension),
+        ("isAbsolute", 1, PathNative::IsAbsolute),
+        ("relative", 2, PathNative::Relative),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Path), name,
+            MethodKind::Method, arity, NativeBuiltin::Path(native));
+    }
+    for (name, native) in [
+        ("parse", UriNative::Parse),
+        ("fromFilePath", UriNative::FromFilePath),
+        ("toFilePath", UriNative::ToFilePath),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Uri), name,
+            MethodKind::Method, 1, NativeBuiltin::Uri(native));
+    }
+
+    // Synchronous native filesystem utilities. File data is transferred through
+    // the existing String / Bytes representations, never through an FFI pointer.
+    for (name, arity, native) in [
+        ("readText", 1, FsNative::ReadText),
+        ("open", 2, FsNative::Open),
+        ("readBytes", 1, FsNative::ReadBytes),
+        ("writeText", 2, FsNative::WriteText),
+        ("writeBytes", 2, FsNative::WriteBytes),
+        ("exists", 1, FsNative::Exists),
+        ("stat", 1, FsNative::Stat),
+        ("readDir", 1, FsNative::ReadDir),
+        ("realPath", 1, FsNative::RealPath),
+        ("mkdir", 1, FsNative::Mkdir),
+        ("mkdirAll", 1, FsNative::MkdirAll),
+        ("removeFile", 1, FsNative::RemoveFile),
+        ("rename", 2, FsNative::Rename),
+    ] {
+        manifest.register_native(
+            program,
+            static_(BuiltinId::Fs),
+            name,
+            MethodKind::Method,
+            arity,
+            NativeBuiltin::Fs(native),
+        );
+    }
+
+    for class in [BuiltinClass::FileInfo, BuiltinClass::File] {
+        for (name, native) in [
+            ("path", FileNative::Path), ("name", FileNative::Name),
+            ("modifiedAt", FileNative::ModifiedAt), ("createdAt", FileNative::CreatedAt),
+        ] {
+            manifest.register_native(program, instance(class), name, MethodKind::Getter, 0, NativeBuiltin::File(native));
+        }
+    }
+    for (name, native) in [
+        ("size", FileNative::Size), ("isFile", FileNative::IsFile),
+        ("isDirectory", FileNative::IsDirectory), ("isSymlink", FileNative::IsSymlink),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::FileInfo), name, MethodKind::Getter, 0, NativeBuiltin::File(native));
+    }
+    for (name, arity, native) in [
+        ("read", 1, FileNative::Read), ("write", 1, FileNative::Write),
+        ("seek", 1, FileNative::Seek), ("flush", 0, FileNative::Flush),
+        ("close", 0, FileNative::Close),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::File), name, MethodKind::Method, arity, NativeBuiltin::File(native));
+    }
+
+    // `.orange` packages: tar archives compressed with Zstandard level 18.
+    // `Package.package(name)` returns a builder; its mutators return the
+    // builder itself so calls chain, and `finish()` writes the package.
+    let package_static = static_(BuiltinId::Package);
+    manifest.register_native(program, package_static, "package",
+        MethodKind::Method, 1, NativeBuiltin::Package(PackageNative::Package));
+    for arity in [1, 2] {
+        manifest.register_native(program, package_static, "unpackage",
+            MethodKind::Method, arity, NativeBuiltin::Package(PackageNative::Unpackage));
+    }
+    for (name, arity, native) in [
+        ("addFile", 1, PackageNative::AddFile),
+        ("addFiles", 1, PackageNative::AddFiles),
+        ("addFolder", 1, PackageNative::AddFolder),
+        ("setPackageDest", 1, PackageNative::SetPackageDest),
+        ("finish", 0, PackageNative::Finish),
+    ] {
+        manifest.register_native(program, instance(BuiltinClass::Package), name,
+            MethodKind::Method, arity, NativeBuiltin::Package(native));
+    }
+
+    // regexr's public API, with both Rust spelling and Napalm camelCase aliases.
+    for (builtin, name, native) in [
+        (BuiltinId::Regex, "new", RegexNative::New),
+        (BuiltinId::Regex, "escape", RegexNative::Escape),
+        (BuiltinId::Regex, "builder", RegexNative::BuilderNew),
+        (BuiltinId::RegexBuilder, "new", RegexNative::BuilderNew),
+    ] {
+        manifest.register_native(program, static_(builtin), name, MethodKind::Method, 1, NativeBuiltin::Regex(native));
+    }
+    for (class, methods) in [
+        (BuiltinClass::Regex, &[
+            ("as_str", "asStr", 0, RegexNative::AsStr),
+            ("engine_name", "engineName", 0, RegexNative::EngineName),
+            ("capture_names", "captureNames", 0, RegexNative::CaptureNames),
+            ("is_match", "isMatch", 1, RegexNative::IsMatch),
+            ("try_is_match", "tryIsMatch", 1, RegexNative::TryIsMatch),
+            ("find", "find", 1, RegexNative::Find),
+            ("try_find", "tryFind", 1, RegexNative::TryFind),
+            ("find_iter", "findIter", 1, RegexNative::FindIter),
+            ("captures", "captures", 1, RegexNative::Captures),
+            ("try_captures", "tryCaptures", 1, RegexNative::TryCaptures),
+            ("captures_iter", "capturesIter", 1, RegexNative::CapturesIter),
+            ("replace", "replace", 2, RegexNative::Replace),
+            ("replace_all", "replaceAll", 2, RegexNative::ReplaceAll),
+        ][..]),
+        (BuiltinClass::RegexBuilder, &[
+            ("jit", "jit", 1, RegexNative::Jit),
+            ("optimize_prefixes", "optimizePrefixes", 1, RegexNative::OptimizePrefixes),
+            ("backtrack_limit", "backtrackLimit", 1, RegexNative::BacktrackLimit),
+            ("size_limit", "sizeLimit", 1, RegexNative::SizeLimit),
+            ("nest_limit", "nestLimit", 1, RegexNative::NestLimit),
+            ("build", "build", 0, RegexNative::Build),
+        ][..]),
+        (BuiltinClass::RegexMatch, &[
+            ("start", "start", 0, RegexNative::Start),
+            ("end", "end", 0, RegexNative::End),
+            ("as_str", "asStr", 0, RegexNative::AsStr),
+            ("as_bytes", "asBytes", 0, RegexNative::AsBytes),
+            ("range", "range", 0, RegexNative::Range),
+            ("len", "len", 0, RegexNative::Len),
+            ("is_empty", "isEmpty", 0, RegexNative::IsEmpty),
+        ][..]),
+        (BuiltinClass::RegexCaptures, &[
+            ("len", "len", 0, RegexNative::Len),
+            ("is_empty", "isEmpty", 0, RegexNative::IsEmpty),
+            ("get", "get", 1, RegexNative::Get),
+            ("name", "name", 1, RegexNative::Name),
+        ][..]),
+    ] {
+        for &(rust, camel, arity, native) in methods {
+            manifest.register_native(program, instance(class), rust, MethodKind::Method, arity, NativeBuiltin::Regex(native));
+            if camel != rust {
+                manifest.register_native(program, instance(class), camel, MethodKind::Method, arity, NativeBuiltin::Regex(native));
+            }
+        }
+    }
+    for class in [BuiltinClass::RegexMatch, BuiltinClass::RegexCaptures] {
+        manifest.register_native(program, instance(class), "length", MethodKind::Getter, 0, NativeBuiltin::Regex(RegexNative::Len));
+    }
+    manifest.register_native(program, instance(BuiltinClass::RegexCaptures), "[]", MethodKind::SubscriptGetter, 1, NativeBuiltin::Regex(RegexNative::Index));
+
+    // Native immutable Bytes and mutable ByteBuffer. These are ordinary
+    // runtime calls so both JIT tiers use the established GC-safe call ABI.
+    let bytes_class = instance(BuiltinClass::Bytes);
+    let buffer_class = instance(BuiltinClass::ByteBuffer);
+    for (name, arity, native) in [
+        ("empty", 0, BytesNative::BytesEmpty),
+        ("alloc", 1, BytesNative::BytesAlloc),
+        ("fromUtf8", 1, BytesNative::BytesFromUtf8),
+        ("fromArray", 1, BytesNative::BytesFromArray),
+    ] {
+        manifest.register_native(program, static_(BuiltinId::Bytes), name, MethodKind::Method, arity, NativeBuiltin::Bytes(native));
+    }
+    for arity in [0, 1] {
+        manifest.register_native(program, static_(BuiltinId::ByteBuffer), "new", MethodKind::Method, arity, NativeBuiltin::Bytes(BytesNative::BufferNew));
+    }
+    for (name, kind, arity, native) in [
+        ("length", MethodKind::Getter, 0, BytesNative::BytesLength),
+        ("isEmpty", MethodKind::Getter, 0, BytesNative::BytesIsEmpty),
+        ("[]", MethodKind::SubscriptGetter, 1, BytesNative::BytesIndex),
+        ("slice", MethodKind::Method, 1, BytesNative::BytesSlice),
+        ("slice", MethodKind::Method, 2, BytesNative::BytesSlice),
+        ("clone", MethodKind::Method, 0, BytesNative::BytesClone),
+        ("toUtf8", MethodKind::Method, 0, BytesNative::BytesToUtf8),
+        ("toArray", MethodKind::Method, 0, BytesNative::BytesToArray),
+        ("toMutable", MethodKind::Method, 0, BytesNative::BytesToMutable),
+        ("indexOf", MethodKind::Method, 1, BytesNative::BytesIndexOf),
+        ("toString", MethodKind::Getter, 0, BytesNative::BytesToString),
+        ("toString", MethodKind::Method, 0, BytesNative::BytesToString),
+        ("iterate", MethodKind::Method, 1, BytesNative::BytesIterate),
+        ("iteratorValue", MethodKind::Method, 1, BytesNative::BytesIteratorValue),
+    ] {
+        manifest.register_native(program, bytes_class, name, kind, arity, NativeBuiltin::Bytes(native));
+    }
+    for (name, kind, arity, native) in [
+        ("length", MethodKind::Getter, 0, BytesNative::BufferLength),
+        ("capacity", MethodKind::Getter, 0, BytesNative::BufferCapacity),
+        ("isEmpty", MethodKind::Getter, 0, BytesNative::BufferIsEmpty),
+        ("[]", MethodKind::SubscriptGetter, 1, BytesNative::BufferIndex),
+        ("[]=", MethodKind::SubscriptSetter, 2, BytesNative::BufferIndexSet),
+        ("append", MethodKind::Method, 1, BytesNative::BufferAppend),
+        ("reserve", MethodKind::Method, 1, BytesNative::BufferReserve),
+        ("resize", MethodKind::Method, 1, BytesNative::BufferResize),
+        ("writeUInt8", MethodKind::Method, 1, BytesNative::BufferWriteU8),
+        ("writeUInt16BE", MethodKind::Method, 1, BytesNative::BufferWriteU16BE),
+        ("writeUInt16LE", MethodKind::Method, 1, BytesNative::BufferWriteU16LE),
+        ("writeUInt32BE", MethodKind::Method, 1, BytesNative::BufferWriteU32BE),
+        ("writeUInt32LE", MethodKind::Method, 1, BytesNative::BufferWriteU32LE),
+        ("take", MethodKind::Method, 1, BytesNative::BufferTake),
+        ("peek", MethodKind::Method, 1, BytesNative::BufferPeek),
+        ("discard", MethodKind::Method, 1, BytesNative::BufferDiscard),
+        ("freeze", MethodKind::Method, 0, BytesNative::BufferFreeze),
+        ("clear", MethodKind::Method, 0, BytesNative::BufferClear),
+        ("fill", MethodKind::Method, 1, BytesNative::BufferFill),
+        ("indexOf", MethodKind::Method, 1, BytesNative::BufferIndexOf),
+        ("toUtf8", MethodKind::Method, 0, BytesNative::BufferToUtf8),
+        ("toString", MethodKind::Getter, 0, BytesNative::BufferToString),
+        ("toString", MethodKind::Method, 0, BytesNative::BufferToString),
+        ("iterate", MethodKind::Method, 1, BytesNative::BufferIterate),
+        ("iteratorValue", MethodKind::Method, 1, BytesNative::BufferIteratorValue),
+    ] {
+        manifest.register_native(program, buffer_class, name, kind, arity, NativeBuiltin::Bytes(native));
+    }
+
     // List.
     let list = instance(BuiltinClass::List);
     for (name, kind, arity, op) in [
@@ -520,6 +864,12 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         ("iterate", MethodKind::Method, 1, BuiltinPrimitive::ListIterate),
         ("iteratorValue", MethodKind::Method, 1, BuiltinPrimitive::ListIteratorValue),
         ("toString", MethodKind::Getter, 0, BuiltinPrimitive::ListToString),
+        ("concat", MethodKind::Method, 1, BuiltinPrimitive::ListConcat),
+        ("slice", MethodKind::Method, 0, BuiltinPrimitive::ListSlice),
+        ("slice", MethodKind::Method, 1, BuiltinPrimitive::ListSlice),
+        ("slice", MethodKind::Method, 2, BuiltinPrimitive::ListSlice),
+        ("reverse", MethodKind::Method, 0, BuiltinPrimitive::ListReverse),
+        ("sort", MethodKind::Method, 0, BuiltinPrimitive::ListSortNatural),
     ] {
         manifest.register(program, list, name, kind, arity, op);
     }
@@ -564,6 +914,64 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     let null = b.const_null();
     b.ret(null);
     manifest.list_remove = Some((remove, b.finish()));
+
+    // Convert elements through the normal virtual protocol, then join all parts
+    // in one native allocation instead of repeatedly copying a growing String.
+    manifest.register(program, instance(BuiltinClass::List), "__joinStrings",
+        MethodKind::Method, 1, BuiltinPrimitive::ListJoinStrings);
+    let join_primitive = manifest.bindings.last().unwrap().primitive;
+    let subscript = program.intern_method("[]", MethodKind::SubscriptGetter, 1);
+    for arity in [0, 1] {
+        let method = program.intern_method("join", MethodKind::Method, arity);
+        let params = if arity == 0 { vec![Type::List(None)] }
+            else { vec![Type::List(None), Type::Top] };
+        let mut b = Builder::new(program, module, "List.join", FunctionKind::Method,
+            params, Type::String);
+        let source = b.param(0);
+        let len = b.emit1(Inst::ListLen { list: source }, Type::Int32);
+        let separator = if arity == 0 {
+            b.const_string(",")
+        } else {
+            let separator = b.param(1);
+            b.invoke_typed(separator, to_string_method, Vec::new(), Type::String)
+        };
+        let parts = b.emit1(Inst::AllocList { capacity: Some(len) }, Type::List(None));
+        let empty = b.const_string("");
+        let null = b.const_null();
+        let header = b.new_block(&[]);
+        let index = b.add_block_param(header, Type::Int32);
+        let body = b.new_block(&[]);
+        let convert = b.new_block(&[]);
+        let append = b.new_block(&[]);
+        let text = b.add_block_param(append, Type::String);
+        let done = b.new_block(&[]);
+        let zero = b.const_i32(0);
+        b.jump(header, vec![zero]);
+        b.position_at(header);
+        let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+        b.branch(more, body, vec![], done, vec![]);
+        b.position_at(body);
+        // Subscript dispatch returns null if a toString() callback shortened
+        // the source. The initial length still determines the separator count.
+        let boxed_index = b.emit1(Inst::Int32ToNum { value: index }, Type::Num);
+        let item = b.invoke(source, subscript, vec![boxed_index]);
+        let missing = b.emit1(Inst::RefEq { left: item, right: null }, Type::Bool);
+        b.branch(missing, append, vec![empty], convert, vec![]);
+        b.position_at(convert);
+        let converted = b.invoke_typed(item, to_string_method, Vec::new(), Type::String);
+        b.jump(append, vec![converted]);
+        b.position_at(append);
+        b.emit0(Inst::ListAppend { list: parts, value: text });
+        let one = b.const_i32(1);
+        let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+        b.jump(header, vec![next]);
+        b.position_at(done);
+        let result = b.emit1(Inst::CallPrimitive {
+            primitive: join_primitive, args: vec![parts, separator],
+        }, Type::String);
+        b.ret(result);
+        manifest.list_functions.push((method, b.finish()));
+    }
 
     // Higher-order List operations stay in WIR instead of Host primitives. This
     // gives callbacks ordinary Napalm call semantics, lets GC maps remain precise,
@@ -676,6 +1084,9 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     b.position_at(done);
     b.ret(result);
     manifest.list_functions.push((reduce_method, b.finish()));
+
+    install_list_search_functions(program, &mut manifest, module, call1, equals);
+    install_list_sort_function(program, &mut manifest, module, call2);
 
     // Collections share the API and key equality; their storage is distinct.
     manifest.register(program, static_(BuiltinId::ConcurrentMap), "new", MethodKind::Method, 0, BuiltinPrimitive::ConcurrentMapNew);
@@ -1007,6 +1418,16 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     // deliberately bypass the Host primitive ABI.
     manifest.register_native(program, static_(BuiltinId::Fiber), "current", MethodKind::Getter, 0, NativeBuiltin::FiberCurrent);
     manifest.register_native(program, static_(BuiltinId::Fiber), "new", MethodKind::Method, 1, NativeBuiltin::FiberNew);
+    manifest.register_native(program, static_(BuiltinId::Generator), "__close", MethodKind::Method, 1, NativeBuiltin::GeneratorClose);
+    manifest.register_native(program, static_(BuiltinId::Generator), "__is", MethodKind::Method, 1, NativeBuiltin::GeneratorIs);
+    manifest.register_native(program, static_(BuiltinId::Generator), "__new", MethodKind::Method, 1, NativeBuiltin::GeneratorNew);
+    for arity in 0..=1 {
+        for (name, native) in [("next", NativeBuiltin::GeneratorNext), ("return", NativeBuiltin::GeneratorReturn), ("throw", NativeBuiltin::GeneratorThrow)] {
+            manifest.register_native(program, instance(BuiltinClass::Generator), name, MethodKind::Method, arity, native);
+        }
+    }
+    manifest.register_native(program, instance(BuiltinClass::Generator), "iterate", MethodKind::Method, 1, NativeBuiltin::GeneratorIterate);
+    manifest.register_native(program, instance(BuiltinClass::Generator), "iteratorValue", MethodKind::Method, 1, NativeBuiltin::GeneratorIteratorValue);
     manifest.register_native(program, instance(BuiltinClass::Fiber), "error", MethodKind::Getter, 0, NativeBuiltin::FiberError);
     manifest.register_native(program, instance(BuiltinClass::Fiber), "isDone", MethodKind::Getter, 0, NativeBuiltin::FiberIsDone);
     for arity in 0..=1u8 {
@@ -1033,41 +1454,46 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     manifest.register_native(program, instance(BuiltinClass::Promise), "isRejected", MethodKind::Getter, 0, NativeBuiltin::PromiseIsRejected);
     manifest.register_native(program, instance(BuiltinClass::Promise), "isCancelled", MethodKind::Getter, 0, NativeBuiltin::PromiseIsCancelled);
 
-    // Event/Emitter provide one-to-many notifications. Emitter owns the publish
-    // capability; `event` returns a read-only Event view sharing the same native
-    // listener state. Delivery is queued as runtime microtasks to avoid arbitrary
-    // reentrant VM calls from emit().
-    manifest.register_native(program, static_(BuiltinId::Emitter), "new", MethodKind::Method, 0, NativeBuiltin::EmitterNew);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "event", MethodKind::Getter, 0, NativeBuiltin::EmitterEvent);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "emit", MethodKind::Method, 1, NativeBuiltin::EmitterEmit);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "listenerCount", MethodKind::Getter, 0, NativeBuiltin::EmitterListenerCount);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "clear", MethodKind::Method, 0, NativeBuiltin::EmitterClear);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "close", MethodKind::Method, 0, NativeBuiltin::EmitterClose);
-    manifest.register_native(program, instance(BuiltinClass::Emitter), "closed", MethodKind::Getter, 0, NativeBuiltin::EmitterClosed);
-
-    manifest.register_native(program, instance(BuiltinClass::Event), "on", MethodKind::Method, 1, NativeBuiltin::EventOn);
-    manifest.register_native(program, instance(BuiltinClass::Event), "once", MethodKind::Method, 1, NativeBuiltin::EventOnce);
-    manifest.register_native(program, instance(BuiltinClass::Event), "off", MethodKind::Method, 1, NativeBuiltin::EventOff);
-    manifest.register_native(program, instance(BuiltinClass::Event), "listenerCount", MethodKind::Getter, 0, NativeBuiltin::EventListenerCount);
-    manifest.register_native(program, instance(BuiltinClass::Event), "closed", MethodKind::Getter, 0, NativeBuiltin::EventClosed);
-
-    // Channel/Receiver are split FIFO capabilities. Channel.send() never blocks;
-    // a bounded full queue returns false. Receiver.receive() returns a Promise and
-    // is fulfilled immediately when data is already buffered.
-    manifest.register_native(program, static_(BuiltinId::Channel), "new", MethodKind::Method, 0, NativeBuiltin::ChannelNew);
-    manifest.register_native(program, static_(BuiltinId::Channel), "new", MethodKind::Method, 1, NativeBuiltin::ChannelNew);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "receiver", MethodKind::Getter, 0, NativeBuiltin::ChannelReceiver);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "send", MethodKind::Method, 1, NativeBuiltin::ChannelSend);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "close", MethodKind::Method, 0, NativeBuiltin::ChannelClose);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "closed", MethodKind::Getter, 0, NativeBuiltin::ChannelClosed);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "length", MethodKind::Getter, 0, NativeBuiltin::ChannelLength);
-    manifest.register_native(program, instance(BuiltinClass::Channel), "capacity", MethodKind::Getter, 0, NativeBuiltin::ChannelCapacity);
-
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "receive", MethodKind::Method, 0, NativeBuiltin::ReceiverReceive);
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "tryReceive", MethodKind::Method, 0, NativeBuiltin::ReceiverTryReceive);
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "close", MethodKind::Method, 0, NativeBuiltin::ReceiverClose);
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "closed", MethodKind::Getter, 0, NativeBuiltin::ReceiverClosed);
-    manifest.register_native(program, instance(BuiltinClass::Receiver), "length", MethodKind::Getter, 0, NativeBuiltin::ReceiverLength);
+    // Independent publishers/subscribers connected through many-to-many channels.
+    for (builtin, native) in [
+        (BuiltinId::Event, PubSubNative::EventNew),
+        (BuiltinId::Emitter, PubSubNative::EmitterNew),
+        (BuiltinId::Channel, PubSubNative::ChannelNew),
+        (BuiltinId::Receiver, PubSubNative::ReceiverNew),
+    ] {
+        manifest.register_native(program, static_(builtin), "new", MethodKind::Method, 0, NativeBuiltin::PubSub(native));
+    }
+    manifest.register_native(program, static_(BuiltinId::Event), "new", MethodKind::Method, 1, NativeBuiltin::PubSub(PubSubNative::EventNew));
+    manifest.register_native(program, instance(BuiltinClass::Event), "data", MethodKind::Getter, 0, NativeBuiltin::PubSub(PubSubNative::EventData));
+    for (class, name, arity, native) in [
+        (BuiltinClass::Emitter, "publish_to", 1, PubSubNative::PublishTo),
+        (BuiltinClass::Emitter, "publishTo", 1, PubSubNative::PublishTo),
+        (BuiltinClass::Emitter, "unpublish_from", 1, PubSubNative::UnpublishFrom),
+        (BuiltinClass::Emitter, "unpublishFrom", 1, PubSubNative::UnpublishFrom),
+        (BuiltinClass::Emitter, "emit", 0, PubSubNative::Emit),
+        (BuiltinClass::Emitter, "emit", 1, PubSubNative::Emit),
+        // Arity 1 is registered only to report the missing handler clearly.
+        (BuiltinClass::Receiver, "subscribe_from", 1, PubSubNative::SubscribeFrom),
+        (BuiltinClass::Receiver, "subscribeFrom", 1, PubSubNative::SubscribeFrom),
+        (BuiltinClass::Receiver, "subscribe_from", 2, PubSubNative::SubscribeFrom),
+        (BuiltinClass::Receiver, "subscribeFrom", 2, PubSubNative::SubscribeFrom),
+        (BuiltinClass::Receiver, "unsubscribe_from", 1, PubSubNative::UnsubscribeFrom),
+        (BuiltinClass::Receiver, "unsubscribeFrom", 1, PubSubNative::UnsubscribeFrom),
+    ] {
+        manifest.register_native(program, instance(class), name, MethodKind::Method, arity, NativeBuiltin::PubSub(native));
+    }
+    for class in [BuiltinClass::Emitter, BuiltinClass::Channel, BuiltinClass::Receiver] {
+        manifest.register_native(program, instance(class), "close", MethodKind::Method, 0, NativeBuiltin::PubSub(PubSubNative::Close));
+        manifest.register_native(program, instance(class), "closed", MethodKind::Getter, 0, NativeBuiltin::PubSub(PubSubNative::Closed));
+    }
+    for (class, name, native) in [
+        (BuiltinClass::Emitter, "channelCount", PubSubNative::ChannelCount),
+        (BuiltinClass::Channel, "emitterCount", PubSubNative::EmitterCount),
+        (BuiltinClass::Channel, "receiverCount", PubSubNative::ReceiverCount),
+        (BuiltinClass::Receiver, "channelCount", PubSubNative::ChannelCount),
+    ] {
+        manifest.register_native(program, instance(class), name, MethodKind::Getter, 0, NativeBuiltin::PubSub(native));
+    }
 
     // Timer is a static-only engine class. All operations return cancellable
     // Promises; trailing Napalm blocks are simply the final closure argument.
@@ -1081,15 +1507,11 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
     // returns a cancellable Napalm Promise<Response>.
     // Reactive is a compiler/runtime service. Keep its entry points internal so
     // reactivity can be detected before execution and the JIT never compiles a
-    // field trace under the wrong tracking policy.
+    // field trace under the wrong tracking policy. Computed properties need no
+    // entry point: their getters are reactive-memoized by the call boundary.
     let reactive = static_(BuiltinId::Reactive);
-    manifest.register_native(program, reactive, "__registerComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveComputed);
     manifest.register_native(program, reactive, "__registerWatcher", MethodKind::Method, 1, NativeBuiltin::ReactiveWatch);
     manifest.register_native(program, reactive, "__unwatch", MethodKind::Method, 1, NativeBuiltin::ReactiveUnwatch);
-    manifest.register_native(program, reactive, "__beginComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveBeginComputed);
-    manifest.register_native(program, reactive, "__finishComputed", MethodKind::Method, 2, NativeBuiltin::ReactiveFinishComputed);
-    manifest.register_native(program, reactive, "__readComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveReadComputed);
-    manifest.register_native(program, reactive, "__abortComputed", MethodKind::Method, 1, NativeBuiltin::ReactiveAbortComputed);
 
     manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 1, NativeBuiltin::FetchCall);
     manifest.register_native(program, static_(BuiltinId::Fetch), "call", MethodKind::Method, 2, NativeBuiltin::FetchCall);
@@ -1296,13 +1718,263 @@ pub fn install_hir_builtins(program: &mut Program) -> BuiltinManifest {
         (BuiltinId::HttpGet, NativeBuiltin::HttpGet, &[1, 2][..]),
         (BuiltinId::HttpGetJson, NativeBuiltin::HttpGetJson, &[1, 2][..]),
         (BuiltinId::HttpPostJson, NativeBuiltin::HttpPostJson, &[2, 3][..]),
-        (BuiltinId::SetTimeout, NativeBuiltin::SetTimeout, &[2][..]),
     ] {
-        for &arity in arities { manifest.register_native(program, static_(id), "call", MethodKind::Method, arity, native); }
+        for &arity in arities {
+            manifest.register_native(program, static_(id), "call", MethodKind::Method, arity, native);
+            manifest.register_native(program, static_(BuiltinId::Http), id.name(), MethodKind::Method, arity, native);
+        }
     }
+    manifest.register_native(program, static_(BuiltinId::SetTimeout), "call", MethodKind::Method, 2, NativeBuiltin::SetTimeout);
     manifest.register(program, static_(BuiltinId::Print), "call", MethodKind::Method, 1, BuiltinPrimitive::SystemPrint);
 
     manifest
+}
+
+/// Head of a List scan loop. The length is snapshotted (elements appended by a
+/// callback are not visited) and the live length is re-checked before every
+/// read, so a callback that shrinks the List ends the scan instead of reading
+/// out of bounds. Both exits jump to `exit` without arguments. Returns the loop
+/// header, the Int32 index and the element; the caller closes the loop with
+/// [`list_scan_advance`].
+fn list_scan_begin(
+    b: &mut Builder<'_>,
+    list: ValueId,
+    len: ValueId,
+    exit: BlockId,
+) -> (BlockId, ValueId, ValueId) {
+    let header = b.new_block(&[]);
+    let index = b.add_block_param(header, Type::Int32);
+    let live = b.new_block(&[]);
+    let body = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(header, vec![zero]);
+    b.position_at(header);
+    let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: len }, Type::Bool);
+    b.branch(more, live, vec![], exit, vec![]);
+    b.position_at(live);
+    let current = b.emit1(Inst::ListLen { list }, Type::Int32);
+    let inside = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: current }, Type::Bool);
+    b.branch(inside, body, vec![], exit, vec![]);
+    b.position_at(body);
+    let item = b.emit1(Inst::ListGet { list, index }, Type::Top);
+    (header, index, item)
+}
+
+fn list_scan_advance(b: &mut Builder<'_>, header: BlockId, index: ValueId) {
+    let one = b.const_i32(1);
+    let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+    b.jump(header, vec![next]);
+}
+
+fn int32_min(b: &mut Builder<'_>, left: ValueId, right: ValueId) -> ValueId {
+    let pick_left = b.new_block(&[]);
+    let pick_right = b.new_block(&[]);
+    let join = b.new_block(&[]);
+    let result = b.add_block_param(join, Type::Int32);
+    let less = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left, right }, Type::Bool);
+    b.branch(less, pick_left, vec![], pick_right, vec![]);
+    b.position_at(pick_left);
+    b.jump(join, vec![left]);
+    b.position_at(pick_right);
+    b.jump(join, vec![right]);
+    b.position_at(join);
+    result
+}
+
+/// indexOf/lastIndexOf/includes (`==` dispatch, like `remove`) and the
+/// callback scans forEach/find/findIndex/some/every. Like map/filter, the
+/// callbacks receive only the element.
+fn install_list_search_functions(
+    program: &mut Program,
+    manifest: &mut BuiltinManifest,
+    module: ModuleId,
+    call1: MethodSymbol,
+    equals: MethodSymbol,
+) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Scan { IndexOf, Includes, ForEach, Find, FindIndex, Some, Every }
+    for (name, scan, ret) in [
+        ("indexOf", Scan::IndexOf, Type::Num),
+        ("includes", Scan::Includes, Type::Bool),
+        ("forEach", Scan::ForEach, Type::Null),
+        ("find", Scan::Find, Type::Top),
+        ("findIndex", Scan::FindIndex, Type::Num),
+        ("some", Scan::Some, Type::Bool),
+        ("every", Scan::Every, Type::Bool),
+    ] {
+        let method = program.intern_method(name, MethodKind::Method, 1);
+        let mut b = Builder::new(program, module, &format!("List.{name}"), FunctionKind::Method,
+            vec![Type::List(None), Type::Top], ret);
+        let list = b.param(0);
+        let operand = b.param(1);
+        let len = b.emit1(Inst::ListLen { list }, Type::Int32);
+        let exhausted = b.new_block(&[]);
+        let (header, index, item) = list_scan_begin(&mut b, list, len, exhausted);
+        let test = match scan {
+            Scan::IndexOf | Scan::Includes => b.invoke(item, equals, vec![operand]),
+            _ => b.invoke(operand, call1, vec![item]),
+        };
+        if scan == Scan::ForEach {
+            list_scan_advance(&mut b, header, index);
+        } else {
+            let hit = b.new_block(&[]);
+            let miss = b.new_block(&[]);
+            if scan == Scan::Every {
+                // `every` stops on the first falsy result.
+                b.branch(test, miss, vec![], hit, vec![]);
+            } else {
+                b.branch(test, hit, vec![], miss, vec![]);
+            }
+            b.position_at(miss);
+            list_scan_advance(&mut b, header, index);
+            b.position_at(hit);
+            let found = match scan {
+                Scan::IndexOf | Scan::FindIndex => b.emit1(Inst::Int32ToNum { value: index }, Type::Num),
+                Scan::Includes | Scan::Some => b.const_bool(true),
+                Scan::Every => b.const_bool(false),
+                Scan::Find => item,
+                Scan::ForEach => unreachable!(),
+            };
+            b.ret(found);
+        }
+        b.position_at(exhausted);
+        let missing = match scan {
+            Scan::IndexOf | Scan::FindIndex => b.const_num(-1.0),
+            Scan::Includes | Scan::Some => b.const_bool(false),
+            Scan::Every => b.const_bool(true),
+            Scan::Find | Scan::ForEach => b.const_null(),
+        };
+        b.ret(missing);
+        manifest.list_functions.push((method, b.finish()));
+    }
+}
+
+/// `sort(compare)`: a stable bottom-up merge sort written in WIR, so the
+/// comparator runs with ordinary Napalm call semantics. Runs are merged into
+/// private scratch Lists; the result is written back to the receiver at the
+/// end (as far as the receiver still reaches) and the receiver is returned.
+fn install_list_sort_function(
+    program: &mut Program,
+    manifest: &mut BuiltinManifest,
+    module: ModuleId,
+    call2: MethodSymbol,
+) {
+    manifest.register(program, BuiltinTarget::Instance(BuiltinClass::List), "__sortAfter",
+        MethodKind::Method, 1, BuiltinPrimitive::ListSortAfter);
+    let sort_after = manifest.bindings.last().unwrap().primitive;
+    let method = program.intern_method("sort", MethodKind::Method, 1);
+    let mut b = Builder::new(program, module, "List.sort", FunctionKind::Method,
+        vec![Type::List(None), Type::Top], Type::List(None));
+    let source = b.param(0);
+    let compare = b.param(1);
+    let n = b.emit1(Inst::ListLen { list: source }, Type::Int32);
+    let one = b.const_i32(1);
+
+    // Private copy: the comparator cannot observe or disturb the scratch Lists.
+    let copy = b.emit1(Inst::AllocList { capacity: Some(n) }, Type::List(None));
+    let copied = b.new_block(&[]);
+    let (copy_header, copy_index, copy_item) = list_scan_begin(&mut b, source, n, copied);
+    b.emit0(Inst::ListAppend { list: copy, value: copy_item });
+    list_scan_advance(&mut b, copy_header, copy_index);
+
+    let outer = b.new_block(&[]);
+    let src = b.add_block_param(outer, Type::List(None));
+    let width = b.add_block_param(outer, Type::Int32);
+    let pass = b.new_block(&[]);
+    let write_back = b.new_block(&[]);
+    let sorted = b.add_block_param(write_back, Type::List(None));
+    b.position_at(copied);
+    b.jump(outer, vec![copy, one]);
+
+    b.position_at(outer);
+    let more_passes = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: width, right: n }, Type::Bool);
+    b.branch(more_passes, pass, vec![], write_back, vec![src]);
+
+    // One pass merges adjacent runs of `width` elements from src into tmp.
+    b.position_at(pass);
+    let tmp = b.emit1(Inst::AllocList { capacity: Some(n) }, Type::List(None));
+    let run_header = b.new_block(&[]);
+    let run = b.add_block_param(run_header, Type::Int32);
+    let run_start = b.new_block(&[]);
+    let pass_end = b.new_block(&[]);
+    let zero = b.const_i32(0);
+    b.jump(run_header, vec![zero]);
+    b.position_at(run_header);
+    let more_runs = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: run, right: n }, Type::Bool);
+    b.branch(more_runs, run_start, vec![], pass_end, vec![]);
+
+    b.position_at(run_start);
+    let mid_raw = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: run, right: width }, Type::Int32);
+    let mid = int32_min(&mut b, mid_raw, n);
+    let hi_raw = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: mid, right: width }, Type::Int32);
+    let hi = int32_min(&mut b, hi_raw, n);
+    let merge = b.new_block(&[]);
+    let left = b.add_block_param(merge, Type::Int32);
+    let right = b.add_block_param(merge, Type::Int32);
+    let check_right = b.new_block(&[]);
+    let compare_block = b.new_block(&[]);
+    let take_right = b.new_block(&[]);
+    let take_left = b.new_block(&[]);
+    let drain_left = b.new_block(&[]);
+    let drain_left_index = b.add_block_param(drain_left, Type::Int32);
+    let drain_left_body = b.new_block(&[]);
+    let drain_right = b.new_block(&[]);
+    let drain_right_index = b.add_block_param(drain_right, Type::Int32);
+    let drain_right_body = b.new_block(&[]);
+    let run_next = b.new_block(&[]);
+    b.jump(merge, vec![run, mid]);
+
+    b.position_at(merge);
+    let left_more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left, right: mid }, Type::Bool);
+    b.branch(left_more, check_right, vec![], drain_right, vec![right]);
+    b.position_at(check_right);
+    let right_more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: right, right: hi }, Type::Bool);
+    b.branch(right_more, compare_block, vec![], drain_left, vec![left]);
+    b.position_at(compare_block);
+    let a = b.emit1(Inst::ListGet { list: src, index: left }, Type::Top);
+    let c = b.emit1(Inst::ListGet { list: src, index: right }, Type::Top);
+    let order = b.invoke(compare, call2, vec![a, c]);
+    let after = b.emit1(Inst::CallPrimitive { primitive: sort_after, args: vec![src, order] }, Type::Bool);
+    b.branch(after, take_right, vec![], take_left, vec![]);
+    b.position_at(take_right);
+    b.emit0(Inst::ListAppend { list: tmp, value: c });
+    let right_next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: right, right: one }, Type::Int32);
+    b.jump(merge, vec![left, right_next]);
+    b.position_at(take_left);
+    b.emit0(Inst::ListAppend { list: tmp, value: a });
+    let left_next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left, right: one }, Type::Int32);
+    b.jump(merge, vec![left_next, right]);
+
+    for (header, index, body, bound) in [
+        (drain_left, drain_left_index, drain_left_body, mid),
+        (drain_right, drain_right_index, drain_right_body, hi),
+    ] {
+        b.position_at(header);
+        let more = b.emit1(Inst::CmpInt { kind: CmpKind::Lt, left: index, right: bound }, Type::Bool);
+        b.branch(more, body, vec![], run_next, vec![]);
+        b.position_at(body);
+        let item = b.emit1(Inst::ListGet { list: src, index }, Type::Top);
+        b.emit0(Inst::ListAppend { list: tmp, value: item });
+        let next = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: index, right: one }, Type::Int32);
+        b.jump(header, vec![next]);
+    }
+    b.position_at(run_next);
+    b.jump(run_header, vec![hi]);
+
+    b.position_at(pass_end);
+    let doubled = b.emit1(Inst::IntBin { op: IntBinOp::Add, left: width, right: width }, Type::Int32);
+    b.jump(outer, vec![tmp, doubled]);
+
+    // Write back (bounded by the receiver's live length) and return it.
+    b.position_at(write_back);
+    let done = b.new_block(&[]);
+    let (write_header, write_index, _) = list_scan_begin(&mut b, source, n, done);
+    let value = b.emit1(Inst::ListGet { list: sorted, index: write_index }, Type::Top);
+    b.emit0(Inst::ListSet { list: source, index: write_index, value });
+    list_scan_advance(&mut b, write_header, write_index);
+    b.position_at(done);
+    b.ret(source);
+    manifest.list_functions.push((method, b.finish()));
 }
 
 /// Native decorators (`@memoize`, `@debounce(100)`, ...). Applying one returns a
@@ -1515,6 +2187,12 @@ impl Host for BuiltinHost {
             (Some(ListCount), "length", 0) => Some(TraceListMethod::Length),
             (Some(ListSubscript), "[]", 1) => Some(TraceListMethod::Subscript),
             (Some(ListSubscriptSet), "[]=", 2) => Some(TraceListMethod::SubscriptSet),
+            (Some(ListPush), "push", 1) => Some(TraceListMethod::Push),
+            (Some(ListAdd), "add", 1) => Some(TraceListMethod::Add),
+            (Some(ListIterate), "iterate", 1) => Some(TraceListMethod::Iterate),
+            // For an in-range integral iterator this is exactly `list[i]`; any
+            // other iterator fails the Subscript guards and replays the Invoke.
+            (Some(ListIteratorValue), "iteratorValue", 1) => Some(TraceListMethod::Subscript),
             _ => None,
         }
     }
@@ -2415,6 +3093,34 @@ fn execute_primitive(
         NumInfinity => Ok(Value::from_num(f64::INFINITY)),
         NumNan => Ok(Value::from_num(f64::NAN)),
 
+        StringUtf8Length => {
+            let text = context.string_bytes(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not String"))?;
+            Ok(Value::from_num(text.len() as f64))
+        }
+        StringUtf16Length => {
+            let text = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            Ok(Value::from_num(text.encode_utf16().count() as f64))
+        }
+        StringCodePointAt => {
+            let index = integer(argument(args, 0)?, "code point index")?;
+            // One-byte code points (the common ASCII case): O(1) instead of
+            // counting and walking the whole text on every call.
+            if let Some(code) = context.string_code_point_fast(this, index) {
+                return Ok(code);
+            }
+            let text = context.string_utf8(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
+            let length = string_char_len(text) as i64;
+            let index = if index < 0 { length.saturating_add(index) } else { index };
+            Ok(if index >= 0 && index < length {
+                Value::from_num(text.chars().nth(index as usize)
+                    .expect("validated code point index") as u32 as f64)
+            } else {
+                Value::NULL
+            })
+        }
         StringCount => {
             let text = context.string_utf8(this)
                 .ok_or_else(|| RuntimeError::new("receiver is not a valid UTF-8 String"))?;
@@ -2437,19 +3143,18 @@ fn execute_primitive(
         }
         StringEq | StringNe => {
             let rhs = argument(args, 0)?;
-            let equal = context.string_bytes(this).zip(context.string_bytes(rhs)).is_some_and(|(a,b)| a == b);
+            let equal = context.strings_equal(this, rhs).unwrap_or(false);
             Ok(Value::from_bool(if matches!(op, StringEq) { equal } else { !equal }))
         }
         StringSubscript => {
             let raw = integer(argument(args, 0)?, "index")?;
             // ASCII receivers index bytes directly, and one-character ASCII
             // results reuse the VM's shared Strings instead of allocating.
-            let ascii = context.string_utf8(this)
-                .filter(|text| text.is_ascii())
-                .map(|text| {
-                    let len = text.len() as i64;
+            let ascii = context.ascii_string_bytes(this)
+                .map(|bytes| {
+                    let len = bytes.len() as i64;
                     let index = if raw < 0 { len + raw } else { raw };
-                    (0..len).contains(&index).then(|| text.as_bytes()[index as usize])
+                    (0..len).contains(&index).then(|| bytes[index as usize])
                 });
             if let Some(byte) = ascii {
                 return Ok(match byte {
@@ -2701,6 +3406,17 @@ fn execute_primitive(
             };
             Ok(context.allocate_string(output))
         }
+        StringHashCode => {
+            // Java-compatible and deterministic across runs (the internal content
+            // hash is process-seeded): h = 31*h + c over UTF-16 code units,
+            // wrapping as a signed 32-bit integer. Invalid UTF-8 hashes as its
+            // lossy (U+FFFD) decoding.
+            let bytes = context.string_bytes(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not String"))?;
+            let hash = String::from_utf8_lossy(bytes).encode_utf16()
+                .fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(unit as i32));
+            Ok(Value::from_num(hash as f64))
+        }
         StringToUpperCase | StringToLowerCase => {
             let output = {
                 let text = context.string_utf8(this)
@@ -2740,6 +3456,26 @@ fn execute_primitive(
         }
 
         ListCount => Ok(Value::from_num(context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))? as f64)),
+        ListJoinStrings => {
+            let len = context.list_len(this)
+                .ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            let separator = context.string_utf8(argument(args, 0)?)
+                .ok_or_else(|| RuntimeError::new("join separator toString() must return a valid UTF-8 String"))?;
+            let mut byte_len = separator.len().checked_mul(len.saturating_sub(1));
+            for index in 0..len {
+                let item = context.list_get(this, index).unwrap();
+                let text = context.string_utf8(item)
+                    .ok_or_else(|| RuntimeError::new("join element toString() must return a valid UTF-8 String"))?;
+                byte_len = byte_len.and_then(|size| size.checked_add(text.len()));
+            }
+            let mut output = string_buffer(byte_len)?;
+            for index in 0..len {
+                if index != 0 { output.push_str(separator); }
+                let item = context.list_get(this, index).unwrap();
+                output.push_str(context.string_utf8(item).unwrap());
+            }
+            Ok(context.allocate_string(output))
+        }
         ListConcat => {
             let rhs = argument(args, 0)?;
             let left_len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
@@ -2808,6 +3544,56 @@ fn execute_primitive(
             context.list_remove_at(this, index)
         }
         ListClear => { context.list_clear(this)?; Ok(Value::NULL) }
+        ListSlice => {
+            let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            let start = if args.len() > 1 {
+                string_relative_index(integer(argument(args, 0)?, "slice start")?, len)
+            } else {
+                0
+            };
+            let end = if args.len() > 2 {
+                string_relative_index(integer(argument(args, 1)?, "slice end")?, len)
+            } else {
+                len
+            };
+            let values = context.list_values(this, start..end.max(start))
+                .ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            Ok(context.allocate_list(values))
+        }
+        ListReverse => {
+            context.list_reorder(this, |items| items.reverse())?;
+            Ok(this)
+        }
+        ListSortNatural => {
+            let len = context.list_len(this).ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            let mut values = context.list_values(this, 0..len)
+                .ok_or_else(|| RuntimeError::new("receiver is not List"))?;
+            if values.iter().all(|value| value.is_num()) {
+                // total_cmp orders -0 before +0 and puts NaN last, so the
+                // result is deterministic for every Number input.
+                values.sort_by(|a, b| a.as_num().unwrap().total_cmp(&b.as_num().unwrap()));
+            } else if values.iter().all(|value| context.string_utf8(*value).is_some()) {
+                values.sort_by(|a, b| {
+                    context.string_utf8(*a).unwrap().cmp(context.string_utf8(*b).unwrap())
+                });
+            } else {
+                return Err(RuntimeError::new(
+                    "sort() without a comparator requires all Numbers or all Strings; pass sort((a, b) => ...)",
+                ));
+            }
+            context.list_reorder(this, |items| {
+                if items.len() == values.len() { items.copy_from_slice(&values); }
+            })?;
+            Ok(this)
+        }
+        ListSortAfter => {
+            // Comparator protocol of sort(compare): a positive Number places
+            // `a` after `b`; zero, negative and NaN keep the original order.
+            let order = argument(args, 0)?;
+            let order = order.as_num()
+                .ok_or_else(|| RuntimeError::new("sort comparator must return a Number"))?;
+            Ok(Value::from_bool(order > 0.0))
+        }
         ListSubscript | MapSubscript => {
             let (container, subscript) = nested_subscript_target(context, this, &args[1..])?;
             if context.map_len(container).is_some() {

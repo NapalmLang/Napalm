@@ -1,0 +1,623 @@
+// Cross-module source graph and symbol resolution for Napalm LSP.
+// The index is implemented in Napalm, independently of the engine frontend.
+// Editor buffers always take precedence over disk. Graph construction is bounded.
+import {tokenize} from "./lexer";
+import {parseLexed} from "./parser";
+import {analyze, symbolAt} from "./semantic";
+
+const MAX_MODULES = 512;
+const MAX_MODULE_SOURCE_BYTES = 4 * 1024 * 1024;
+const MAX_EXPORT_DEPTH = 128;
+const MAX_MODULE_DIAGNOSTICS = 100;
+
+function isWindowsPath(path) {
+    return path.startsWith("\\\\") || (path.length > 1 && path[1] === ":");
+}
+
+function keyForPath(path) {
+    const normalized = Path.normalize(path);
+    return isWindowsPath(normalized) ? normalized.toLowerCase() : normalized;
+}
+
+function pathFromUri(uri) {
+    if (typeof uri !== "String" || !uri.startsWith("file:")) return null;
+    try { return Path.normalize(Uri.toFilePath(uri)); }
+    catch (error) { return null; }
+}
+
+function displayUri(path) {
+    try { return Uri.fromFilePath(path); }
+    catch (error) { return null; }
+}
+
+function hexDigit(c) {
+    const v = c.codePointAt(0);
+    if (v >= 48 && v <= 57) return v - 48;
+    if (v >= 65 && v <= 70) return v - 55;
+    if (v >= 97 && v <= 102) return v - 87;
+    return -1;
+}
+
+function decodeStringToken(raw) {
+    if (typeof raw !== "String" || raw.length < 2) return null;
+    const quote = raw[0];
+    if ((quote !== "'" && quote !== '"') || raw[raw.length - 1] !== quote) return null;
+    let result = "";
+    let index = 1;
+    const end = raw.length - 1;
+    while (index < end) {
+        const ch = raw[index];
+        if (ch !== "\\") { result += ch; index++; continue; }
+        index++;
+        if (index >= end) return null;
+        const escaped = raw[index];
+        index++;
+        if (escaped === "n") result += "\n";
+        else if (escaped === "r") result += "\r";
+        else if (escaped === "t") result += "\t";
+        else if (escaped === "b") result += "\b";
+        else if (escaped === "f") result += "\f";
+        else if (escaped === "v") result += "\v";
+        else if (escaped === "0") result += "\0";
+        else if (escaped === "\n") { }
+        else if (escaped === "\r") { if (index < end && raw[index] === "\n") index++; }
+        else if (escaped === "x" || escaped === "u") {
+            let count = escaped === "x" ? 2 : 4;
+            let braced = false;
+            if (escaped === "u" && index < end && raw[index] === "{") {
+                index++;
+                count = 0;
+                braced = true;
+            }
+            let codepoint = 0;
+            while (index < end) {
+                if (braced && raw[index] === "}") break;
+                if (!braced && count === 0) break;
+                const digit = hexDigit(raw[index]);
+                if (digit < 0) return null;
+                if (codepoint > 0x10ffff) return null;
+                codepoint = codepoint * 16 + digit;
+                index++;
+                if (!braced) count--;
+                else count++;
+                if (braced && count > 6) return null;
+            }
+            if (braced) {
+                if (index >= end || raw[index] !== "}" || count === 0) return null;
+                index++;
+            } else if (count !== 0) return null;
+            if (codepoint > 0x10ffff || (codepoint >= 0xd800 && codepoint <= 0xdfff)) return null;
+            result += String.fromCodePoint(codepoint);
+        } else result += escaped;
+    }
+    return result;
+}
+
+function diagnostic(node, code, message) {
+    return {range: node.range, severity: 1, code: code, message: message,
+        startByte: node.startByte, endByte: node.endByte};
+}
+
+function addDiagnostic(record, node, code, message) {
+    if (record.moduleDiagnostics.length < MAX_MODULE_DIAGNOSTICS) {
+        record.moduleDiagnostics.push(diagnostic(node, code, message));
+    }
+}
+
+function addNames(pattern, visit) {
+    if (pattern === null) return;
+    if (pattern.kind === "Identifier") { visit(pattern); return; }
+    if (pattern.kind === "AssignmentPattern") { addNames(pattern.left, visit); return; }
+    if (pattern.kind === "RestPattern") { addNames(pattern.argument, visit); return; }
+    if (pattern.kind === "ArrayPattern") {
+        for (const part of pattern.elements) addNames(part, visit);
+    } else if (pattern.kind === "ObjectPattern") {
+        for (const part of pattern.properties) {
+            if (part.kind === "PatternProperty") addNames(part.value, visit);
+            else addNames(part, visit);
+        }
+    }
+}
+
+function declarations(node, visit) {
+    if (node === null) return;
+    if (node.kind === "ExportDeclaration" || node.kind === "DeclareStatement" ||
+        node.kind === "DecoratedDeclaration" || node.kind === "ExportDefaultDeclaration") {
+        declarations(node.declaration, visit);
+        return;
+    }
+    if (node.kind === "VariableDeclaration") {
+        for (const item of node.declarations) addNames(item.id, (id) => visit(id, "value"));
+        return;
+    }
+    if (node.kind === "FunctionDeclaration") {
+        if (node.id !== null) visit(node.id, "value");
+    } else if (node.kind === "TypeAliasDeclaration" || node.kind === "InterfaceDeclaration") {
+        if (node.id !== null) visit(node.id, "type");
+    } else if (node.kind === "ClassDeclaration" || node.kind === "EnumDeclaration") {
+        if (node.id !== null) {
+            visit(node.id, "value");
+            visit(node.id, "type");
+        }
+    } else if (node.kind === "ImportDeclaration") {
+        for (const spec of node.specifiers) {
+            if (node.typeOnly) visit(spec.local, "type");
+            else {
+                visit(spec.local, "value");
+                visit(spec.local, "type");
+            }
+        }
+    }
+}
+
+function getSymbol(record, id) {
+    if (id === null) return null;
+    const symbol = record.symbolBySpan.get(id.startByte + ":" + id.endByte);
+    return symbol === null || symbol.name !== id.name ? null : symbol;
+}
+
+function putLocal(record, name, domain, id) {
+    if (id === null || id.kind !== "Identifier") return;
+    const symbol = getSymbol(record, id);
+    if (symbol !== null) record.locals.set(domain + ":" + name, symbol);
+}
+
+function localSymbol(record, name, domain) {
+    return record.locals.get(domain + ":" + name);
+}
+
+function localLocation(record, symbol) {
+    if (symbol === null) return null;
+    return {uri: record.uri, range: symbol.declaration.range,
+        identity: record.key + ":" + symbol.declaration.startByte + ":" + symbol.declaration.endByte};
+}
+
+function exportKey(name, domain) { return domain + ":" + name; }
+
+function addExport(record, name, domain, entry, node) {
+    const key = exportKey(name, domain);
+    if (record.exports.has(key)) {
+        addDiagnostic(record, node, "NAPALM-MOD-004", "Duplicate export '" + name + "'");
+    } else record.exports.set(key, entry);
+}
+
+function exposeNamed(record, node, domain, alias, id) {
+    addExport(record, alias, domain,
+        {kind: "local", local: id.name, node: node}, node);
+}
+
+function collectExports(record, statement) {
+    if (statement.kind === "ExportDeclaration") {
+        declarations(statement.declaration, (id, domain) => {
+            if (statement.typeOnly && domain !== "type") return;
+            exposeNamed(record, id, domain, id.name, id);
+        });
+    } else if (statement.kind === "ExportDefaultDeclaration") {
+        const decl = statement.declaration;
+        if (decl === null) return;
+        const id = decl.id;
+        if (id !== null && id.kind === "Identifier") {
+            addExport(record, "default", "value", {kind: "local", local: id.name, node: id}, id);
+        } else {
+            addExport(record, "default", "value",
+                {kind: "expression", node: decl}, decl);
+        }
+    } else if (statement.kind === "ExportNamedDeclaration") {
+        for (const spec of statement.specifiers) {
+            const domain = statement.typeOnly ? "type" : "value";
+            const entry = statement.source === null ?
+                {kind: "local", local: spec.local.name, node: spec.exported} :
+                {kind: "forward", source: statement.source, imported: spec.local.name,
+                    node: spec.exported};
+            addExport(record, spec.exported.name, domain, entry, spec.exported);
+            // Ordinary named exports may also expose a type (interfaces, classes).
+            if (!statement.typeOnly) {
+                const typeEntry = statement.source === null ?
+                    {kind: "local", local: spec.local.name, node: spec.exported} :
+                    {kind: "forward", source: statement.source, imported: spec.local.name,
+                        node: spec.exported};
+                addExport(record, spec.exported.name, "type", typeEntry, spec.exported);
+            }
+        }
+    }
+}
+
+function sourceImports(record) {
+    const imports = [];
+    for (const statement of record.ast.body) {
+        if (statement.kind === "ImportDeclaration") imports.push(statement);
+        else if (statement.kind === "ExportNamedDeclaration" && statement.source !== null) imports.push(statement);
+    }
+    return imports;
+}
+
+function isWithinRoot(root, path) {
+    const relative = Path.relative(root, path);
+    return relative === "." || relative === "" ||
+        (relative !== ".." && !relative.startsWith("../") &&
+         !relative.startsWith("..\\") && !Path.isAbsolute(relative));
+}
+
+function environmentRoots(name, base) {
+    const raw = Process.getenv(name);
+    if (typeof raw !== "String" || raw.length === 0) return [];
+    const separator = isWindowsPath(base) ? ";" : ":";
+    const result = [];
+    for (const item of raw.split(separator)) {
+        if (item.length > 0) result.push(item);
+    }
+    return result;
+}
+
+class ModuleIndexer {
+    constructor(documents, roots, previous, dirtyPaths) {
+        this.previous = previous;
+        this.dirty = new Set();
+        this.stats = {parsed: 0, reused: 0};
+        if (dirtyPaths !== null) for (const path of dirtyPaths) {
+            if (typeof path === "String" && path.length > 0) this.dirty.add(keyForPath(path));
+        }
+        this.modules = new Map();
+        this.openPaths = new Map();
+        this.roots = roots;
+        this.order = [];
+        this.total = 0;
+        for (const uri of documents.keys()) {
+            const path = pathFromUri(uri);
+            if (path !== null) this.openPaths.set(keyForPath(path), documents.get(uri));
+        }
+    }
+
+    exists(path) {
+        if (this.openPaths.has(keyForPath(path))) return true;
+        try { return Fs.exists(path); }
+        catch (error) { return false; }
+    }
+
+    projectRoot(importingPath) {
+        for (const root of this.roots) if (isWithinRoot(root, importingPath)) return root;
+        let parent = Path.dirname(importingPath);
+        const fallback = parent;
+        for (let i = 0; i < 32; i++) {
+            if (this.exists(Path.join(parent, ".git")) ||
+                this.exists(Path.join(parent, "napalm.toml")) ||
+                this.exists(Path.join(parent, "Napalm.toml")) ||
+                this.exists(Path.join(parent, ".napalm"))) return parent;
+            const above = Path.dirname(parent);
+            if (above === parent) break;
+            parent = above;
+        }
+        return fallback;
+    }
+
+    candidate(path, packageRoot) {
+        const basename = Path.basename(path);
+        if (!path.endsWith(".napalm") && basename.indexOf(".") >= 0) return null;
+        const options = path.endsWith(".napalm") ? [path] :
+            [path + ".napalm", Path.join(path, "index.napalm")];
+        for (const candidate of options) {
+            if (!this.exists(candidate)) continue;
+            if (packageRoot !== null) {
+                try {
+                    if (!isWithinRoot(packageRoot, candidate)) continue;
+                    // Check actual targets as well, so a symlink cannot escape a package root.
+                    if (Fs.exists(packageRoot) && Fs.exists(candidate)) {
+                        const realRoot = Fs.realPath(packageRoot);
+                        const realCandidate = Fs.realPath(candidate);
+                        if (!isWithinRoot(realRoot, realCandidate)) continue;
+                    }
+                } catch (error) { continue; }
+            }
+            return Path.normalize(candidate);
+        }
+        return null;
+    }
+
+    resolve(importingPath, raw) {
+        const spec = decodeStringToken(raw);
+        if (spec === null || spec.length === 0 || spec.indexOf("\0") >= 0) return null;
+        if (spec.startsWith("@lib/") || spec.startsWith("@std/")) {
+            const library = spec.startsWith("@lib/");
+            const tail = spec.slice(5);
+            for (const component of tail.replaceAll("\\", "/").split("/")) {
+                if (component === ".." || component.length === 0) return null;
+            }
+            if (Path.isAbsolute(tail)) return null;
+            const kind = library ? "packages" : "std";
+            const root = this.projectRoot(importingPath);
+            const roots = [Path.join(root, ".napalm", kind)];
+            const envName = library ? "NAPALM_LIB_PATH" : "NAPALM_STD_PATH";
+            for (const item of environmentRoots(envName, importingPath)) roots.push(item);
+            const home = Process.getenv("NAPALM_HOME");
+            if (typeof home === "String" && home.length > 0) roots.push(Path.join(home, kind));
+            for (const packageRoot of roots) {
+                const found = this.candidate(Path.resolve(packageRoot, tail), packageRoot);
+                if (found !== null) return found;
+            }
+            return null;
+        }
+        if (spec.startsWith("@")) return null;
+        if (spec.endsWith("/") || spec.endsWith("\\")) return null;
+        return this.candidate(Path.resolve(Path.dirname(importingPath), spec), null);
+    }
+
+    load(path) {
+        const key = keyForPath(path);
+        const previous = this.modules.get(key);
+        if (previous !== null) return previous;
+        if (this.total >= MAX_MODULES) return null;
+        let source = null;
+        const buffer = this.openPaths.get(key);
+        const uri = buffer === null ? displayUri(path) : buffer.uri;
+        if (uri === null) return null;
+        const cached = this.previous === null ? null : this.previous.modules.get(key);
+        // Closed files can reuse their snapshot until a watched-file notification
+        // invalidates them. Open buffers are always checked against their text.
+        const canReuseDisk = buffer === null && cached !== null && !this.dirty.has(key) &&
+            !this.previous.openPaths.has(key);
+        if (buffer !== null) source = buffer.text;
+        else if (canReuseDisk) source = cached.source;
+        else {
+            try { source = Fs.readText(path); }
+            catch (error) { return null; }
+        }
+        if (typeof source !== "String") return null;
+        if (source.utf8Length > MAX_MODULE_SOURCE_BYTES) return null;
+        const reuse = cached !== null && !this.dirty.has(key) && cached.source === source;
+        const lexical = reuse ? cached.lexical : tokenize(source);
+        const parsed = reuse ? cached.parsed : parseLexed(source, lexical);
+        const semantic = reuse ? cached.semantic : analyze(parsed.ast);
+        if (reuse) this.stats.reused++;
+        else this.stats.parsed++;
+        const record = {key: key, path: path, uri: uri, source: source, ast: parsed.ast,
+            lexical: lexical, parsed: parsed, semantic: semantic, moduleDiagnostics: [],
+            exports: new Map(), imports: [], locals: new Map(), links: new Map(),
+            symbolBySpan: new Map(), extraOccurrences: [], dependencyKeys: new Map(), state: "loading"};
+        this.modules.set(key, record);
+        for (const symbol of semantic.symbols) {
+            record.symbolBySpan.set(symbol.declaration.startByte + ":" + symbol.declaration.endByte, symbol);
+        }
+        this.order.push(record);
+        this.total++;
+        for (const statement of parsed.ast.body) {
+            declarations(statement, (id, domain) => putLocal(record, id.name, domain, id));
+            collectExports(record, statement);
+        }
+        record.imports = sourceImports(record);
+        for (const statement of record.imports) {
+            const dependencyPath = this.resolve(path, statement.source);
+            if (dependencyPath === null) {
+                addDiagnostic(record, statement, "NAPALM-MOD-001",
+                    "Cannot resolve module " + statement.source);
+                continue;
+            }
+            const dependency = this.load(dependencyPath);
+            if (dependency === null) {
+                addDiagnostic(record, statement, "NAPALM-MOD-001",
+                    "Cannot read module " + statement.source);
+            } else record.dependencyKeys.set(statement.source, dependency.key);
+        }
+        record.state = "indexed";
+        return record;
+    }
+
+    findExport(record, name, domain, active, depth) {
+        if (depth > MAX_EXPORT_DEPTH) return null;
+        const marker = record.key + ":" + domain + ":" + name;
+        if (active.has(marker)) return null;
+        active.add(marker);
+        const entry = record.exports.get(exportKey(name, domain));
+        let resolved = null;
+        if (entry !== null) {
+            if (entry.kind === "expression") {
+                resolved = {uri: record.uri, range: entry.node.range,
+                    identity: record.key + ":default:" + entry.node.startByte};
+            } else if (entry.kind === "local") {
+                const local = localSymbol(record, entry.local, domain);
+                if (local !== null && local.kind === "import") {
+                    const link = record.links.get(local.id);
+                    if (link !== null) resolved = link;
+                    else {
+                        // Re-export of an imported binding can form a cycle.
+                        for (const statement of record.imports) {
+                            if (statement.kind !== "ImportDeclaration") continue;
+                            for (const spec of statement.specifiers) {
+                                if (spec.local.name !== entry.local) continue;
+                                const key = record.dependencyKeys.get(statement.source);
+                                const dependency = this.modules.get(key);
+                                if (dependency === null) continue;
+                                const imported = spec.kind === "DefaultImport" ? "default" : spec.imported.name;
+                                resolved = this.findExport(dependency, imported, domain, active, depth + 1);
+                                if (resolved !== null) break;
+                            }
+                        }
+                    }
+                } else if (local !== null) resolved = localLocation(record, local);
+                else if (name === "default" && entry.node !== null) {
+                    // Anonymous and expression-form default declarations have no
+                    // module-scope binding in the semantic symbol table.
+                    resolved = {uri: record.uri, range: entry.node.range,
+                        identity: record.key + ":default:" + entry.node.startByte};
+                }
+            } else if (entry.kind === "forward") {
+                const key = record.dependencyKeys.get(entry.source);
+                const dependency = this.modules.get(key);
+                if (dependency !== null) {
+                    resolved = this.findExport(dependency, entry.imported, domain, active, depth + 1);
+                }
+            }
+        }
+        active.delete(marker);
+        return resolved;
+    }
+
+    linkAll() {
+        for (const record of this.order) {
+            for (const statement of record.imports) {
+                const key = record.dependencyKeys.get(statement.source);
+                const dependency = this.modules.get(key);
+                if (dependency === null) continue;
+                if (statement.kind === "ImportDeclaration") {
+                    for (const spec of statement.specifiers) {
+                        const imported = spec.kind === "DefaultImport" ? "default" : spec.imported.name;
+                        const domain = statement.typeOnly ? "type" : "value";
+                        let destination = this.findExport(dependency, imported, domain, new Set(), 0);
+                        if (destination === null && !statement.typeOnly) {
+                            destination = this.findExport(dependency, imported, "type", new Set(), 0);
+                        }
+                        const local = localSymbol(record, spec.local.name, domain);
+                        if (destination !== null) {
+                            if (local !== null) record.links.set(local.id, destination);
+                            if (spec.kind === "NamedImport" && spec.imported !== spec.local) {
+                                record.extraOccurrences.push({node: spec.imported, location: destination,
+                                    declaration: false});
+                            }
+                        } else if (dependency.lexical.diagnostics.length === 0 &&
+                            dependency.parsed.diagnostics.length === 0) {
+                            addDiagnostic(record, spec, "NAPALM-MOD-002",
+                                "Module does not export '" + imported + "'");
+                        }
+                    }
+                } else {
+                    for (const spec of statement.specifiers) {
+                        const domain = statement.typeOnly ? "type" : "value";
+                        let destination = this.findExport(dependency, spec.local.name, domain, new Set(), 0);
+                        if (destination === null && !statement.typeOnly) {
+                            destination = this.findExport(dependency, spec.local.name, "type", new Set(), 0);
+                        }
+                        if (destination !== null) record.extraOccurrences.push({node: spec.local,
+                            location: destination, declaration: false});
+                        else if (dependency.lexical.diagnostics.length === 0 &&
+                            dependency.parsed.diagnostics.length === 0) {
+                            addDiagnostic(record, spec, "NAPALM-MOD-002",
+                                "Module does not export '" + spec.local.name + "'");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export function buildModuleIndex(documents, roots) {
+    return updateModuleIndex(null, documents, roots, []);
+}
+
+// Reuse immutable lexical, AST, and semantic snapshots for unchanged modules.
+// Module links and diagnostics are always rebuilt, so updates to re-exports,
+// new files, or removed dependencies cannot leave stale cross-module results.
+export function updateModuleIndex(previous, documents, roots, dirtyPaths) {
+    if (previous !== null && previous.roots.join("\n") !== roots.join("\n")) previous = null;
+    const index = new ModuleIndexer(documents, roots, previous, dirtyPaths);
+    for (const uri of documents.keys()) {
+        const path = pathFromUri(uri);
+        if (path !== null) index.load(path);
+    }
+    index.linkAll();
+    // Do not retain the complete previous graph through successive revisions.
+    // Its immutable source snapshots are already shared by the new records.
+    index.previous = null;
+    return index;
+}
+
+export function filePathForUri(uri) {
+    return pathFromUri(uri);
+}
+
+export function moduleIdentityAt(index, uri, position) {
+    const record = recordForUri(index, uri);
+    return record === null ? null : resolvedAt(record, position);
+}
+
+export function recordForUri(index, uri) {
+    const path = pathFromUri(uri);
+    if (path === null) return null;
+    return index.modules.get(keyForPath(path));
+}
+
+export function documentDiagnostics(index, uri) {
+    const record = recordForUri(index, uri);
+    if (record === null) return [];
+    const diagnostics = [];
+    for (const item of record.lexical.diagnostics) diagnostics.push({range: item.range,
+        severity: item.severity, code: item.code, source: "napalm-lexer", message: item.message});
+    for (const item of record.parsed.diagnostics) {
+        let duplicate = false;
+        for (const earlier of record.lexical.diagnostics) {
+            if (earlier.startByte === item.startByte) { duplicate = true; break; }
+        }
+        if (!duplicate) diagnostics.push({range: item.range, severity: item.severity,
+            code: item.code, source: "napalm-parser", message: item.message});
+    }
+    if (record.lexical.diagnostics.length === 0 && record.parsed.diagnostics.length === 0) {
+        for (const item of record.semantic.diagnostics) diagnostics.push({range: item.range,
+            severity: item.severity, code: item.code, source: "napalm-semantic", message: item.message});
+        for (const item of record.moduleDiagnostics) diagnostics.push({range: item.range,
+            severity: item.severity, code: item.code, source: "napalm-modules", message: item.message});
+    }
+    return diagnostics;
+}
+
+function sameLocation(left, right) {
+    return left !== null && right !== null && left.identity === right.identity;
+}
+
+function hit(range, position) {
+    const start = range.start;
+    const end = range.end;
+    const after = position.line > start.line ||
+        (position.line === start.line && position.character >= start.character);
+    const before = position.line < end.line ||
+        (position.line === end.line && position.character < end.character);
+    return after && before;
+}
+
+function occurrenceLocation(record, symbol) {
+    if (symbol === null) return null;
+    const link = record.links.get(symbol.id);
+    return link === null ? localLocation(record, symbol) : link;
+}
+
+function resolvedAt(record, position) {
+    for (const occurrence of record.extraOccurrences) {
+        if (hit(occurrence.node.range, position)) return occurrence.location;
+    }
+    return occurrenceLocation(record, symbolAt(record.semantic, position));
+}
+
+export function moduleDefinitionAt(index, uri, position) {
+    const record = recordForUri(index, uri);
+    if (record === null) return null;
+    const result = resolvedAt(record, position);
+    if (result === null) return null;
+    return {uri: result.uri, range: result.range};
+}
+
+export function moduleReferencesAt(index, uri, position, includeDeclaration) {
+    const record = recordForUri(index, uri);
+    if (record === null) return [];
+    const target = resolvedAt(record, position);
+    if (target === null) return [];
+    const result = [];
+    const seen = new Set();
+    for (const sourceModule of index.order) {
+        for (const occurrence of sourceModule.semantic.occurrences) {
+            if (!sameLocation(target, occurrenceLocation(sourceModule, occurrence.symbol))) continue;
+            if (occurrence.declaration && !includeDeclaration) continue;
+            const key = sourceModule.key + ":" + occurrence.startByte + ":" + occurrence.endByte;
+            if (!seen.has(key)) {
+                seen.add(key);
+                result.push({uri: sourceModule.uri, range: occurrence.range});
+            }
+        }
+        for (const occurrence of sourceModule.extraOccurrences) {
+            if (!sameLocation(target, occurrence.location)) continue;
+            const key = sourceModule.key + ":" + occurrence.node.startByte + ":" + occurrence.node.endByte;
+            if (!seen.has(key)) {
+                seen.add(key);
+                result.push({uri: sourceModule.uri, range: occurrence.node.range});
+            }
+        }
+    }
+    return result;
+}

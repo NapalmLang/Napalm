@@ -10,13 +10,13 @@
 )
 ;; function u0:0(i64 vmctx, i64, i32, i32, i32) tail {
 ;;     region0 = 123 ""
-;;     region1 = 160 ""
+;;     region1 = 25 ""
 ;;     region2 = 7 ""
 ;;     region3 = 215 ""
 ;;     region4 = 105 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
-;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     gv2 = load.i64 notrap aligned region1 gv1+16
 ;;     sig0 = (i64 vmctx) -> i8 tail
 ;;     sig1 = (i64 vmctx, i64, i64, i64) tail
 ;;     fn0 = colocated u805306368:11 sig0
@@ -33,7 +33,7 @@
 ;; @001e                               brif v10, block2, block3(v8)
 ;;
 ;;                                 block2:
-;;                                     v61 = iadd.i64 v6, v7  ; v7 = 1
+;; @001e                               v61 = iadd.i64 v6, v7  ; v7 = 1
 ;; @001e                               store notrap aligned region2 v61, v5
 ;; @001e                               v12 = call fn0(v0)
 ;; @001e                               v14 = load.i64 notrap aligned region2 v5
@@ -57,8 +57,8 @@
 ;; @0025                               v44 = iconst.i64 4
 ;; @0025                               v45 = iadd v43, v44  ; v44 = 4
 ;; @0025                               v49 = iadd v45, v20
-;;                                     v62 = iconst.i64 0
-;;                                     v63 = icmp sge v49, v62  ; v62 = 0
+;; @001e                               v62 = iconst.i64 0
+;; @0025                               v63 = icmp sge v49, v62  ; v62 = 0
 ;; @0025                               brif v63, block4, block5(v49)
 ;;
 ;;                                 block4:

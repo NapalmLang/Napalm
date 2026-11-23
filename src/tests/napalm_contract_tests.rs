@@ -224,7 +224,7 @@ fn napalm_typeof_reports_runtime_kinds_contracts_and_generic_arguments() {
             typeof typedMap, typeof new Map(), typeof {}, typeof named, typeof point,
             typeof new Set(), typeof Named, typeof Point, typeof Animal, typeof new Dog(),
             typeof new Holder<number>(1), typeof new Holder(1), typeof (() => 1),
-            typeof Promise.resolve(1), timerKind, typeof new Date(), typeof emitter, typeof emitter.event,
+            typeof Promise.resolve(1), timerKind, typeof new Date(), typeof emitter, typeof emitter.emit(1),
         ];
     "#, "[Number, Boolean, Null, String, Array<Number>, Array, Map<String, Number>, Map, Object, \
          Object implementation of Named, Object implementation of Point, Set, Interface, Type, Class, \

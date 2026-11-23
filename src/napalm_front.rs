@@ -253,6 +253,7 @@ fn byte_offset_to_char_offset(source: &str, byte_offset: usize) -> usize {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LexErrorKind {
+    UnterminatedMxBlock,
     UnterminatedBlockComment,
     UnterminatedString,
     UnterminatedRawString,
@@ -266,6 +267,8 @@ pub enum LexErrorKind {
 #[derive(Logos, Clone, Copy, Debug, PartialEq, Eq)]
 #[logos(error = LexErrorKind)]
 enum RawTokenKind {
+    #[token("[[[", lex_mx_block)]
+    MxBlock,
     #[regex(r"[ \t\r]+", logos::skip)]
     _Whitespace,
 
@@ -442,6 +445,7 @@ enum RawTokenKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TokenKind {
+    MxBlock,
     Newline,
     As,
     Async,
@@ -522,6 +526,7 @@ impl TokenKind {
     pub const fn description(self) -> &'static str {
         use TokenKind::*;
         match self {
+            MxBlock => "MX block",
             Newline => "newline",
             As => "`as`",
             Async => "`async`",
@@ -665,6 +670,7 @@ fn lex_with_offset(source: &str, base_offset: usize) -> LexOutput {
             }
             Err(error) => {
                 let (code, message) = match error {
+                    LexErrorKind::UnterminatedMxBlock => ("MX-L002", "unterminated MX block; expected `]]]`"),
                     LexErrorKind::UnterminatedBlockComment => {
                         ("NAPALM-L001", "unterminated block comment")
                     }
@@ -705,6 +711,7 @@ fn map_raw_token(raw: RawTokenKind) -> Option<TokenKind> {
     use RawTokenKind as R;
     use TokenKind as T;
     Some(match raw {
+        R::MxBlock => T::MxBlock,
         R::_Whitespace | R::_LineComment | R::BlockComment => return None,
         R::Newline => T::Newline,
         R::As => T::As,
@@ -780,6 +787,16 @@ fn map_raw_token(raw: RawTokenKind) -> Option<TokenKind> {
         R::Greater => T::Greater,
         R::Hash => T::Hash,
     })
+}
+
+fn lex_mx_block(lexer: &mut logos::Lexer<'_, RawTokenKind>) -> Result<(), LexErrorKind> {
+    if let Some(end) = crate::napalm_mx_front::block_end(lexer.remainder()) {
+        lexer.bump(end);
+        Ok(())
+    } else {
+        lexer.bump(lexer.remainder().len());
+        Err(LexErrorKind::UnterminatedMxBlock)
+    }
 }
 
 fn lex_decimal_number(
@@ -908,6 +925,13 @@ fn scan_interpolation_tail(bytes: &[u8], depth: usize) -> Result<usize, LexError
     let mut parens = 1usize;
 
     while index < bytes.len() {
+        if bytes[index..].starts_with(b"[[[") {
+            let body = std::str::from_utf8(&bytes[index + 3..])
+                .map_err(|_| LexErrorKind::UnterminatedMxBlock)?;
+            index += 3 + crate::napalm_mx_front::block_end(body)
+                .ok_or(LexErrorKind::UnterminatedMxBlock)?;
+            continue;
+        }
         if index + 2 < bytes.len()
             && bytes[index] == b'"'
             && bytes[index + 1] == b'"'
@@ -1148,6 +1172,21 @@ pub struct ImportBinding {
 /// forwarding their arguments to the superclass constructor.
 pub const INHERITED_FIELD_INITIALIZER: &str = "<fields>";
 
+/// Name prefix of the synthetic parameter behind a defaulted `x = value`
+/// parameter. An omitted argument arrives as `null`, which selects the
+/// default; methods also answer every arity that only omits such trailing
+/// parameters.
+pub const DEFAULT_PARAMETER_PREFIX: &str = "<default:";
+
+/// Number of leading parameters a caller must pass: everything up to the
+/// last parameter without a default.
+pub fn required_parameter_count(params: &[Ident]) -> usize {
+    params
+        .iter()
+        .rposition(|param| !param.value.starts_with(DEFAULT_PARAMETER_PREFIX))
+        .map_or(0, |index| index + 1)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassDecl {
     pub name: Ident,
@@ -1341,6 +1380,8 @@ impl Expr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExprKind {
+    /// Database-language island, parsed independently from Napalm expressions.
+    Mx(Box<crate::napalm_mx_front::Block>),
     Null,
     Bool(bool),
     Number(f64),
@@ -1415,6 +1456,14 @@ pub enum ExprKind {
     },
     /// NapalmJIT extension: suspend the current async execution until a Promise settles.
     Await(Box<Expr>),
+    /// Suspend a synchronous generator. Delegation is expanded by the surface
+    /// parser into a closure that returns the same [completion, value] packet.
+    GeneratorYield {
+        value: Box<Expr>,
+        delegated: bool,
+        yield_type: Option<TypeAnnotation>,
+        next_type: Option<TypeAnnotation>,
+    },
     /// `typeof value`: a String naming the runtime kind of the value (or
     /// "Interface"/"Type" for a bare contract name).
     TypeOf(Box<Expr>),
@@ -1541,6 +1590,7 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
             ExprKind::TypedCollection { expression: inner, .. }
             | ExprKind::Grouped(inner)
             | ExprKind::Unary { operand: inner, .. }
+            | ExprKind::GeneratorYield { value: inner, .. }
             | ExprKind::Await(inner)
             | ExprKind::TypeOf(inner)
             | ExprKind::Launch(inner)
@@ -1603,7 +1653,7 @@ pub fn module_imports(module: &ModuleAst) -> Vec<&ImportDecl> {
                 }
             }
             ExprKind::Closure(body) | ExprKind::AsyncClosure(body) | ExprKind::ConcurrentClosure(body) => visit_body(body, out),
-            ExprKind::Null
+            ExprKind::Mx(_) | ExprKind::Null
             | ExprKind::Bool(_)
             | ExprKind::Number(_)
             | ExprKind::String(_)
@@ -3036,6 +3086,12 @@ impl<'a> Parser<'a> {
     fn parse_prefix(&mut self) -> PResult<Expr> {
         let token = self.advance();
         match token.kind {
+            TokenKind::MxBlock => {
+                match crate::napalm_mx_front::parse(&self.slice(token.span)[3..token.span.len() - 3], token.span.start + 3) {
+                    Ok(block) => Ok(Expr::new(ExprKind::Mx(Box::new(block)), token.span)),
+                    Err(diagnostic) => { self.diagnostics.push(diagnostic); Err(()) }
+                }
+            }
             TokenKind::Null => Ok(Expr::new(ExprKind::Null, token.span)),
             TokenKind::True => Ok(Expr::new(ExprKind::Bool(true), token.span)),
             TokenKind::False => Ok(Expr::new(ExprKind::Bool(false), token.span)),

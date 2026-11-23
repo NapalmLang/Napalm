@@ -8,7 +8,7 @@
 ;;       pushq   %rbp
 ;;       movq    %rsp, %rbp
 ;;       movq    8(%rdi), %r11
-;;       movq    0x18(%r11), %r11
+;;       movq    0x10(%r11), %r11
 ;;       addq    $0x10, %r11
 ;;       cmpq    %rsp, %r11
 ;;       ja      0x5d
@@ -23,7 +23,7 @@
 ;;       cmpq    %rcx, %rdx
 ;;       jb      0x54
 ;;   47: movq    %r14, %rdi
-;;       callq   0x14a
+;;       callq   0x155
 ;;       movq    8(%rsp), %r14
 ;;       addq    $0x10, %rsp
 ;;       popq    %rbp

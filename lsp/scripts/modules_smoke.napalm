@@ -1,0 +1,57 @@
+// Run from the repository root: napalm lsp/scripts/modules_smoke.napalm
+import {createDocumentStore, openDocument, changeDocument} from "../src/documents";
+import {buildModuleIndex, moduleDefinitionAt, moduleReferencesAt, documentDiagnostics} from "../src/module_index";
+
+function check(condition, message) {
+    if (!condition) throw "module index smoke: " + message;
+}
+
+const root = Path.join(Process.cwd(), "lsp", "tests", "fixtures", "intermodule");
+const entryPath = Path.join(root, "entry.napalm");
+const basePath = Path.join(root, "base.napalm");
+const entryUri = Uri.fromFilePath(entryPath);
+const baseUri = Uri.fromFilePath(basePath);
+const files = createDocumentStore();
+openDocument(files, {textDocument: {uri: entryUri, version: 1,
+    languageId: "napalm", text: Fs.readText(entryPath)}});
+
+let index = buildModuleIndex(files, [root]);
+check(index.order.length === 3, "loads the entry, forwarding module, and source");
+check(documentDiagnostics(index, entryUri).length === 0, "clean module diagnostics");
+
+const target = moduleDefinitionAt(index, entryUri, {line: 2, character: 17});
+check(target !== null && target.uri === baseUri && target.range.start.line === 1,
+    "go to definition crosses a forwarding module");
+const types = moduleDefinitionAt(index, entryUri, {line: 3, character: 17});
+check(types !== null && types.uri === baseUri && types.range.start.line === 2,
+    "type-only import navigates across files");
+const references = moduleReferencesAt(index, entryUri, {line: 2, character: 26}, true);
+check(references.length >= 3, "cross-file references include the declaration");
+
+const badUri = Uri.fromFilePath(Path.join(root, "bad.napalm"));
+openDocument(files, {textDocument: {uri: badUri, version: 1,
+    languageId: "napalm", text: Fs.readText(Path.join(root, "bad.napalm"))}});
+index = buildModuleIndex(files, [root]);
+let missingFile = false;
+let missingExport = false;
+for (const error of documentDiagnostics(index, badUri)) {
+    if (error.code === "NAPALM-MOD-001") missingFile = true;
+    if (error.code === "NAPALM-MOD-002") missingExport = true;
+}
+check(missingFile && missingExport, "missing files and exports are diagnosed");
+
+openDocument(files, {textDocument: {uri: baseUri, version: 1,
+    languageId: "napalm", text: "export const count = 7;\n"}});
+index = buildModuleIndex(files, [root]);
+let broken = false;
+for (const error of documentDiagnostics(index, entryUri)) {
+    if (error.code === "NAPALM-MOD-002") broken = true;
+}
+check(broken, "unsaved editor buffers override on-disk exports");
+
+const cycleUri = Uri.fromFilePath(Path.join(root, "cycle_a.napalm"));
+openDocument(files, {textDocument: {uri: cycleUri, version: 1,
+    languageId: "napalm", text: Fs.readText(Path.join(root, "cycle_a.napalm"))}});
+index = buildModuleIndex(files, [root]);
+check(index.order.length <= 6, "cyclic re-exports terminate");
+System.print("Napalm intermodule index smoke tests passed");

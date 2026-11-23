@@ -1,4 +1,68 @@
 #[test]
+fn napalm_http_client_helpers_can_be_shadowed() {
+    run_napalm(
+        r#"
+        function get() { return "user get"; }
+        const getJSON = () => "user getJSON";
+        let postJSON = () => "user postJSON";
+        function nested(get) { return () => get(); }
+        const captured = nested(() => "local get");
+        const server = listen "127.0.0.1:0" {
+            route "GET" ["/"] (req) => get();
+            route "GET" ["/json"] (req) => ({body: "{\"answer\":42}"});
+            route "GET" ["/header"] (req) => req.headers["x-test"];
+            route "POST" ["/echo"] (req) => ({body: req.body});
+        };
+        const watchdog = setTimeout(() => http.close(server), 5000);
+        const base = "http://" + http.address(server);
+        const a = await http.get(base + "/");
+        const b = await http.get(base + "/header", [["X-Test", "pairs"]]);
+        const c = await http.getJSON(base + "/json");
+        const d = await http.getJSON(base + "/json", {});
+        const e = await http.postJSON(base + "/echo", "{\"answer\":7}");
+        const f = await http.postJSON(base + "/echo", "{\"answer\":8}", {});
+        const result = [get(), getJSON(), postJSON(), captured(), a.body, b.body, c.json.answer, d.json.answer, e.json.answer, f.json.answer];
+        http.close(server); watchdog.cancel();
+        "#,
+        "[user get, user getJSON, user postJSON, local get, user get, pairs, 42, 42, 7, 8]",
+    );
+}
+
+#[test]
+fn napalm_http_client_helper_shadowing_is_lexical() {
+    run_napalm(
+        r#"
+        const nativeGet = get;
+        const nativeGetJSON = getJSON;
+        const nativePostJSON = postJSON;
+        let local = null;
+        {
+            function get() { return 1; }
+            function getJSON() { return 2; }
+            function postJSON() { return 3; }
+            local = () => [get(), getJSON(), postJSON()];
+        }
+        System.gc();
+        const server = listen "127.0.0.1:0" {
+            route "GET" ["/"] (req) => "42";
+            route "POST" ["/"] (req) => req.body;
+        };
+        const watchdog = setTimeout(() => http.close(server), 5000);
+        const url = "http://" + http.address(server) + "/";
+        const a = await get(url);
+        const b = await getJSON(url);
+        const c = await postJSON(url, "7");
+        const d = await nativeGet(url);
+        const e = await nativeGetJSON(url);
+        const f = await nativePostJSON(url, "8");
+        const result = [local(), a.body, b.json, c.json, d.body, e.json, f.json];
+        http.close(server); watchdog.cancel();
+        "#,
+        "[[1, 2, 3], 42, 42, 7, 42, 42, 8]",
+    );
+}
+
+#[test]
 fn napalm_http_routes_async_clients_and_gc() {
     run_napalm(
         r#"

@@ -1,0 +1,4 @@
+import {total, multiply as transform} from "./forward";
+import type {Entry} from "./base";
+const result = transform(total);
+const declared: Entry = null;

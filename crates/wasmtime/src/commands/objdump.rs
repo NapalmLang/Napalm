@@ -151,8 +151,8 @@ impl ObjdumpCommand {
 
         let mut breakpoints = frame_table_descriptors
             .iter()
-            .flat_map(|ftd| ftd.breakpoint_patches())
-            .map(|(wasm_pc, patch)| (wasm_pc, patch.offset, SmallVec::from(patch.enable)))
+            .flat_map(|ftd| ftd.all_breakpoint_patches())
+            .map(|(_module, wasm_pc, patch)| (wasm_pc, patch.offset, SmallVec::from(patch.enable)))
             .collect::<Vec<_>>();
         breakpoints.sort_by_key(|(_wasm_pc, native_offset, _patch)| *native_offset);
         let breakpoints: Box<dyn Iterator<Item = _>> = Box::new(breakpoints.into_iter());

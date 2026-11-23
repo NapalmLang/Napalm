@@ -39,7 +39,7 @@ presented as existing features.
 19. [Exceptions and Cleanup](#19-exceptions-and-cleanup)
 20. [Async, Promise, and Timers](#20-async-promise-and-timers)
 21. [Concurrency with launch](#21-concurrency-with-launch)
-22. [Fibers](#22-fibers)
+22. [Fibers and Generators](#22-fibers-and-generators)
 23. [Modules, Imports, and Exports](#23-modules-imports-and-exports)
 24. [Strings](#24-strings)
 25. [Numbers and Randomness](#25-numbers-and-randomness)
@@ -53,8 +53,16 @@ presented as existing features.
 33. [Complete Recipes](#33-complete-recipes)
 34. [Example and Source Map](#34-example-and-source-map)
 35. [Current Performance](#35-current-performance)
-36. [Napalm System platform helpers](#35-system-platform-helpers)
-37. [Napalm nNative FFI](#35-native-ffi)
+36. [Platform Detection (System.os, System.arch)](#36-platform-detection)
+37. [Napalm Native FFI](#37-napalm-native-ffi)
+38. [JSON](#38-json)
+39. [Bytes](#39-bytes)
+40. [ByteBuffer](#40-bytebuffer)
+41. [Fs](#41-fs)
+42. [Path](#42-path)
+43. [Uri](#43-uri)
+44. [Package (.orange)](#44-package)
+45. [Regex](#45-regex)
 
 ### How to Read the Examples
 
@@ -106,28 +114,202 @@ If it has already been compiled:
 .\target\release\napalm.exe .\hello.napalm
 ```
 
-The CLI accepts **a single file**, not a list of program arguments. This
+The CLI accepts an entry file followed by optional program arguments:
+`napalm program.napalm [arguments...]`. `Process.args` contains only the
+arguments after the filename. The entry file can also be a compiled
+`.burning` artifact (see [1.2](#12-building-and-distributing-programs)). This
 implementation does not provide a REPL, `process.argv`, or an `-e` option.
-Do not infer those features from Cargo's capabilities.
+
+| Command | Effect |
+| --- | --- |
+| `napalm program.napalm [arguments...]` | Compiles and runs the program. |
+| `napalm program.burning [arguments...]` | Runs a program compiled with `--build`. |
+| `napalm --build program.napalm` | Writes `program.burning` without running anything. |
+| `napalm --compile program.napalm` | Writes `program.burning` and a standalone executable. |
+| `napalm --compile program.burning` | Writes a standalone executable from an existing artifact. |
+| `napalm --help` | Prints the usage summary (exit code 2). |
+
+`scripts/process_args.napalm` prints these arguments as a JSON array and checks
+that they are Strings. It accepts any argument list, including none (`[]`):
+
+```powershell
+cargo run --release -- scripts/process_args.napalm
+cargo run --release -- scripts/process_args.napalm alpha "two words"
+```
 
 **Current extension:** use `.napalm`. Imports with an extension accept
 `.napalm`; imports without an extension look for the file and directory index
 with that extension. Older references to `.nap` or `.ts` in some texts do not
 describe the current resolver.
 
-### 1.2 Process Exit Codes
+### 1.2 Building and Distributing Programs
+
+Napalm can compile a program ahead of time instead of compiling it on every
+run. There are two output forms:
+
+- **`--build`** writes a `.burning` artifact: the compiled program, including
+  every module it imports. It runs with `napalm program.burning`.
+- **`--compile`** also writes a **standalone executable** that contains the
+  Napalm runtime and the program. It runs on its own, with no Napalm install.
+
+#### `--build`: `.burning` artifacts
+
+```powershell
+napalm --build .\scripts\fib.napalm     # writes .\scripts\fib.burning
+napalm .\scripts\fib.burning 30 extra   # Process.args is ["30", "extra"]
+```
+
+- The artifact is written beside the entry file, with the same name and a
+  `.burning` extension. An existing artifact is replaced only if the build
+  succeeds.
+- Statically imported modules (`import ... from './x'`, `@std`, `@lib`) are
+  compiled into the same artifact. They do not get their own `.burning` files.
+- **No code runs during a build**: no module body, import or `static` block
+  executes, and `System.print` produces no output. Compile errors are reported
+  as in a normal run.
+- `--build` must come **before** the entry file. In `napalm program.burning
+  --build`, `--build` is an ordinary program argument.
+- `--build` takes a source file. `napalm --build program.burning` is a usage
+  error (exit code 2) and leaves the artifact untouched.
+
+Running an artifact skips parsing and compiling. The original sources are no
+longer needed: the artifact can be moved to another directory or machine.
+Builtins, the JIT, error messages, `Process.args` and exit codes behave as
+they do for source files.
+
+The build uses extra whole-program optimizations that a normal run skips.
+They assume the artifact contains every module that can run. For example, a
+function called with constant arguments may be evaluated during the build:
+
+```napalm
+function fibonacci(n: number): number {
+    return n <= 1 ? n : fibonacci(n - 1) + fibonacci(n - 2);
+}
+System.print(fibonacci(25)); // 75025; with --build it may be computed during the build
+```
+
+These optimizations do not change what a program prints, returns or throws.
+Side effects (output, I/O, timers, exceptions) and their order are preserved,
+and source locations in error messages remain those of the original code.
+Building takes longer than a normal run's compilation; running the artifact
+is faster to start.
+
+#### `--compile`: standalone executables
+
+```powershell
+napalm --compile .\app.napalm     # writes .\app.burning and .\app.exe
+.\app.exe alpha "two words"       # Process.args is ["alpha", "two words"]
+```
+
+`--compile` builds the program exactly like `--build`, keeps the `.burning`
+file, and also writes an executable beside the entry file: `app.exe` on
+Windows, `app` (marked executable) on Linux and macOS.
+`napalm --compile app.burning` turns an existing artifact into an executable
+without needing the sources.
+
+Running the executable runs the embedded program:
+
+- **Every argument goes to the program.** The executable has no CLI options:
+  `app.exe --help` puts `"--help"` in `Process.args`.
+- Exit codes, error messages and output are the same as
+  `napalm app.burning`.
+- It can be renamed and moved freely. Neither the sources, the `.burning`
+  file nor a Napalm installation are needed.
+- Files, native libraries (FFI) and network resources that the program opens
+  at runtime are still read from the system as usual. Relative paths are
+  resolved against the current working directory, not the executable's.
+
+**Dependencies.** The executable contains the interpreter, garbage collector,
+builtins and both JIT tiers. On Windows it also contains the LLVM library
+(`LLVM-C.dll`) and needs no Visual C++ Redistributable. Expect roughly 45 MB.
+The LLVM library is unpacked automatically to
+`%LOCALAPPDATA%\napalm\llvm\` the first time a program becomes hot enough to
+use it. This happens once per machine and takes about a second. Executables
+that embed the same LLVM library share the unpacked copy. Set
+`NAPALM_CACHE_DIR` to use a different directory. If the LLVM library cannot be
+found when compiling, `--compile` prints a warning and the executable still
+works, but uses only the Cranelift JIT unless it finds LLVM at runtime.
+
+On Linux and macOS the LLVM library is not embedded: install LLVM 23 or put
+`libLLVM` next to the executable. Standalone executables are untested on macOS.
+Code-signing a standalone executable (Authenticode on Windows, `codesign` on
+macOS) is not supported.
+
+An executable runs only with the runtime that produced it. Recompile after
+updating Napalm. A `.burning` artifact is also tied to the Napalm version that
+built it: a runtime with a different format rejects it with exit code 1, and
+it must be rebuilt.
+
+The `NAPALM_*` diagnostic environment variables (for example `NAPALM_NO_JIT`)
+also affect standalone executables.
+
+#### Build and compile errors
+
+| Situation | Exit code |
+| --- | --- |
+| Success (nothing is printed, except the LLVM warning described above) | `0` |
+| Syntax or type error in the program; invalid or incompatible `.burning` file | `1` |
+| Missing entry file after `--build`/`--compile`; `--build` given a `.burning` file | `2` |
+| Unreadable source; output file cannot be written | `3` |
+
+A failed build or compile leaves any existing `.burning` file and executable
+untouched.
+
+### 1.3 Process Exit Codes
 
 | Code | Meaning |
 | --- | --- |
 | `0` | The program completed successfully. |
-| `1` | Compilation error, including syntax errors or statically checked types. |
+| `1` | Compilation error, including syntax errors or statically checked types; invalid or incompatible `.burning` artifact or standalone executable. |
 | `2` | Incorrect CLI usage; this is also the current exit code for `--help`. |
-| `3` | I/O error while loading sources or emitting diagnostics. |
+| `3` | I/O error while loading sources or artifacts, writing build output, or emitting diagnostics. |
 | `4` | Uncaught runtime error or a module suspension that was not resumed. |
+
+Standalone executables and `.burning` artifacts use the same codes.
 
 An open HTTP listener, a periodic timer, or pending asynchronous work can keep
 the process alive after the module body has run. Close or cancel resources that
 are no longer needed.
+
+### 1.4 Process and Standard Streams
+
+`Process.cwd()`, `Process.chdir(path)` and `Process.getenv(name)` expose the
+working directory and environment; a missing environment variable returns
+`null`. `Process.exit(code)` immediately exits the host process with the given
+integer status, overriding the normal CLI exit codes above.
+
+`Process.stdin` is an `InputStream`; `Process.stdout` and `Process.stderr` are
+distinct `OutputStream` singletons. Their operations are synchronous:
+
+| Operation | Result |
+| --- | --- |
+| `stdin.read(count)` | Up to `count` bytes, or `null` at EOF. |
+| `stdin.readExact(count)` | Exactly `count` bytes; throws if EOF arrives early. |
+| `stdin.readLine()` | A UTF-8 string without LF/CRLF, or `null` at EOF; an empty line is `""`. |
+| `stdout.write(bytes)` / `stderr.write(bytes)` | Number of bytes written; accepts `Bytes` or `ByteBuffer`. |
+| `stream.writeAll(bytes)` | Writes all bytes and returns their count. |
+| `stream.writeText(text)` | Writes a UTF-8 String and returns its byte count. |
+| `stream.flush()` | Flushes output and returns `null`. |
+| `stream.close()` | Returns `null`; standard streams remain usable. |
+
+Input reads wait for data or EOF. Zero-byte reads return empty `Bytes` without
+waiting. Binary reads accept integer counts from 0 through 256 MiB; lines are
+limited to 16 MiB. Invalid types, lengths, UTF-8 and I/O errors throw catchable
+runtime errors.
+
+`scripts/process_complete.napalm` runs self-contained checks by default and
+exits successfully without reading stdin. Its optional `lsp`, `line`, `eof`
+and `binary` modes require specific input; `exit` deliberately returns status
+17. The LSP mode reads one Content-Length frame and emits only its framed
+JSON response. Keep diagnostics on stderr when using protocol stdout.
+
+Run every mode with controlled binary input, expected output/status checks
+and timeouts:
+
+```powershell
+cargo build --release
+python tools/verify_process_integration.py
+```
 
 ## 2. Basic Syntax and Literals
 
@@ -286,9 +468,10 @@ protocol. Many builtins also retain the `value.toString` getter.
 Classes can implement `toString()` and participate in interpolation,
 concatenation, and `System.print`.
 
-Do not use `String(value)`, `Number(value)`, `Boolean(value)`, or
-`JSON.stringify` by analogy with JavaScript: equivalent APIs are not provided
-here. The textual output of Maps and lists is for presentation, **not JSON**.
+Do not use `String(value)`, `Number(value)`, or `Boolean(value)` by analogy
+with JavaScript: equivalent conversion APIs are not provided here. The textual
+output of Maps and lists is for presentation, **not JSON**. Use
+[`JSON.stringify(value)`](#38-json) to serialize supported values as JSON.
 
 ### 3.5 typeof
 
@@ -307,9 +490,11 @@ carry generic or contract information include it:
 | instance of `Dog`; of `Holder<number>` | `Instance of Dog`; `Instance of Holder<Number>` |
 | function or closure | `Function` |
 | Promise; pending `Timer.delay`/`Timer.every` | `Promise`; `Timer` |
-| `new Emitter<number>()`, its `.event` | `Emitter<Number>`, `Event<Number>` |
+| `new Emitter<number>()`, the result of its `emit(1)` | `Emitter<Number>`, `Event<Number>` |
 | Channel / Receiver | `Channel`, `Receiver` (with `<T>` when typed) |
-| Date, Proxy, Range, Fiber, Module | `Date`, `Proxy`, `Range`, `Fiber`, `Module` |
+| `Fs.stat(path)`, `Fs.open(path, mode)` | `FileInfo`, `File` |
+| `Package.package(name)` | `Package` |
+| Date, Proxy, Range, Fiber, Generator, Module | `Date`, `Proxy`, `Range`, `Fiber`, `Generator`, `Module` |
 | native decorator | `NativeDecorator` |
 
 A settled timer Promise reports `Promise`. User decorators are ordinary
@@ -410,7 +595,7 @@ type.
 | Logical | `&&`, `||`, `??`. |
 | Pipeline | `|>`; thread-first and left-associative. |
 | Conditional | `condition ? yes : no`. |
-| Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `&&=`, `||=`, `??=`. |
+| Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `|=`, `&=`, `^=`, `<<=`, `>>=`, `&&=`, `||=`, `??=`. |
 
 From highest to lowest, the parser gives precedence to member access/calls,
 updates, prefixes, exponentiation, multiplication, addition, shifts,
@@ -456,6 +641,19 @@ System.print(10 & 3);   // 2
 Numeric operands are converted to the 32-bit domain; the shift amount is reduced
 to its five lowest bits. Do not use these operators for exact 64-bit integer
 arithmetic.
+
+The compound forms `|=`, `&=`, `^=`, `<<=`, and `>>=` apply the corresponding
+bitwise operation and store its result in the left-hand destination. They return
+the stored value and evaluate the destination's receiver and key only once.
+
+```napalm
+let flags = 0;
+flags |= 5;   // 5
+flags &= 3;   // 1
+flags ^= 2;   // 3
+flags <<= 2;  // 12
+flags >>= 1;  // 6 (unsigned shift, just like >>)
+```
 
 ### 5.4 Short-Circuiting and Optional Access
 
@@ -620,7 +818,43 @@ if (n === 1) {
 `do...while` executes its body at least once. `if` and `while` use Napalm's
 truthiness rules, not JS's.
 
-### 6.2 Classic for
+### 6.2 unless and until
+
+`unless` and `until` are syntactic sugar for `if` and `while` with the
+condition negated:
+
+```napalm
+unless (user.isAdmin) {
+    throw "forbidden";
+}
+
+let attempts = 0;
+until (connect() || attempts >= 3) {
+    attempts++;
+}
+
+do {
+    line = input.next();
+} until (line === null);
+```
+
+| Sugar | Equivalent |
+| --- | --- |
+| `unless (c) A` | `if (!(c)) A` |
+| `unless (c) A else B` | `if (!(c)) A else B` |
+| `until (c) A` | `while (!(c)) A` |
+| `do A until (c)` | `do A while (!(c))` |
+
+- The negation follows the same truthiness rules as `!`: `unless (x)` runs
+  its body when `x` is `false` or `null`.
+- `unless` accepts `else`, and can be chained with `else if`/`else unless`.
+  For readability, prefer `if` whenever an `else` branch is needed.
+- `break` and `continue` behave the same in `until` as in `while`.
+- They are pure parser desugarings: they generate exactly the same code as
+  their `if`/`while` equivalents, with no runtime cost.
+- As with `if` and `while`, the parentheses around the condition are required.
+
+### 6.3 Classic for
 
 ```napalm
 let total = 0;
@@ -640,7 +874,7 @@ There are no `break label`/`continue label` labels.
 it is in JavaScript with `let`. To capture a different value each time, pass it
 to a function that creates the closure.
 
-### 6.3 for...of and for...in
+### 6.4 for...of and for...in
 
 ```napalm
 for (const value of [10, 20]) {
@@ -663,6 +897,8 @@ for (const entry of record) {
 - Destructuring patterns are supported in the binding.
 - `for...in` does not implement prototype enumeration or array indices.
   The receiver must provide a `keys` getter.
+- Leaving a `for...of` over a generator early (`break`, `return`, or an
+  exception) closes the generator ([section 22.2](#222-generators)).
 
 There is no `switch` or `for await...of` in this version.
 
@@ -744,17 +980,55 @@ System.print(pair.call(4, 5)); // [4, 5]
 
 An ordinary closure call fills missing parameters with `null` and ignores
 excess arguments, up to the global limit of **16 arguments**. This does not
-implement optional or rest parameters:
+implement rest parameters:
 
 - A `b?: string` parameter retains the `string` annotation. Omitting it passes
   `null` and may cause a fatal type error.
 - An unannotated parameter can receive that `null`.
 - Methods and constructors are looked up by **name and arity**; do not assume
-  they use the same rules as a closure.
+  they use the same rules as a closure. Only trailing parameters with default
+  values (below) can be omitted from a method or constructor call.
 - `launch` requires exactly the declared arity.
-- There is no `function f(...args)` or `function f(x = 1)`.
-- If default values are needed, use a check in the body or a destructured
-  parameter with defaults inside the pattern.
+- There is no `function f(...args)`.
+
+### Default Parameter Values
+
+A parameter can declare a default value with `= value`. This works in functions,
+arrow functions, generators, methods, static methods and constructors, including
+constructor parameter properties and destructured parameters:
+
+```napalm
+function greet(name: string = "world", punct = "!") {
+    return "hi " + name + punct;
+}
+greet();             // hi world!
+greet("Ana");        // hi Ana!
+
+function range(start: number, end: number = start + 10) { return [start, end]; }
+range(5);            // [5, 15]: a default can read earlier parameters
+
+class Lexer {
+    constructor(public source: string = "", public pos: number = 0) {}
+    peek(distance = 0) { return this.pos + distance; }
+}
+new Lexer().peek();  // 0
+
+interface Size { w: number; h: number; }
+function area({ w, h }: Size = { w: 1, h: 1 }) { return w * h; }
+```
+
+- The default is evaluated on **every call** that needs it, left to right, after
+  the parameters before it. It is not a shared value computed once.
+- Because an omitted argument arrives as `null`, an **explicit `null` also
+  selects the default**. This is unlike JavaScript, where only `undefined`
+  does.
+- A declared type applies to the final value: `x: number = 0` is checked as
+  `number` after the default is substituted. Callers may still omit `x` or
+  pass `null`. A default with the wrong type fails at runtime when it is used.
+- A method or constructor with trailing defaults also answers every shorter
+  arity. The shorter arity forwards to the class's own implementation. A
+  shorter arity that the class declares explicitly takes precedence.
+- `x?: T = value` is rejected: a parameter with a default is already optional.
 
 For a function that explicitly accepts absence:
 
@@ -828,14 +1102,15 @@ To validate a dynamic return, assign the result to an annotated variable.
 | `T[]`, `Array<T>`, `List<T>` | List of T elements. |
 | `Map<K, V>` | Map with key and value contracts. |
 | `Set<T>` | Set with an element contract. |
-| `Event<T>`, `Emitter<T>` | Typed event subscription and publication endpoints. Without `<T>`, payloads are `any`. |
-| `Channel<T>`, `Receiver<T>` | Typed FIFO send/receive endpoints. Without `<T>`, payloads are `any`. |
+| `Event<T>` | Event whose `data` payload is a `T`. Without `<T>`, the payload is `any`. |
+| `Emitter<T>`, `Channel<T>`, `Receiver<T>` | Pub/sub endpoints that carry `Event<T>` (§15.3). Connected endpoints must have the same `T`. Without `<T>`, payloads are `any`. |
 | `A \| B` | Union of alternatives. |
 | `(x: T) => U`, `Function`, `Fn` | Closure value; this annotation does not validate a complete signature. |
 | Interface/alias name | Schema declared in the same module. |
 | Known class name | Class identity, not a literal object with the same fields. |
 | `{ x: number; }` | Inline structural schema. |
 | `Range`, `Fiber`, `Map`, `Set`, `List` | Native families recognized by the type resolver. |
+| `FileInfo`, `File` | Native filesystem metadata and open file handles. |
 
 Additional syntax is accepted as type information, but it is not equivalent
 to TypeScript's type system:
@@ -1030,7 +1305,8 @@ free.item = "text";
   including writes from methods and from optimized native code.
 - `Promise<T>`: the settled value is checked against `T` at `await`.
 - `Map<K, V>`, `Set<T>`, `T[]`/`Array<T>`, `Event<T>`, `Emitter<T>`,
-  `Channel<T>` and `Receiver<T>` work as before (§10.5, §15.3).
+  `Channel<T>` and `Receiver<T>` work as before (§10.5, §15.3). For the
+  pub/sub endpoints, the type arguments of connected endpoints must match.
 - Recursive generic contracts (`next: Node<T>`) are not supported, like
   recursive interfaces in general. Type parameters of generic functions are
   erased to `any`.
@@ -1106,30 +1382,68 @@ that operation introduces null; `length` is read-only. Use
 | `clear()` | Empties the list and returns null. |
 | `setLength(n)` | Truncates or grows with null; returns n. |
 | `fill(value)` | Replaces all elements and returns the list. |
+| `slice(start = 0, end = length)` | New shallow list with `[start, end)`; negative indices count from the end, bounds are clamped, `end <= start` gives `[]`. |
+| `concat(otherList)` | New shallow concatenation, same as `+`. |
+| `reverse()` | Reverses in place and returns the list. |
+| `sort()` | Sorts in place and returns the list: all Numbers ascending (NaN last) or all Strings by code point; anything else is an error. |
+| `sort(compare)` | Stable in-place sort; `compare(a, b)` must return a Number, and a positive result places `a` after `b`. |
+| `indexOf(value)` | First index whose element is `==` to value, or -1. |
+| `includes(value)` | Bool; whether some element is `==` to value. |
 | `map(callback)` | New list; calls `callback(element)` once per element. |
 | `filter(callback)` | New list with elements whose condition is truthy. |
 | `reduce(callback, initial)` | Accumulates through `callback(accumulator, element)`. |
+| `forEach(callback)` | Calls `callback(element)` for each element; returns null. |
+| `find(callback)` | First element whose condition is truthy, or null. |
+| `findIndex(callback)` | Index of that element, or -1. |
+| `some(callback)`, `every(callback)` | Bool; stop at the first truthy (`some`) or falsy (`every`) result. `[].every(f)` is true. |
+| `join(separator = ",")` | String containing each element's text separated by `separator`; does not modify the list. |
 | `+ otherList` | New shallow concatenation. |
 | `[range]` | New list with the selected segment. |
 | `iterate(cursor)`, `iteratorValue(cursor)` | Iteration protocol. |
 | `toString`, `toString()` | Text representation. |
 
 `push`, `add`, and `unshift` accept **a single element**, not a variable
-number of elements. map/filter callbacks do not automatically receive an
-index or collection. `reduce` requires an initial value.
+number of elements. Callbacks (map, filter, forEach, find, findIndex, some,
+every) do not automatically receive an index or collection. `reduce` requires
+an initial value. Unlike JavaScript, `sort()` without a comparator does not
+convert Numbers to text: `[10, 9, 1].sort()` is `[1, 9, 10]`.
 
 ```napalm
 const source = [1, 2, 3, 4];
 System.print(source.map(x => x * 2));       // [2, 4, 6, 8]
 System.print(source.filter(x => x > 2));    // [3, 4]
 System.print(source.reduce((a, x) => a + x, 0)); // 10
+System.print(source.join());               // 1,2,3,4
+System.print(source.join(" - "));          // 1 - 2 - 3 - 4
 System.print(source);                      // [1, 2, 3, 4]
 ```
 
-`forEach`, `find`, `findIndex`, `sort`, `splice`, and the complete JS Array
-catalog are not installed. Use a loop or compose the available operations.
-Do not modify the source list inside callbacks while assuming ECMAScript's
-exact rules.
+`join()` returns `""` for an empty list. An empty separator concatenates the
+elements directly. Null elements (including unfilled array slots) contribute
+empty text. Other elements and an explicitly supplied separator use their
+`toString()` method, including user overrides; conversion errors propagate.
+An explicit null separator therefore becomes `"null"`. Nested lists retain
+Napalm's bracketed representation: `[[1, 2], [3]].join(";")` is `"[1, 2];[3]"`.
+The initial length is captured before conversion; elements are then read in
+order, so changes made by a `toString()` method to later elements are visible,
+and newly appended elements are ignored.
+
+```napalm
+const xs = [5, 3, 8, 1];
+System.print(xs.slice(1, -1));                 // [3, 8]
+System.print(xs.slice().sort());               // [1, 3, 5, 8]; xs is unchanged
+System.print(xs.find(x => x > 4));             // 5
+System.print([xs.indexOf(8), xs.includes(2)]); // [2, false]
+System.print(["b", "a"].sort().reverse());     // [b, a]
+System.print([[2, "x"], [1, "y"]].sort((a, b) => a[0] - b[0])); // [[1, y], [2, x]]
+```
+
+The scanning methods (forEach, find, findIndex, some, every, indexOf,
+includes) capture the length when they start: elements appended by a callback
+are not visited, and the scan stops early if a callback shortens the list.
+`sort(compare)` sorts a private copy and writes the result back at the end.
+`splice`, `lastIndexOf`, `flat`, and the rest of the JS Array catalog are not
+installed; use a loop or compose the available operations.
 
 ### 9.4 Shallow Copies and Limits
 
@@ -1330,7 +1644,7 @@ There is no step parameter.
 | `count` | Count for traversal in steps of one. |
 | `toString` / `toString()` | Range representation. |
 
-Use finite endpoints to ensure iteration terminates. Wren operators
+Use finite endpoints to ensure iteration terminates. Napalm operators
 `1..5` and `1...5` **are not part of the current public syntax**.
 
 ### 11.2 List Slices
@@ -1375,8 +1689,9 @@ for (const n of new Countdown(2)) {
 ```
 
 The cursor `0` is valid because it is truthy in Napalm.
-`Symbol.iterator`, `{done, value}` objects, and generators are not used.
-Lists, strings, ranges, Maps, key views, and Sets implement the protocol.
+`Symbol.iterator` and `{done, value}` objects are not part of this protocol.
+Lists, strings, ranges, Maps, key views, Sets, and generators
+([section 22.2](#222-generators)) implement it.
 List and call spread also use it.
 
 ## 12. Destructuring, Rest, and Spread
@@ -1559,6 +1874,23 @@ field. Declare the fields that make up their API. Instances provide `keys()`,
 `values()`, `entries()` and `size` for their stored fields, including inherited
 fields, in field-slot order. Computed getters and static fields are excluded.
 User-defined members can override these defaults.
+
+Stored fields can also be addressed by name with a computed key:
+
+```napalm
+class Point { x = 1; y = 2; }
+const point = new Point();
+const key = "x";
+System.print(point[key]);     // 1
+point[key] = 10;              // same checks as point.x = 10
+System.print(point["z"]);     // null: unknown names read as null
+```
+
+`instance[key]` reads the stored field named `key` (inherited fields included)
+and yields `null` for unknown names and non-String keys. `instance[key] = value`
+keeps the field's declared type and fails for a name that is not a field, like
+`object.extra = value`. Only stored fields are reachable this way: methods,
+getters, computed members and static fields are not.
 
 ### 14.2 Inheritance and super
 
@@ -1842,74 +2174,153 @@ Both computed and watch:
 - They are dependency-tracked state derivation primitives, not explicit event
   streams.
 - The low-level `__Reactive` functions are internal support and are not an
-  application API. Use `Event`/`Emitter` when explicit subscription and
-  publication are required.
+  application API. Use `Emitter`/`Channel`/`Receiver` (§15.3) when explicit
+  publication and subscription are required.
 
-### 15.3 Event and Emitter
+### 15.3 Events, Emitters, Channels, and Receivers
 
-`Emitter<T>` is Napalm's native one-to-many publication endpoint.
-Its `event` getter returns an `Event<T>` view that can subscribe but cannot
-publish. The split is deliberate: code can be given an `Event<T>` without also
-being given the capability to emit values.
+Napalm has native publish/subscribe built from four global types:
 
-The generic payload is optional. Without `<T>`, payloads are `any`.
+| Type | Role |
+| --- | --- |
+| `Emitter<T>` | Publishes events. |
+| `Channel<T>` | A pipe that carries events from emitters to receivers. |
+| `Receiver<T>` | Subscribes to channels, with one handler per channel. |
+| `Event<T>` | One published occurrence. Its `data` holds the payload. |
+
+You create each endpoint on its own and then connect them. An emitter
+**publishes to** channels. A receiver **subscribes from** a channel and gives
+the handler that runs for every event arriving through that channel:
 
 ```napalm
-const emitter = new Emitter<number>();
-const event: Event<number> = emitter.event;
+const channel = new Channel();
+const emitter = new Emitter();
+const receiver = new Receiver();
 
-const token = event.on((value) => {
-    System.print(`value: ${value}`);
+emitter.publish_to(channel);
+receiver.subscribe_from(channel, (event) => {
+    System.print(event.data.obj);
 });
 
-event.once((value) => {
-    System.print(`first emission only: ${value}`);
-});
-
-System.print(emitter.emit(10)); // number of listener deliveries queued
-System.print(emitter.emit(20));
-
-event.off(token);
-System.print(event.listenerCount);
-
-emitter.clear();
-emitter.close();
-System.print(event.closed);
+emitter.emit({ obj: "yes" }); // prints: yes
 ```
 
-| Member | Effect |
-| --- | --- |
-| `new Emitter<T>()` | Creates an emitter; `<T>` is optional and defaults to `any`. |
-| `emitter.event` | Read-only `Event<T>` capability sharing the same event state. |
-| `emitter.emit(value)` | Queues delivery to the current listeners and returns the number of queued deliveries. |
-| `emitter.listenerCount` | Number of currently registered listeners. |
-| `emitter.clear()` | Removes all current listeners. |
-| `emitter.close()` | Closes the emitter and prevents future publication/subscription. |
-| `event.on(callback)` | Adds a persistent listener and returns a subscription token. |
-| `event.once(callback)` | Adds a listener consumed by the first emission that observes it. |
-| `event.off(token)` | Removes the subscription represented by that token. |
-| `event.off(callback)` | Removes subscriptions using that callback. |
-| `event.listenerCount` | Number of currently registered listeners. |
-| `event.closed` | Whether the shared emitter/event state is closed. |
+`emitter.emit(data)` wraps `data` in a new `Event`. That Event travels through
+every channel the emitter publishes to. For each receiver subscribed to one of
+those channels, the handler of that subscription is called with the Event.
 
-Event delivery uses the VM's **microtask queue**. `emit()` does not invoke
-listeners inline, which prevents arbitrary listener reentrancy inside the
-publisher. Listener callbacks may take zero or one argument.
+#### Many-to-many connections
 
-`emit()` snapshots the listeners that should receive that emission. Therefore,
-calling `off()`, `clear()`, or `close()` after `emit()` does not retract
-deliveries that have already been queued.
+Connections are many-to-many:
 
-A `once()` listener is consumed by the first emission that sees it, even though
-the actual callback runs later as a microtask.
+- One emitter can publish to many channels.
+- One receiver can subscribe from many channels, with a different handler for
+  each one.
+- One channel can be shared by many emitters and many receivers.
 
-A `concurrent function` is not a direct event listener. If an event should
-start parallel work, use an ordinary or async listener that explicitly performs
-`launch`.
+```napalm
+const news = new Channel();
+const sports = new Channel();
 
-Typed event contracts are persistent runtime contracts in addition to static
-checks. Hiding a typed endpoint behind `any` does not remove its payload
-restriction:
+const editor = new Emitter();
+editor.publish_to(news).publish_to(sports); // connecting methods are chainable
+
+const reporter = new Emitter();
+reporter.publish_to(sports);
+
+const reader = new Receiver();
+reader.subscribe_from(news, (event) => System.print(`reader: ${event.data}`));
+
+const fan = new Receiver();
+fan.subscribe_from(sports, (event) => System.print(`fan, sports: ${event.data}`))
+   .subscribe_from(news, (event) => System.print(`fan, news: ${event.data}`));
+
+editor.emit("headline");
+reporter.emit("score");
+```
+
+Output:
+
+```text
+reader: headline
+fan, news: headline
+fan, sports: headline
+fan, sports: score
+```
+
+Because handlers belong to subscriptions, an Event that reaches the same
+receiver through two channels runs **both** channel handlers, as `fan` shows
+for `"headline"`. Handlers run in this order: the emitter's channels in the
+order it connected to them, then each channel's receivers in the order they
+subscribed.
+
+Each receiver has one handler per channel. Calling
+`subscribe_from(channel, handler)` again for a channel it already subscribes
+from replaces that handler. `unpublish_from(channel)` and
+`unsubscribe_from(channel)` remove a connection and return whether one
+existed.
+
+#### Handlers
+
+A handler is an ordinary or `async` function that takes the `Event` as its
+only parameter, or no parameters at all:
+
+```napalm
+const channel = new Channel<number>();
+const emitter = new Emitter<number>();
+const receiver = new Receiver<number>();
+emitter.publish_to(channel);
+
+receiver.subscribe_from(channel, async function (event) {
+    const doubled = await Promise.resolve(event.data * 2);
+    System.print(doubled);
+});
+
+const event = emitter.emit(21); // emit() also returns the Event
+System.print(event.data);       // 21, printed before 42
+```
+
+Handlers run on the VM's **microtask queue**, not inside `emit()`. `emit()`
+returns first, and the handlers run afterwards in the order described above.
+This prevents a handler from re-entering the code that is emitting.
+
+The routes are fixed when the event is emitted. Unsubscribing after `emit()`
+does not cancel a handler call that is already queued. Closing the receiver
+does cancel it (see Closing).
+
+A `concurrent function` cannot be a handler directly; use an ordinary or
+async handler that calls `launch`.
+
+#### Generic payloads
+
+All four types take an optional type argument: `Event<T>`, `Emitter<T>`,
+`Channel<T>`, and `Receiver<T>`. Without one, the payload is `any`.
+
+When you use type arguments, **connected endpoints must have the same `T`**.
+An `Emitter<Noded>` cannot publish to a `Channel<Bird>`, and a
+`Receiver<number>` cannot subscribe from a `Channel<string>`:
+
+```napalm compile-error
+interface Noded { id: number; }
+class Bird { name: string = "tweety"; }
+
+const emitter = new Emitter<Noded>();
+const birds = new Channel<Bird>();
+emitter.publish_to(birds); // error: cannot connect Emitter<Noded> to Channel<Bird>
+```
+
+The compiler reports this when it knows both types. The runtime checks it
+again on every connection, so hiding an endpoint behind `any` does not get
+around it. A typed endpoint also cannot connect to an untyped one: an
+`Emitter<number>` cannot publish to a plain `Channel`.
+
+```napalm runtime-error
+const receiver = new Receiver<number>();
+receiver.subscribe_from(new Channel(), (event) => {}); // Receiver<Number> vs untyped Channel
+```
+
+`Emitter<T>.emit(data)` checks `data` against `T`. This check is a
+persistent runtime contract, so it also applies through an `any` alias:
 
 ```napalm runtime-error
 const emitter = new Emitter<number>();
@@ -1917,13 +2328,45 @@ const dynamic: any = emitter;
 dynamic.emit("not a number");
 ```
 
-`Event<T>` and its paired `Emitter<T>` share one payload contract. Applying a
-typed `Event<T>` contract to an initially untyped event also constrains its
-paired emitter.
+Give an endpoint its type argument when you create it
+(`new Channel<Bird>()`) or when you first bind it
+(`const c: Channel<Bird> = new Channel()`). You cannot change an endpoint's
+payload type after it has been connected.
 
-Event/Emitter endpoints are currently **VM-local**. They can be used by
-Fibers/tasks in one Interpreter, but they cannot cross the isolated
-`launch concurrent` worker boundary.
+#### Closing
+
+`close()` exists on emitters, channels, and receivers. It returns `true` the
+first time and `false` if the endpoint was already closed. A closed endpoint
+cannot be connected again.
+
+- **Emitter:** unpublishes from all channels. Later `emit()` calls are errors.
+- **Channel:** disconnects all of its emitters and receivers.
+- **Receiver:** unsubscribes from all channels. Handler calls that were queued
+  but have not run yet are dropped.
+
+#### Reference
+
+| Member | Effect |
+| --- | --- |
+| `new Emitter<T>()`, `new Channel<T>()`, `new Receiver<T>()` | Create an endpoint. `<T>` is optional. |
+| `new Event<T>(data)` | Create an Event yourself, for example to test a handler. `data` is optional. |
+| `event.data` | The payload passed to `emit()`. |
+| `emitter.publish_to(channel)` | Connect to a channel. Returns the emitter. |
+| `emitter.unpublish_from(channel)` | Disconnect. Returns whether a connection existed. |
+| `emitter.emit(data)` | Create an `Event<T>` holding `data`, queue it for every reachable handler, and return it. `data` is optional (`null`). |
+| `emitter.channelCount` | Number of channels the emitter publishes to. |
+| `channel.emitterCount` | Number of emitters publishing to the channel. |
+| `channel.receiverCount` | Number of receivers subscribed to the channel. |
+| `receiver.subscribe_from(channel, handler)` | Subscribe with `handler` for that channel, or replace its handler. Returns the receiver. |
+| `receiver.unsubscribe_from(channel)` | Disconnect. Returns whether a subscription existed. |
+| `receiver.channelCount` | Number of channels the receiver subscribes from. |
+| `x.close()`, `x.closed` | Close an emitter, channel, or receiver; check whether it is closed. |
+
+The connecting methods also accept camelCase spellings: `publishTo`,
+`unpublishFrom`, `subscribeFrom`, and `unsubscribeFrom`.
+
+These endpoints are **VM-local**. Fibers and tasks in one Interpreter can use
+them, but they cannot cross the `launch concurrent` worker boundary (§21.3).
 
 ## 16. Enums
 
@@ -2430,90 +2873,23 @@ call.
 The number of workers and the speedup depend on the machine; five tasks do not
 imply a fivefold speedup.
 
-### 21.4 Channel and Receiver
+### 21.4 Channels Inside One Interpreter
 
-`Channel<T>` and `Receiver<T>` provide native FIFO message passing inside one
-Interpreter. `Channel<T>` owns the send capability; its `receiver` getter
-returns the receive capability.
+`Channel<T>` is the pipe between emitters and receivers described in §15.3,
+not a queue: events are not stored, they are handed to the subscribed
+handlers. Use it to pass events between cooperative tasks and Fibers in one
+Interpreter: one task emits, and the handlers run as microtasks.
 
-The generic payload is optional. Without `<T>`, payloads are `any`.
+Emitters, channels, receivers, and events are **VM-local** and cannot cross
+`launch concurrent`. The worker boundary copies supported values into an
+isolated Interpreter, so a channel between workers would need transport in
+the concurrent runtime rather than shared VM heap handles. To send results
+from a worker, await its Promise and emit the result from the main
+Interpreter.
 
-```napalm
-const channel = new Channel<string>(64);
-const receiver: Receiver<string> = channel.receiver;
+## 22. Fibers and Generators
 
-System.print(channel.send("hello")); // true
-System.print(channel.send("world")); // true
-
-System.print(await receiver.receive()); // hello
-System.print(receiver.tryReceive());    // world
-
-channel.close();
-System.print(await receiver.receive()); // null
-```
-
-| Member | Effect |
-| --- | --- |
-| `new Channel<T>()` | Creates an unbounded FIFO channel. `<T>` is optional and defaults to `any`. |
-| `new Channel<T>(capacity)` | Creates a bounded channel. |
-| `channel.receiver` | Returns the paired `Receiver<T>` capability. |
-| `channel.send(value)` | Sends without blocking; returns false when closed or currently unable to accept the value. |
-| `channel.close()` | Closes the channel while preserving already-buffered values for draining. |
-| `channel.length` | Number of currently buffered messages. |
-| `channel.capacity` | Configured capacity. |
-| `channel.closed` | Whether the shared channel state is closed. |
-| `receiver.receive()` | Returns `Promise<T | null>`; waits asynchronously when no message is available. |
-| `receiver.tryReceive()` | Returns an immediately available value or null. |
-| `receiver.close()` | Closes the shared channel state. |
-| `receiver.length` | Number of currently buffered messages. |
-| `receiver.closed` | Whether the shared channel state is closed. |
-
-A bounded channel never blocks the sender. When its buffer is full,
-`send(value)` returns `false`.
-
-Capacity `0` creates a **rendezvous channel**. It has no buffer:
-`send(value)` succeeds only when a receiver is already waiting.
-
-```napalm
-const channel = new Channel<number>(0);
-const receiver = channel.receiver;
-
-const pending = receiver.receive();
-System.print(channel.send(42)); // true
-System.print(await pending);    // 42
-```
-
-`receive()` resolves immediately when a buffered value is available. Otherwise
-it remains pending until a sender supplies a value or the channel closes.
-
-Closing a channel has these semantics:
-
-1. No new sends are accepted.
-2. Already-buffered values remain available and are drained in FIFO order.
-3. Pending receivers that cannot receive a buffered value complete with `null`.
-4. After the buffer is empty, subsequent `receive()` calls resolve with `null`.
-
-The nullable result is part of the type: `Receiver<T>.receive()` has an await
-result of `T | null`, not just `T`.
-
-As with Event/Emitter, typed channel contracts survive aliases through `any`:
-
-```napalm runtime-error
-const numbers = new Channel<number>();
-const dynamic: any = numbers;
-dynamic.send("not a number");
-```
-
-`Channel<T>` and its paired `Receiver<T>` share one payload contract. Applying
-a typed contract to one side constrains the other side as well.
-
-These endpoints are currently **VM-local**. They work across cooperative tasks
-and Fibers in one Interpreter, but they do not yet cross `launch concurrent`.
-The worker boundary copies supported values into an isolated Interpreter; a
-future cross-worker channel requires transport in the concurrent runtime rather
-than sharing VM heap handles.
-
-## 22. Fibers
+### 22.1 Fibers
 
 Fibers are explicit-transfer coroutines. They are not threads or Promises.
 
@@ -2560,6 +2936,108 @@ executable, a final module suspension is a runtime error.
 Fiber control operations are unavailable inside async tasks. Do not mix the
 two models as if they were equivalent.
 Fatal contracts do not become recoverable with `fiber.try()` either.
+
+### 22.2 Generators
+
+A generator function is declared with `function*` (or `*name()` for a class
+method). Calling it does **not** run the body: it returns a `Generator` whose
+body runs lazily, suspending at each `yield` until the consumer asks for the
+next value.
+
+```napalm
+function* conversation(): Generator<string, string, number> {
+    const age = yield "How old are you?";
+    yield `In ten years you will be ${age + 10}`;
+    return "bye";
+}
+
+const talk = conversation();          // nothing has run yet
+System.print(talk.next().value);      // How old are you?
+System.print(talk.next(30).value);    // In ten years you will be 40
+const last = talk.next(0);
+System.print([last.value, last.done]);  // [bye, true]
+System.print(talk.next(0).done);        // true (value is null)
+```
+
+`next()`, `return()` and `throw()` return an object `{value, done}`. The
+argument of the first `next()` is ignored; each later argument becomes the
+result of the `yield` expression where the body is suspended.
+
+| Form or API | Effect |
+| --- | --- |
+| `function* f() {}`, `const f = function* () {}` | Generator function declaration or expression. |
+| `*name() {}` in a class | Generator method; `this` is the receiver as usual. |
+| `yield value`, `yield` | Suspends and produces `value` (or `null`). Evaluates to the next `next()` argument. |
+| `yield* sequence` | Delegates to another generator, forwarding values, `next()` arguments, `return()` and `throw()`; evaluates to the delegate's return value. Any other iterable (list, range, Map...) is also accepted; then it evaluates to `null`. |
+| `gen.next(value?)` | Resumes the body. |
+| `gen.return(value?)` | Completes the generator as if `return value` ran at the suspended `yield`; `finally` blocks run. |
+| `gen.throw(error)` | Raises `error` at the suspended `yield`, where the body may catch it. |
+| `value instanceof Generator` | Whether the value is a generator. |
+
+Generators implement the iteration protocol (section 11.3), so `for...of`,
+list spread and call spread consume them. Leaving a `for...of` early with
+`break`, `return` or an exception **closes** the generator, running its
+pending `finally` blocks.
+
+```napalm
+function* fibonacci() {
+    let a = 0;
+    let b = 1;
+    while (true) {
+        yield a;
+        const next = a + b;
+        a = b;
+        b = next;
+    }
+}
+
+for (const n of fibonacci()) {
+    if (n > 20) break;          // closes the infinite generator
+    System.print(n);
+}
+
+class Tree {
+    constructor(public left: any, public value: number, public right: any) {}
+    *walk(): Generator<number> {
+        if (this.left) yield* this.left.walk();
+        yield this.value;
+        if (this.right) yield* this.right.walk();
+    }
+}
+const tree = new Tree(new Tree(null, 1, null), 2, new Tree(null, 3, null));
+System.print([...tree.walk()]); // [1, 2, 3]
+```
+
+Rules and semantics:
+
+- The annotation `Generator<Yield, Return, Next>` (one to three arguments) is
+  checked at runtime: every yielded value against `Yield`, every `return`
+  (including falling off the end) against `Return`, and every `next(value)`
+  argument against `Next`. `void`, `any` and omitted arguments leave that
+  channel unchecked. `next()` without an argument sends `null`, so after the
+  first call a generator with a non-nullable `Next` must be resumed with a
+  value. A violation is a fatal contract error. A generator
+  passed through `Generator<T>` keeps that contract even through `any` aliases.
+- An exception thrown by the body propagates to the caller of `next()`,
+  `return()` or `throw()`, and the generator is then done.
+- `return()` on a generator that has not started finishes it without running
+  the body; `throw()` on it rethrows the error to the caller.
+- If the generator is suspended inside `try...finally`, `return()` runs the
+  `finally` block. If that block yields, `return()` returns that value with
+  `done: false`, and the return completes on a later resumption.
+- Resuming a generator from inside its own body (directly or through another
+  generator) is a runtime error: "generator is already running".
+- `yield` is only valid directly in the generator's own body; it cannot appear
+  in a nested function or arrow function. Async, concurrent and
+  getter/setter/constructor generators are not supported.
+- `typeof gen` is `Generator`, and its text form is `<generator#N>`.
+- Array destructuring requires a List, so `const [a, b] = gen()` is rejected;
+  use `const [a, b] = [...gen()]` for a finite generator.
+
+Generators are built on Fibers: each one owns a separate resumable stack, and
+its hot loops are compiled by the JIT like any other code. A generator is not
+a `Fiber`, though: `call`, `transfer` and the other Fiber operations are not
+available on it.
 
 ## 23. Modules, Imports, and Exports
 
@@ -2694,6 +3172,7 @@ Negative indices in `text[index]` count from the end.
 | `substring(start, end?)` | Clamps negatives to zero and swaps reversed endpoints. |
 | `trim()`, `trimStart()`, `trimEnd()` | Removes Unicode whitespace at the corresponding ends. |
 | `toUpperCase()`, `toLowerCase()` | Unicode uppercase/lowercase conversion. |
+| `hashCode()` | Deterministic 32-bit hash, compatible with Java's `String.hashCode()`: `h = 31 * h + unit` over UTF-16 code units, as a signed integer (`"".hashCode()` is `0`, `"abc".hashCode()` is `96354`). Stable across runs and machines. |
 | `toString`, `toString()` | The string itself. |
 | `iterate`, `iteratorValue` | Iteration by scalar value. |
 | `String.fromCodePoint(number)` | String from a valid Unicode code point. |
@@ -2738,7 +3217,8 @@ System.print('aba'.replace('a', 'x'));    // xba
 System.print('aba'.replaceAll('a', 'x')); // xbx
 ```
 
-`concat`, regular expressions, and regular-expression methods are not provided.
+`concat` and regular-expression methods on String are not provided. Use the
+[Regex built-in](#45-regex) for regular-expression searches and replacements.
 
 ## 25. Numbers and Randomness
 
@@ -2773,6 +3253,8 @@ System.print((1 / 0).isInfinity);     // true
 ```
 
 Num static API: `fromString(text)`, `pi`, `tau`, `infinity`, `nan`.
+The globals `NaN` and `Infinity` are the same values as `Num.nan` and
+`Num.infinity`; a local or module binding with either name shadows them.
 `fromString` uses textual numeric conversion; it is not a radix-based
 `parseInt`.
 There is no standard `Math` namespace, `parseInt`, `parseFloat`, `BigInt`, or
@@ -2805,8 +3287,8 @@ There is no public seed API or cryptographic guarantee for these numbers.
 | `System.write(value)` | Prints without a line break and flushes stdout; returns value. |
 | `print(value)` | Global one-argument shortcut. |
 | `System.clock` | Monotonic seconds elapsed since host creation. |
-| `System.os()` | Build system, e.g. `"windows"`, `"linux"`, `"macos"`. |
-| `System.arch()` | Architecture, e.g. `"x86_64"` or `"aarch64"`. |
+| `System.os()` | Operating system as a String, e.g. `"windows"`, `"linux"`, `"macos"`. See [section 36](#36-platform-detection). |
+| `System.arch()` | CPU architecture as a String, e.g. `"x86_64"` or `"aarch64"`. See [section 36](#36-platform-detection). |
 | `System.gc()` | Requests explicit garbage collection. |
 
 ```napalm
@@ -3042,7 +3524,7 @@ The returned Promise can be canceled.
 
 JSON bodies must be serializable data: scalars, lists, and Maps with string
 keys; not functions or cyclic graphs. Depth is limited.
-This does not provide a complete global `JSON` API.
+The global [`JSON`](#38-json) utility also exposes `parse` and `stringify`.
 
 ### 29.2 Response and Headers
 
@@ -3377,7 +3859,7 @@ See [README_FFI.md](README_FFI.md) for the complete C contract.
 | A closure has dynamic this. | `this` is lexical. |
 | async means parallel CPU work. | Use launch with concurrent functions for that. |
 | Promise has then/catch/executor. | Use async/await and installed factories/combinators. |
-| EventEmitter or MessageChannel must be imported from Node/browser APIs. | Napalm provides native global Event/Emitter and Channel/Receiver endpoints. |
+| EventEmitter or MessageChannel must be imported from Node/browser APIs. | Napalm provides native global Emitter, Channel, Receiver, and Event types for publish/subscribe (§15.3). |
 | `System.clock` measures ms. | It measures seconds; timers and Date use ms. |
 | A broken contract is caught. | Contract errors are fatal. |
 
@@ -3385,16 +3867,19 @@ See [README_FFI.md](README_FFI.md) for the complete C contract.
 
 Do not use the following as though they were available features:
 
-- `switch`, generators, `yield` as generator syntax, regex literals,
-  JSX, executable namespaces, and `const enum`.
+- `switch`, async generators and `for await...of`, regex literals,
+  JSX, executable namespaces, and `const enum`. (Synchronous generators are
+  supported; see [section 22.2](#222-generators).)
+- Generator methods in object literals (`{ *items() {} }`); object literals
+  do not have method shorthand at all.
 - `void` as an operator, and `>>>`.
 - Rest parameters and full default-initializer parameters.
 - The general comma operator and `matrix[x, y]` subscripts.
 - Namespace imports, export-star, dynamic import, and require.
 - `#private` fields, object descriptors, and the JS prototype API.
-- Wren syntax `construct`, `is`, `..`/`...` ranges, trailing block closures
+- Napalm syntax `construct`, `is`, `..`/`...` ranges, trailing block closures
   on calls, and imports such as `import "x" for Name`.
-- `fn` declarations, `else unless`, and Deferred APIs from old scripts.
+- `fn` declarations and Deferred APIs from old scripts.
 
 The presence of a token or internal test does not mean the public parser
 accepts it as a Napalm program.
@@ -3531,6 +4016,7 @@ semantic specification nor a universal performance test.
 | [native_decorators.napalm](scripts/native_decorators.napalm) | Tests for caching, TTL, once, delay, debounce, and throttle. |
 | [destructuring_spread.napalm](scripts/destructuring_spread.napalm) | Patterns, defaults, rest, spread, and calls. |
 | [enums.napalm](scripts/enums.napalm) | Numeric and string enums, reverse mapping, and local enum. |
+| [generators.napalm](scripts/generators.napalm) | Self-checking tour of generators: laziness, `next(value)`, `yield*`, `return()`/`throw()`, cleanup, and `for...of` closing. |
 | [interfaces.napalm](scripts/interfaces.napalm) | Open contracts, aliases, and valid mutation. |
 | [types.napalm](scripts/types.napalm) | Classes implementing interfaces and types, instance `keys()`, and the `instanceof`/`implements`/`inherits` operators. |
 | [intrinsics.napalm](scripts/intrinsics.napalm) | Arrays, lambdas, Unicode, strings, nullish operations, and optional chaining. |
@@ -3559,7 +4045,7 @@ they are engine-specific benchmarks.
 
 | File | Observed difference |
 | --- | --- |
-| [index.napalm](scripts/index.napalm) | Mixes `fn`, `else unless`, uninstalled JS methods, Promise executor, and Deferred. Its use of `|>` is now valid, but the other historical constructs still prevent the file from compiling unchanged. |
+| [index.napalm](scripts/index.napalm) | Mixes `fn`, uninstalled JS methods, Promise executor, and Deferred. Its use of `|>` is now valid, but the other historical constructs still prevent the file from compiling unchanged. |
 | [trycatch.napalm](scripts/trycatch.napalm) | Uses `fn` declarations; the manual's exception examples use `function`. |
 | [defer.napalm](scripts/defer.napalm) | The `errdefer (error)` binding must be written with bars. |
 
@@ -3579,6 +4065,7 @@ documents the available language and shows usable alternatives.
 | [napalm_collection_ops.rs](src/napalm_collection_ops.rs) | Collection copies and validation, destructuring, and spread. |
 | [napalm_modules.rs](src/napalm_modules.rs) | Actual resolution of extensions, namespaces, and exports. |
 | [napalm_native.rs](src/napalm_native.rs) | Native decorator semantics and validation. |
+| [napalm_generators.rs](src/napalm_generators.rs), [napalm_generator_runtime.rs](src/napalm_generator_runtime.rs) | Generator desugaring (`function*`, `yield`, `yield*`) and the `next`/`return`/`throw` runtime. |
 | [napalm_concurrent.rs](src/napalm_concurrent.rs) | Concurrent work boundary and cancellation. |
 | [napalm_fetch.rs](src/napalm_fetch.rs) | Client transport, redirects, and limits. |
 | [napalm_http.rs](src/napalm_http.rs), [napalm_http_vm.rs](src/napalm_http_vm.rs) | HTTP API and transport. |
@@ -3615,6 +4102,7 @@ cargo test napalm_decorators -- --test-threads=1
 cargo test native_decorators -- --test-threads=1
 cargo test napalm_collections -- --test-threads=1
 cargo test napalm_http -- --test-threads=1
+cargo test napalm_generators
 ```
 
 These commands are entry points to regression tests, not a claim that the
@@ -3628,7 +4116,7 @@ Current engine, as of 02-Nov-2026, shows an impressive performance that can comp
 
 | Test | Napalm Performance | Node Performance | Bun Performance |
 | --- | --- | --- | --- |
-| `jit` | 0.198551s | 0.187731s | 0.223191s |
+| `jit` | 0.172551s | 0.187731s | 0.223191s |
 | `jit_entries` | 0.002747s |  0.005001s | 0.004753s |
 | `lev` | 0.000217s | 0.000710s | 0.001525s |
 | `trees` | 0.004445s | 0.005114s | 0.003302s |
@@ -3636,26 +4124,65 @@ Current engine, as of 02-Nov-2026, shows an impressive performance that can comp
 
 (Note: the impressive results in Fibonacci test are due to one of Napalm HIR optimization: the auto-memoization of pure functions with simple arguments).
 
-## 36. Napalm System platform helpers
+## 36. Platform Detection
 
-Adds two Napalm-specific zero-argument methods to `System`:
+`System.os()` and `System.arch()` tell a program which platform it is running
+on, so it can choose platform-specific paths, library names or commands.
 
-```typescript
-System.os()
-System.arch()
+| API | Returns |
+| --- | --- |
+| `System.os()` | The operating system, as a lowercase String. |
+| `System.arch()` | The CPU architecture, as a lowercase String. |
+
+```napalm
+System.print([System.os(), System.arch()]); // [windows, x86_64] on 64-bit Windows
+
+const separator = System.os() == "windows" ? "\\" : "/";
+const is64BitArm = System.arch() == "aarch64";
 ```
 
-They return the Rust target constants from `std::env::consts` as Napalm strings.
+Possible values:
 
-Typical values include:
+| `System.os()` | Platform |
+| --- | --- |
+| `"windows"` | Windows |
+| `"linux"` | Linux |
+| `"macos"` | macOS |
+| `"freebsd"`, `"netbsd"`, `"openbsd"`, `"dragonfly"` | BSD systems |
+| `"android"`, `"ios"` | Mobile systems |
 
-- OS: `linux`, `windows`, `macos`, `freebsd`, `android`, `ios`, ...
-- architecture: `x86_64`, `aarch64`, `x86`, `arm`, `riscv64`, ...
+| `System.arch()` | Architecture |
+| --- | --- |
+| `"x86_64"` | 64-bit Intel/AMD |
+| `"aarch64"` | 64-bit ARM (Apple Silicon, ARM servers, Windows on ARM) |
+| `"x86"` | 32-bit Intel/AMD |
+| `"arm"` | 32-bit ARM |
+| `"riscv64"` | 64-bit RISC-V |
 
-The values describe the platform Napalm was compiled for, which is the correct
-behavior for cross-compiled binaries.
+The lists are not exhaustive: compare against the values you support and
+handle anything else explicitly instead of assuming a default.
 
-No parser, IR, bytecode, JIT, GC, or FFI changes are required.
+Details:
+
+- **They are methods, not properties.** Write `System.os()`, unlike
+  `System.clock`. `System.os` without parentheses, or passing any argument,
+  throws a runtime error.
+- **The values describe the Napalm runtime, not the machine's hardware or OS
+  version.** A 32-bit or x86_64 build running under emulation (for example on
+  Windows on ARM or with Rosetta on macOS) reports its own architecture. There
+  is no API for the OS version or distribution.
+- **The values are fixed when the Napalm runtime is built.** The same running
+  program always gets the same values. They are never computed during
+  `--build`, so a `.burning` artifact moved to another platform reports the
+  platform of the runtime that runs it.
+- **A standalone executable reports the platform it was compiled on.**
+  `--compile` copies the Napalm runtime that ran it, so a program compiled on
+  Windows x86_64 always reports `"windows"` and `"x86_64"`. It only runs on
+  that platform anyway; to target another platform, run `--compile` with a
+  Napalm runtime for that platform.
+
+[Section 31.1](#311-loading-a-c-library) uses `System.os()` to choose the C
+library name to load with FFI.
 
 ## 37. Napalm native FFI
 
@@ -3812,3 +4339,640 @@ libloading = "0.9.0"
 ```
 
 `libffi` uses its bundled libffi build by default. If a deployment deliberately uses a system libffi, enable the crate's `system` feature instead.
+
+## 38. JSON
+
+`JSON` is a global utility; no import or constructor is needed. Both methods
+take exactly one argument and run synchronously.
+
+| Method | Result and behavior |
+| --- | --- |
+| `JSON.parse(input)` | Parses a String, Bytes, or ByteBuffer containing UTF-8 JSON. Returns null, Bool, Num, String, List, or Map according to the JSON value. Binary input is neither modified nor consumed. |
+| `JSON.stringify(value)` | Returns a compact JSON String for null, Bool, Num, String, List, or Map. Map keys must be Strings; nested values must also be supported. |
+
+Objects become Maps in source order. Duplicate keys keep their original
+position but use the last value. Stringification preserves Map insertion order.
+Numbers use Napalm's floating-point representation, so large JSON integers may
+lose precision. `stringify` encodes non-finite numbers as `null` and negative
+zero as `0`.
+
+Invalid JSON, unsupported values (including Bytes, ByteBuffer, functions, and
+class instances), non-String Map keys, and cycles throw errors. Shared children
+without cycles are allowed. Nesting is limited to depth 256, with the root at
+depth zero; input and output are limited to 256 MiB. There are no reviver,
+replacer, indentation, or automatic `toJSON()` hooks.
+
+```napalm
+const value = JSON.parse('{"name":"Napalm","ready":true}');
+System.print(value["name"]); // Napalm
+System.print(JSON.stringify(value)); // {"name":"Napalm","ready":true}
+
+const bytes = Bytes.fromUtf8('[1,2,3]');
+System.print(JSON.parse(bytes)[1]); // 2
+```
+
+See [scripts/json.napalm](scripts/json.napalm) for further examples.
+
+## 39. Bytes
+
+`Bytes` is an immutable binary value, available globally. Lengths and indices
+count bytes, not characters. Create values with the static factories below;
+there is no public `new Bytes()` constructor.
+
+### 39.1 Factories
+
+| Method | Result |
+| --- | --- |
+| `Bytes.empty()` | Empty Bytes. |
+| `Bytes.alloc(length)` | Bytes containing `length` zero bytes. |
+| `Bytes.fromUtf8(text)` | Bytes copied from a String's UTF-8 encoding. |
+| `Bytes.fromArray(values)` | Bytes copied from a List of integer byte values in `0..255`. |
+
+### 39.2 Properties and Methods
+
+| Member | Result and behavior |
+| --- | --- |
+| `length` | Number of bytes. |
+| `isEmpty` | Whether length is zero. |
+| `bytes[index]` | Numeric byte at a zero-based index. Out-of-bounds access throws. |
+| `slice(start, end?)` | Bytes sharing the original storage for the half-open range `[start, end)`. Omitted `end` means length. Requires `0 <= start <= end <= length`. |
+| `clone()` | New Bytes value sharing immutable storage. |
+| `toUtf8()` | Decoded String; invalid UTF-8 throws. |
+| `toArray()` | New List of numeric bytes; limited to 16,777,216 elements. |
+| `toMutable()` | Independent mutable ByteBuffer copy. |
+| `indexOf(pattern)` | First matching byte offset, or `-1`; accepts Bytes, ByteBuffer, or String. An empty pattern matches at `0`. |
+| `toString`, `toString()` | Diagnostic String such as `<Bytes length=3>`. Use `toUtf8()` to decode text. |
+| `iterate(state)` | Iteration protocol: pass `null` to start, then the previous state; returns the next index or `false`. |
+| `iteratorValue(state)` | Numeric byte at the iteration index. |
+
+`for...of` iterates numeric bytes. Byte values, lengths, and indices must be
+finite integers; negative indices and invalid ranges throw rather than wrap or
+clamp. Binary allocations are limited to 256 MiB. Slices and clones retain their
+backing storage; changing a `toMutable()` copy does not affect the source.
+
+```napalm
+const data = Bytes.fromUtf8("Hello");
+System.print(data.length); // 5
+System.print(data[0]); // 72
+System.print(data.slice(1, 4).toUtf8()); // ell
+
+const edited = data.toMutable();
+edited[0] = 104;
+System.print(edited.toUtf8()); // hello
+System.print(data.toUtf8()); // Hello
+```
+
+## 40. ByteBuffer
+
+`ByteBuffer` is a mutable, growable binary buffer. `new ByteBuffer()` creates
+an empty buffer; `new ByteBuffer(capacity)` reserves initial storage but still
+starts with length zero. It is available globally, without an import.
+
+### 40.1 Properties and Methods
+
+| Member | Result and behavior |
+| --- | --- |
+| `length` | Current number of bytes. |
+| `capacity` | Current storage capacity in bytes. |
+| `isEmpty` | Whether length is zero. |
+| `buffer[index]` | Reads a numeric byte at a zero-based index. |
+| `buffer[index] = value` | Replaces an existing byte with an integer in `0..255`; does not grow the buffer. |
+| `append(data)` | Appends Bytes, ByteBuffer, or a String's UTF-8 bytes. Self-append is supported. Returns the buffer. |
+| `reserve(additional)` | Ensures room for at least `additional` bytes beyond the current length, without changing length. Returns the buffer. |
+| `resize(length)` | Truncates or grows to the requested length, filling new bytes with zero. Returns the buffer. |
+| `writeUInt8(value)` | Appends one unsigned byte. Returns the buffer. |
+| `writeUInt16BE(value)`, `writeUInt16LE(value)` | Appends an unsigned 16-bit integer in big-/little-endian order. Returns the buffer. |
+| `writeUInt32BE(value)`, `writeUInt32LE(value)` | Appends an unsigned 32-bit integer in big-/little-endian order. Returns the buffer. |
+| `take(count)` | Removes the first `count` bytes and returns them as immutable Bytes. Returns `null` without consuming anything if insufficient bytes are available. |
+| `peek(count)` | Copies the first `count` bytes into Bytes without consuming them; returns `null` if insufficient bytes are available. |
+| `discard(count)` | Removes the first `count` bytes. Throws if insufficient bytes are available. Returns the buffer. |
+| `freeze()` | Transfers all contents into immutable Bytes and leaves the buffer empty and reusable. |
+| `clear()` | Removes all contents. Returns the buffer. |
+| `fill(value)` | Replaces all existing bytes with an integer in `0..255`, preserving length. Returns the buffer. |
+| `indexOf(pattern)` | First matching byte offset, or `-1`; accepts Bytes, ByteBuffer, or String. An empty pattern matches at `0`. |
+| `toUtf8()` | Decodes current contents as a String without consuming them; invalid UTF-8 throws. |
+| `toString`, `toString()` | Diagnostic String such as `<ByteBuffer length=3>`. |
+| `iterate(state)` | Iteration protocol: pass `null` to start, then the previous state; returns the next index or `false`. |
+| `iteratorValue(state)` | Numeric byte at the iteration index. |
+
+`for...of` iterates numeric bytes. The same integer, bounds, and 256 MiB size
+limits as Bytes apply. Integer writes require values in `0..255`, `0..65535`,
+or `0..4294967295`, respectively; they append rather than overwrite. Bytes
+returned by `take`, `peek`, or `freeze` remain unchanged when the buffer is
+subsequently reused.
+
+```napalm
+const frame = new ByteBuffer(16);
+frame.writeUInt16BE(4660).append("OK");
+System.print(frame.length); // 4
+System.print(frame.peek(2)[0]); // 18
+frame.discard(2);
+System.print(frame.take(2).toUtf8()); // OK
+System.print(frame.take(1)); // null
+frame.append("reused");
+System.print(frame.freeze().toUtf8()); // reused
+System.print(frame.isEmpty); // true
+```
+
+See [scripts/bytes.napalm](scripts/bytes.napalm) for Bytes and ByteBuffer examples.
+
+## 41. Fs
+
+`Fs` is a global utility for synchronous, blocking filesystem operations.
+Paths must be UTF-8 Strings and follow the host operating system's filesystem
+rules. Relative paths use the process working directory. Methods return their
+results directly, not Promises; invalid arguments and I/O failures throw.
+
+### 41.1 Methods
+
+| Method | Result and behavior |
+| --- | --- |
+| `Fs.readText(path)` | Reads the whole file into a String; invalid UTF-8 throws. |
+| `Fs.readBytes(path)` | Reads the whole file into immutable Bytes. |
+| `Fs.writeText(path, text)` | Creates or overwrites a file with a String's UTF-8 contents. Returns `null`. |
+| `Fs.writeBytes(path, data)` | Creates or overwrites a file from Bytes or ByteBuffer without consuming the input. Returns `null`. |
+| `Fs.exists(path)` | Bool indicating whether the path exists, following symlinks. Returns `false` for missing paths or dangling links; other lookup errors can throw. |
+| `Fs.stat(path)` | FileInfo instance containing a metadata snapshot for the path itself, without following a final symlink. |
+| `Fs.open(path, mode)` | Opens a regular file and returns a File instance. Directories, symlinks (including dangling links), and other non-regular files are rejected. See the modes below. |
+| `Fs.readDir(path)` | List of entry Maps sorted by name; does not recurse or follow entry symlinks for type flags. |
+| `Fs.realPath(path)` | Canonical absolute String path, resolving symlinks; the target must exist. |
+| `Fs.mkdir(path)` | Creates one directory; its parent must exist. An existing target is an error. Returns `null`. |
+| `Fs.mkdirAll(path)` | Creates missing parent directories too; succeeds for an existing directory. Returns `null`. |
+| `Fs.removeFile(path)` | Removes a file or symlink. Returns `null`. |
+| `Fs.rename(from, to)` | Renames or moves a file or directory using host filesystem rules. Returns `null`. |
+
+Reads and writes are limited to 256 MiB per operation, and `readDir` to 100,000
+entries. `writeText` and `writeBytes` truncate existing files and do not create
+parent directories. Use `open` for incremental I/O or append mode. There is no
+directory-removal API here.
+`realPath` may return a Windows extended-length path such as `\\?\C:\...`.
+
+### 41.2 FileInfo
+
+`Fs.stat(path)` returns a native `FileInfo`, not a Map. Its properties are
+read-only and describe the instant at which `stat` was called. Call `stat`
+again to refresh them. `FileInfo` is a global type usable in annotations and
+`instanceof`, but has no public constructor.
+
+| Property | Meaning |
+| --- | --- |
+| `path` | The supplied filesystem path as a String. |
+| `name` | Final filename component as a String, or `""` for a root. |
+| `size` | Filesystem metadata size in bytes, represented as Num. |
+| `isFile`, `isDirectory`, `isSymlink` | Bool type flags for the path itself. |
+| `modifiedAt`, `createdAt` | Date values for modification and creation, or `null` if unavailable on the filesystem. Each access returns an independent Date. |
+
+Use `info.size` and `info.modifiedAt`, replacing the previous Map fields
+`info["size"]` and `info["modifiedMs"]`. The previous `readonly` and `accessedMs`
+fields are no longer exposed.
+
+### 41.3 Directory Entries
+
+Each `readDir` entry has `name`, `path`, `isFile`, `isDirectory`, and `isSymlink`.
+`path` includes the supplied directory path and is not necessarily absolute.
+Directory names and returned paths must be representable as UTF-8.
+
+This example reads an existing repository file and performs no writes:
+
+```napalm
+const path = "scripts/json.napalm"; // Run from the repository root.
+if (Fs.exists(path)) {
+    const text = Fs.readText(path);
+    const metadata: FileInfo = Fs.stat(path);
+    System.print(metadata.isFile); // true
+    System.print(metadata.size === Bytes.fromUtf8(text).length); // true
+    System.print(Fs.realPath(path)); // Host-specific absolute path.
+}
+```
+
+### 41.4 Opening Files
+
+`Fs.open(path, mode)` requires an explicit mode String. Only regular files can
+be opened; the final path component cannot be a symlink. Existing parent
+directories are required. The opened resource is checked before truncating it.
+
+| Mode | Read | Write | Missing file | Existing contents |
+| --- | --- | --- | --- | --- |
+| `"r"` | Yes | No | Error | Preserved. |
+| `"r+"` | Yes | Yes | Error | Preserved. |
+| `"w"` | No | Yes | Created | Truncated. |
+| `"w+"` | Yes | Yes | Created | Truncated. |
+| `"a"` | No | Yes | Created | Preserved; writes always append. |
+| `"a+"` | Yes | Yes | Created | Preserved; writes always append. |
+
+The cursor initially starts at zero, including for reads in `a+` mode. Append
+writes go to the current end of the file regardless of an earlier `seek`.
+Reads and writes otherwise advance the shared cursor by the bytes transferred.
+
+### 41.5 File Properties and Methods
+
+`File` is a native global type with no public constructor; obtain an instance
+through `Fs.open`. It supports type annotations and `instanceof`.
+
+| Read-only property | Meaning |
+| --- | --- |
+| `path` | The path supplied to `Fs.open`. Remains readable after closing. |
+| `name` | Final filename component. Remains readable after closing. |
+| `modifiedAt`, `createdAt` | Fresh Date values from the open handle's current metadata, or `null` if unavailable. Access after closing throws. |
+
+| Method | Result and behavior |
+| --- | --- |
+| `read(count)` | Returns Bytes containing up to `count` bytes from the current cursor. EOF and a zero count return empty Bytes. Requires a readable mode. |
+| `write(bytes)` | Writes all supplied Bytes or ByteBuffer contents at the cursor (or end in append mode), without consuming the input. Returns the number of bytes written. Requires a writable mode; Strings are not accepted. |
+| `seek(offset)` | Sets the cursor to the absolute byte offset from the beginning and returns that offset. Seeking beyond EOF is allowed and does not itself extend the file. |
+| `flush()` | Synchronizes file data and metadata to storage. Returns `null`; filesystem errors throw. |
+| `close()` | Releases the OS file handle and returns `null`. Repeated calls are harmless. |
+
+Counts must be finite nonnegative integers at most 256 MiB; writes have the
+same per-call size limit. Offsets must be finite nonnegative integers no greater
+than `9007199254740991`. `read`, `write`, `seek`, and `flush` throw after closing.
+I/O failures throw and can occur after partial transfer. Close explicitly with
+`finally`; unreachable File objects also release their handles during heap
+cleanup, whose timing is not deterministic. `close` does not replace `flush`
+when storage synchronization is required. File and FileInfo cannot cross a
+`launch` boundary.
+
+```napalm
+const file: File = Fs.open("scripts/json.napalm", "r"); // Run from repository root.
+try {
+    System.print(file.name); // json.napalm
+    const prefix: Bytes = file.read(4);
+    System.print(prefix.toUtf8()); // // E
+    file.seek(0);
+    System.print(file.read(4).toUtf8()); // // E
+} finally {
+    file.close();
+}
+```
+
+See [scripts/fs.napalm](scripts/fs.napalm) for FileInfo, incremental File I/O,
+file creation, directory listing, renaming, and removal examples.
+
+## 42. Path
+
+`Path` is a global utility for lexical path operations. It normalizes path
+text without checking whether a file exists or resolving symlinks; use
+`Fs.realPath` when filesystem canonicalization is needed. Inputs must be
+UTF-8 Strings, at most 1 MiB each, without NUL characters.
+
+| Method | Result and behavior |
+| --- | --- |
+| `Path.join(...parts)` | Joins and normalizes 0–16 String parts, skipping empty parts. With no nonempty parts, returns `"."`. Leading separators on later parts do not reset the accumulated path. |
+| `Path.resolve(...parts)` | Resolves 0–16 String parts against the current working directory to an absolute path. A later absolute part replaces the preceding base. With no parts, returns the normalized working directory. |
+| `Path.normalize(path)` | Normalizes separators, `.` and `..`; absolute paths cannot traverse above their root. An empty relative path becomes `"."`. |
+| `Path.dirname(path)` | Parent of the normalized path; a root remains its own parent. |
+| `Path.basename(path)` | Final component of the normalized path; an absolute root has an empty basename. |
+| `Path.extension(path)` | Final extension including its dot, or `""`. A leading dot alone does not count: `.gitignore` has no extension. |
+| `Path.isAbsolute(path)` | Bool indicating whether the parsed path is rooted. `C:work` is drive-relative; `C:\work` is absolute. |
+| `Path.relative(from, to)` | Resolves both paths, then returns the path from `from` to `to`; identical paths produce `"."`. Different roots produce the absolute destination. |
+
+POSIX and Windows drive/UNC syntax are recognized from the input, including
+Windows paths on non-Windows hosts. Windows-style results use backslashes;
+POSIX results use forward slashes. A leading `//server/share` is treated as UNC
+on Windows. Windows component comparisons in `relative` are ASCII
+case-insensitive.
+
+`isAbsolute` also treats a Windows root-relative path such as `\work` as rooted,
+but resolving it requires an active drive. Resolving `C:work` requires a base
+on that drive. Incomplete UNC roots and Windows device paths throw; ordinary
+extended-length drive and UNC prefixes are normalized.
+
+```napalm
+System.print(Path.join("src", "lib", "..", "main.napalm")); // src/main.napalm
+System.print(Path.normalize("/a/../../b")); // /b
+System.print(Path.extension("/src/main.napalm")); // .napalm
+System.print(Path.relative("/a/b", "/a/c/d")); // ../c/d
+System.print(Path.normalize("C:\\a\\..\\b")); // C:\b
+```
+
+## 43. Uri
+
+`Uri` is a global utility for parsing URI text and converting file URIs.
+String inputs must be valid UTF-8 and at most 1 MiB. These operations do not
+access the filesystem.
+
+### 43.1 Methods
+
+| Method | Result and behavior |
+| --- | --- |
+| `Uri.parse(text)` | Parses a URI with a scheme and returns a Map of its components. Percent-encoded components stay encoded. |
+| `Uri.fromFilePath(path)` | Converts an absolute POSIX, Windows drive, or UNC path to a normalized `file:` URI String, percent-encoding spaces, reserved characters, and UTF-8 bytes as needed. Relative paths and Windows rooted paths without a drive throw. |
+| `Uri.toFilePath(uri)` | Converts a `file:` URI String, or a Map returned by `parse`, to a normalized filesystem path String. For a Map, reparses its `text` field; edits to other fields do not affect the result. |
+
+### 43.2 Parsed Fields and Validation
+
+| Field | Meaning |
+| --- | --- |
+| `text` | Original URI String. |
+| `scheme` | Scheme before `:`, retaining its original spelling. |
+| `authority` | Text after `//` and before the path, or `""`. |
+| `path` | Raw path with percent encoding preserved. |
+| `query` | Text after `?`, excluding the fragment, or `""`. |
+| `fragment` | Text after `#`, or `""`. |
+| `hasAuthority`, `hasQuery`, `hasFragment` | Bool flags distinguishing an absent component from a present but empty one. |
+
+`parse` rejects missing or invalid schemes, malformed percent escapes,
+unescaped spaces, and control characters. It does not decode query parameters
+or split the authority into hostname, port, or credentials.
+
+`toFilePath` requires the `file` scheme, an absolute URI path, and no query or
+fragment (even an empty `?` or `#` is rejected). Empty authority and `localhost`
+denote local paths; other supported authorities become UNC server names and
+require a share. Encoded slashes, backslashes, NUL, and decoded invalid UTF-8
+are rejected. Windows drive/UNC URIs produce Windows paths even on other hosts.
+
+```napalm
+const parsed = Uri.parse("https://example.com/a%20b?x=1#part");
+System.print(parsed["authority"]); // example.com
+System.print(parsed["path"]); // /a%20b
+System.print(parsed["query"]); // x=1
+
+const uri = Uri.fromFilePath("/tmp/hello world.txt");
+System.print(uri); // file:///tmp/hello%20world.txt
+System.print(Uri.toFilePath(Uri.parse(uri))); // /tmp/hello world.txt
+```
+
+See [scripts/path.napalm](scripts/path.napalm) for Path and Uri examples.
+
+## 44. Package
+
+`.orange` is the official Napalm package format; dependencies are distributed
+as `.orange` files. A package is always a tar archive compressed as a single
+Zstandard frame at level 18, the highest ratio before decompression speed drops
+noticeably. Neither the format nor the level is configurable.
+
+The `.orange` extension is mandatory on disk and optional in paths passed to
+`Package`: `Package.unpackage("deps/http")` reads `deps/http.orange`, and
+`Package.package("http.orange")` is the same as `Package.package("http")`. Any
+other extension gets `.orange` appended, so `Package.unpackage("http.tar.zst")`
+looks for `http.tar.zst.orange`. Relative paths are resolved against the working
+directory. Like `Fs`, every operation is blocking.
+
+### 44.1 Static Methods
+
+| Method | Result and behavior |
+| --- | --- |
+| `Package.package(name)` | Returns a new `Package` builder. `name` is a file name without path separators; choose the output folder with `setPackageDest`. Nothing is written until `finish()`. |
+| `Package.unpackage(path, dest = "./")` | Extracts the package into `dest`, creating it if needed and overwriting existing files. Returns an Array of the extracted file paths, each joined with `dest` as `Path.join` would. |
+
+### 44.2 Builder Methods
+
+`Package` supports type annotations and `instanceof`. Every method except
+`finish()` returns the same builder, so calls can be chained.
+
+| Method | Behavior |
+| --- | --- |
+| `addFile(path)` | Adds a regular file to the root of the archive, under its file name. |
+| `addFiles(paths)` | Adds an Array of files as `addFile` does. If any path is invalid, none of them is added. |
+| `addFolder(path)` | Adds a folder and everything inside it, keeping its path (see below). |
+| `setPackageDest(folder)` | Folder where `finish()` writes `<name>.orange`. Defaults to `"./"`; created if missing. |
+| `finish()` | Writes the package and returns its path. Can be called again to rebuild it. |
+
+`addFolder` stores the folder at its path relative to the working directory,
+with leading `..` components removed. When nothing is left, for example for
+`"./"`, `"../"`, or an ancestor of the working directory, or when the folder is
+on another drive, the folder's own name is used:
+
+| Working directory | `addFolder(...)` | Stored in the archive as |
+| --- | --- | --- |
+| `/work/app` | `"src/lib"` | `src/lib/...` |
+| `/work/app` | `"../../package/zeta"` | `package/zeta/...` |
+| `/work/app` | `"./"` | `app/...` |
+| `/work/app` | `"../"` | `work/...` |
+| `/work/app` | `"/srv/shared/pkg"` | `srv/shared/pkg/...` |
+| `C:\work\app` | `"D:\deps\zeta"` | `zeta/...` |
+
+Paths are checked when they are added: a missing path, a folder passed to
+`addFile`, a file passed to `addFolder`, or two entries that would share the
+same archive path all throw. Paths are resolved when added, so a later
+`Process.chdir` does not change what `finish()` reads. `finish()` reads the
+folders at that moment, in name order, including empty folders. A package with
+nothing added cannot be finished.
+
+### 44.3 Format and Safety
+
+- Packages are reproducible: identical inputs produce byte-identical `.orange`
+  files. Tar headers carry no owners or timestamps, so extracted files get the
+  current time.
+- `finish()` writes `<dest>/.<name>.orange.partial` first and renames it into
+  place, so an interrupted build never leaves a truncated package. A previous
+  build of the same package inside a packaged folder is left out.
+- Only regular files and folders are allowed. `finish()` throws on symlinks or
+  special files inside a packaged folder; a symlink passed directly to
+  `addFile` is stored as the file it points to.
+- `unpackage` throws on links, special files, and entries that would land
+  outside `dest`. Entries already extracted before the error stay on disk.
+
+```napalm
+const created = Package.package("http")
+    .addFiles(["README.md", "LICENSE"])
+    .addFolder("src")
+    .setPackageDest("dist")
+    .finish();
+System.print(created); // dist/http.orange
+
+const files = Package.unpackage("dist/http", "vendor/http");
+System.print(files.length); // number of extracted files
+```
+
+See [scripts/package.napalm](scripts/package.napalm) for a complete example.
+
+## 45. Regex
+
+`Regex` exposes the public string-matching API of
+[regexr 0.6.2](https://docs.rs/regexr/0.6.2/regexr/). The four built-in types are
+`Regex`, `RegexBuilder`, `RegexMatch`, and `RegexCaptures`. No import is needed;
+all four work in type annotations, `instanceof`, and `typeof`.
+
+### 45.1 Construction and Pattern Syntax
+
+```napalm
+const digits: Regex = new Regex("[0-9]+");
+System.print(digits.isMatch("order 123")); // true
+System.print(digits.find("order 123").asStr()); // 123
+System.print(digits.replaceAll("a12b34", "#")); // a#b#
+
+// Regex.new(pattern) is equivalent to new Regex(pattern).
+const words = Regex.new("\\w+");
+for (const match of words.findIter("hello world")) {
+    System.print(match.asStr()); // hello, then world
+}
+```
+
+Patterns are ordinary Napalm strings, so double backslashes when necessary:
+`"\\d+"` passes `\d+` to regexr. Regex literals such as `/pattern/i` are not
+supported. Flags belong inside the pattern: `(?i)hello`, `(?m)^line`,
+`(?s).`, `(?x)a b`, `(?-u)\w`, or scoped forms such as `(?i:hello)`.
+The supported flags are `i` (case-insensitive), `m` (multiline), `s` (dot
+matches newlines), `x` (extended), and `u` (Unicode). Syntax and matching
+semantics come directly from regexr, including character classes, alternation,
+greedy/lazy quantifiers, numbered/named groups, lookahead/lookbehind, Unicode
+properties, and backreferences. For example:
+
+```napalm
+System.print(Regex.new("(?i)hello").isMatch("HELLO")); // true
+System.print(Regex.new("(?<=foo)bar(?=!)").find("foobar!").asStr()); // bar
+System.print(Regex.new("(ab)\\1").isMatch("abab")); // true
+System.print(Regex.new("\\p{L}+").isMatch("café")); // true
+```
+
+Atomic groups, possessive quantifiers, and `\N{NAME}` are rejected by this
+version of regexr. Patterns, inputs, names, and replacements must be valid
+UTF-8 Strings; other values are not coerced. Invalid patterns and arguments
+throw catchable runtime errors.
+
+`Regex.escape(text)` escapes a literal for use as a pattern, including `#`
+and ASCII whitespace for extended mode. Its result is suitable outside a
+character class; do not insert it directly inside a handwritten `[...]`.
+
+```napalm
+const literal = "a.b|c";
+const exact = Regex.new("^" + Regex.escape(literal) + "$");
+System.print(exact.isMatch(literal)); // true
+```
+
+### 45.2 Regex Methods
+
+Every snake_case method has the camelCase alias shown below. Both spellings
+are calls, including `asStr()`, `engineName()`, and `captureNames()`.
+
+| Method | Alias | Result |
+| --- | --- | --- |
+| `Regex.new(pattern)` | `new Regex(pattern)` | Compile a Regex; throw on failure. |
+| `Regex.escape(text)` | — | Escape literal text. |
+| `Regex.builder(pattern)` | `RegexBuilder.new(pattern)` | Create a configurable builder. |
+| `re.as_str()` | `re.asStr()` | Original pattern String. |
+| `re.engine_name()` | `re.engineName()` | Selected engine's diagnostic name; not a stable engine-selection contract. |
+| `re.capture_names()` | `re.captureNames()` | Array of named groups only; order is unspecified. |
+| `re.is_match(text)` | `re.isMatch(text)` | Whether a match exists anywhere in the input. |
+| `re.try_is_match(text)` | `re.tryIsMatch(text)` | Same result, but throws when the configured backtracking budget is exhausted. |
+| `re.find(text)` | — | First `RegexMatch`, or `null`. |
+| `re.try_find(text)` | `re.tryFind(text)` | First match or `null`; throws on budget exhaustion. |
+| `re.find_iter(text)` | `re.findIter(text)` | Array of non-overlapping `RegexMatch` values. |
+| `re.captures(text)` | — | `RegexCaptures` for the first match, or `null`. |
+| `re.try_captures(text)` | `re.tryCaptures(text)` | First captures or `null`; throws on budget exhaustion. |
+| `re.captures_iter(text)` | `re.capturesIter(text)` | Array of non-overlapping `RegexCaptures` values. |
+| `re.replace(text, replacement)` | — | String with the first match replaced. |
+| `re.replace_all(text, replacement)` | `re.replaceAll(text, replacement)` | String with every match replaced. |
+
+The `*_iter` methods materialize Arrays eagerly, preserving regexr's order,
+non-overlap, anchor context, and empty-match progression. Use ordinary
+`for...of`, indexing, and `.length` on the returned Array. They are not lazy
+Rust iterators. Empty matches advance by complete Unicode characters; an
+empty match immediately following a nonempty match at the same endpoint is
+suppressed. For example, `Regex.new("a*").findIter("aa")` contains one match.
+
+Replacements are **literal**. `$0`, `$1`, `${name}`, and `$&` are inserted
+unchanged; there is no replacement callback or capture interpolation. This
+matches regexr. `String.replace` and `String.replaceAll` retain their ordinary
+literal-search behavior and do not accept a Regex.
+
+### 45.3 Match Results and UTF-8 Offsets
+
+`RegexMatch` values are returned by searches and capture accessors; there is
+no public constructor. They retain their text even after the original Regex
+and input variables go out of scope or garbage collection runs.
+
+| Method/property | Result |
+| --- | --- |
+| `match.start()` | Inclusive starting byte offset in the original input. |
+| `match.end()` | Exclusive ending byte offset in the original input. |
+| `match.range()` | Exclusive Napalm Range, `start...end`. |
+| `match.len()` or `match.length` | Matched byte count, `end - start`. |
+| `match.is_empty()` or `match.isEmpty()` | Whether the matched span is empty. |
+| `match.as_str()` or `match.asStr()` | Matched String. |
+| `match.as_bytes()` or `match.asBytes()` | Matched immutable Bytes. |
+
+Offsets and lengths are **UTF-8 bytes**, not String character indexes or UTF-16
+code units. Do not pass them directly to character-based String slicing.
+
+```napalm
+const match = Regex.new("世").find("é世🎉");
+System.print([match.start(), match.end(), match.len()]); // [2, 5, 3]
+System.print(match.asStr()); // 世
+System.print(match.asBytes().toUtf8()); // 世
+```
+
+### 45.4 Capture Results
+
+`RegexCaptures` has no public constructor. Group `0` is the complete match;
+remaining numeric slots correspond to capture groups. Unmatched optional
+groups retain their slots.
+
+| Method/property | Result |
+| --- | --- |
+| `captures.len()` or `captures.length` | Number of slots, including group 0. |
+| `captures.is_empty()` or `captures.isEmpty()` | Whether there are no slots. A successful capture normally includes slot 0. |
+| `captures.get(index)` | `RegexMatch`, or `null` for an absent/nonparticipating group. |
+| `captures.name(name)` | Named `RegexMatch`, or `null`. |
+| `captures[index]` | Matched String; throws if the group is absent or did not participate. |
+| `captures[name]` | Named matched String; throws if absent or nonparticipating. |
+
+Indexes must be nonnegative safe integer Numbers. Indexing follows regexr's
+string-returning `Index` API, with catchable Napalm errors instead of Rust
+panics. An empty participating group returns an empty match/String, not `null`.
+
+```napalm
+const re = Regex.new("(?<word>[a-z]+)(?:-(?<number>[0-9]+))?");
+const captures: RegexCaptures = re.captures("abc-12");
+System.print(captures[0]); // abc-12
+System.print(captures["word"]); // abc
+System.print(captures.name("number").start()); // 4
+System.print(re.captures("abc").name("number")); // null
+```
+
+### 45.5 Builder Options and Execution Errors
+
+Create a builder with `new RegexBuilder(pattern)`, `RegexBuilder.new(pattern)`,
+or `Regex.builder(pattern)`. Setters mutate and return the same builder for
+chaining. `build()` returns an independent Regex; the builder remains reusable
+and later changes do not affect previously compiled values.
+
+| Method | Alias | Default and meaning |
+| --- | --- | --- |
+| `builder.jit(enabled)` | — | `true`; request regexr's native compilation when available. Pass `false` to opt out explicitly. |
+| `builder.optimize_prefixes(enabled)` | `optimizePrefixes(enabled)` | `false`; merge shared prefixes in large literal alternations. |
+| `builder.backtrack_limit(limit)` | `backtrackLimit(limit)` | `100000000` search steps for fallible backreference searches. |
+| `builder.size_limit(limit)` | `sizeLimit(limit)` | `10000` expanded pattern elements. |
+| `builder.nest_limit(limit)` | `nestLimit(limit)` | `250` nesting depth for groups, classes, and flag scopes. |
+| `builder.build()` | — | Compile with the selected options; throw on failure. |
+
+Boolean options require a Bool. Limits require finite nonnegative integers;
+`sizeLimit` and `nestLimit` accept up to `4294967295`, and `backtrackLimit`
+accepts up to `9007199254740991` (Napalm's largest safe integer, rather than
+Rust's full `u64` range). Zero is passed to regexr unchanged.
+
+In **regexr 0.6.2**, the custom backtracking limit is consulted by `tryFind`,
+`tryCaptures`, and `tryIsMatch`. Budget exhaustion throws; a completed search
+with no match returns `null` or `false`. Ordinary searches, iterator methods,
+and replacements use the engine's default budget and treat exhaustion as no
+match (or the end of iteration), so they can yield partial results. Use the
+`try*` operations when distinguishing failure from absence matters.
+
+```napalm
+const re = Regex.builder("(a+)\\1").backtrackLimit(0).build();
+try {
+    re.tryFind("aaaa");
+} catch (error) {
+    System.print(error); // Regex error reporting exhausted backtracking budget
+}
+```
+
+Napalm enables regexr's JIT feature alongside SIMD. `new Regex(pattern)`,
+`Regex.new(pattern)`, and all builder constructors request `.jit(true)` by
+default: native compilation is attempted during construction or `build()`,
+without waiting for the pattern to become hot. This can increase creation
+time. Unlike regexr's own default, no explicit JIT option is needed in Napalm.
+Use `Regex.builder(pattern).jit(false).build()` to opt out for a particular
+Regex. Engine selection and fallback remain regexr's responsibility; a JIT
+request does not guarantee a JIT engine for every pattern/platform. This
+option is independent of Napalm's own tracing JIT and remains enabled when
+Napalm is built with `--no-default-features`.
+
+The binding covers regexr's public `Regex`, `RegexBuilder`, `Match`, `Captures`,
+and `escape` operations. Rust iterator/borrowing/`Result` types become Napalm
+Arrays, owned values, `null`, and exceptions; internal parser/compiler/VM
+modules are not exposed. Native Regex objects cannot currently cross a
+`launch` concurrent boundary; construct them inside the target context.
+
+See [scripts/regex.napalm](scripts/regex.napalm) for a complete example.

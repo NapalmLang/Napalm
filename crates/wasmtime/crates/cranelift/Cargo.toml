@@ -26,7 +26,6 @@ target-lexicon = { workspace = true }
 gimli = { workspace = true, features = ['std'] }
 object = { workspace = true, features = ['write', 'std'] }
 smallvec = { workspace = true }
-thiserror = { workspace = true }
 wasmtime-versioned-export-macros = { workspace = true }
 itertools = { workspace = true }
 pulley-interpreter = { workspace = true, optional = true }
@@ -49,4 +48,5 @@ features = [
 all-arch = ["cranelift-codegen/all-arch"]
 host-arch = ["cranelift-codegen/host-arch"]
 pulley = ["cranelift-codegen/pulley", "dep:pulley-interpreter"]
+pulley-fallback = ["cranelift-codegen/pulley-fallback"]
 trace-log = ["cranelift-codegen/trace-log"]

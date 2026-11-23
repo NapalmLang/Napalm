@@ -45,6 +45,7 @@
 
 use crate::dominator_tree::DominatorTree;
 pub use crate::isa::call_conv::CallConv;
+use crate::loop_analysis::LoopAnalysis;
 
 use crate::CodegenResult;
 use crate::ir::{self, Function, Type};
@@ -157,6 +158,18 @@ impl fmt::Display for LookupError {
             }
         }
     }
+}
+
+/// Returns an error if the `separate_constant_pool` setting is enabled, for
+/// backends that do not implement it.
+#[cfg(any(feature = "riscv64", feature = "s390x", feature = "pulley"))]
+fn check_no_separate_constant_pool(flags: &settings::Flags, arch: &str) -> CodegenResult<()> {
+    if flags.separate_constant_pool() {
+        return Err(crate::CodegenError::Unsupported(alloc::format!(
+            "separate_constant_pool is not supported on {arch}"
+        )));
+    }
+    Ok(())
 }
 
 /// The type of a polymorphic TargetISA object which is 'static.
@@ -310,6 +323,7 @@ pub trait TargetIsa: fmt::Display + Send + Sync {
         &self,
         func: &Function,
         domtree: &DominatorTree,
+        loop_analysis: &LoopAnalysis,
         regalloc_ctx: &mut regalloc2::Ctx,
         want_disasm: bool,
         ctrl_plane: &mut ControlPlane,

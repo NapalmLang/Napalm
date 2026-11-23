@@ -1181,9 +1181,7 @@ impl<'a> Parser<'a> {
             };
             self.type_parameters()?;
             let params = self.params()?;
-            // `async` functions declare `Promise<T>` while their body returns `T`;
-            // the annotation therefore never constrains `return` statements.
-            let return_type = self.variable_annotation()?.filter(|_| !async_);
+            let return_type = self.variable_annotation()?;
             // TypeScript overload signatures have no runtime body. Keep the final
             // implementation only; the overloads are erased like other types.
             if !self.at("{") {
@@ -3363,8 +3361,7 @@ impl<'a> Parser<'a> {
         // annotation here. For an unparenthesized arrow the preceding annotation
         // was the parameter annotation itself.
         let return_type = if function || parenthesized {
-            // Async closures declare `Promise<T>`; their `return` yields `T`.
-            self.variable_annotation()?.filter(|_| !async_)
+            self.variable_annotation()?
         } else {
             None
         };
@@ -4382,9 +4379,8 @@ impl<'a> Parser<'a> {
                     if is_constructor {
                         self.constructor_properties = Some(Vec::new());
                     }
-                    // Constructors always yield the new instance; `async` methods
-                    // declare `Promise<T>`. Neither annotation constrains `return`.
-                    let return_type = return_type.filter(|_| !is_constructor && !async_);
+                    // Constructors always yield the new instance.
+                    let return_type = return_type.filter(|_| !is_constructor);
                     let body = if generator {
                         self.generator_body(body_params, return_type, member_start)?
                     } else {

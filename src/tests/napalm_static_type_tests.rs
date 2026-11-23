@@ -301,7 +301,7 @@ fn napalm_static_return_contract_rejects_statically_wrong_returns() {
         diagnostics.iter().any(|diagnostic| diagnostic.code == "NAPALM-T007"),
         "{diagnostics:#?}"
     );
-    // Generic, void and async annotations never constrain `return`.
+    // Erased annotations remain unconstrained; async Promise<T> accepts T.
     for source in [
         "function id<T>(x: T): T { return x; } const result = id(\"a\");",
         "function nothing(): void { return 1; }",
@@ -330,6 +330,223 @@ fn napalm_static_return_contract_validates_dynamic_returns() {
         }
         assert!(vm.run_module(entry).is_err(), "a broken result contract must be fatal");
     }
+}
+
+#[test]
+fn napalm_static_return_contract_cannot_be_caught() {
+    for (declaration, call) in [
+        ("function checked(value): number { return value; }", "checked('bad')"),
+        ("class Box { checked(value): number { return value; } }", "new Box().checked('bad')"),
+        ("const checked = (value): number => value;", "checked('bad')"),
+        ("function checked(value): number { if (value) return 1; }", "checked(false)"),
+        ("function checked(value): number { if (value) return 1; return; }", "checked(false)"),
+    ] {
+        for invoke in [call.to_owned(), format!("new Fiber(() => {call}).try()") ] {
+            let source = format!("{declaration} try {{ {invoke}; }} catch (error) {{ }} const result = 1;");
+            interface_error(&source, false);
+        }
+    }
+}
+
+#[test]
+fn napalm_static_return_contract_remains_fatal_in_hot_code() {
+    interface_error(r#"
+        function checked(value): number { return value; }
+        function run() {
+            let total = 0;
+            for (let i = 0; i < 500; i++) {
+                const value: any = i == 499 ? 'bad' : i;
+                try { total += checked(value); } catch (error) { total = -1; }
+            }
+            return total;
+        }
+        const result = run();
+    "#, true);
+}
+
+#[test]
+fn napalm_static_return_contract_accepts_valid_and_nullable_returns() {
+    run_napalm(r#"
+        function checked(value): number { return value; }
+        function optional(value): number | null { if (value) return checked(7); }
+        const arrow = (value): number => value;
+        class Box { checked(value): number { return value; } }
+        const result = [checked(4), optional(true), optional(false), arrow(6), new Box().checked(8)];
+    "#, "[4, 7, null, 6, 8]");
+}
+
+#[test]
+fn napalm_async_return_contract_rejects_statically_wrong_returns() {
+    for source in [
+        "async function checked(): Promise<number> { return 'bad'; }",
+        "async function checked(): number { return 'bad'; }",
+        "const checked = async (): Promise<number> => 'bad';",
+        "class Box { async checked(): Promise<number> { return 'bad'; } }",
+        "concurrent function checked(): number { return 'bad'; }",
+    ] {
+        let diagnostics = static_type_diagnostics(source);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "NAPALM-T007"),
+            "{source}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn napalm_async_return_contract_accepts_values_and_adopted_promises() {
+    run_napalm(r#"
+        async function checked(value): Promise<number> { return value; }
+        async function short(value): number { return value; }
+        async function optional(value): Promise<number | null> { if (value) return 7; }
+        const arrow = async (value): Promise<number> => value;
+        class Box { async checked(value): Promise<number> { return value; } }
+        concurrent function worker(value): number { return value; }
+        const result = [await checked(1), await checked(Promise.resolve(2)),
+            await checked(Timer.delay(0, () => 3)), await short(4),
+            await optional(false), await arrow(Promise.resolve(5)),
+            await new Box().checked(Timer.delay(0, () => 6)), await launch worker(7)];
+    "#, "[1, 2, 3, 4, null, 5, 6, 7]");
+}
+
+#[test]
+fn napalm_async_return_contract_cannot_be_caught() {
+    for (declaration, call) in [
+        ("async function checked(value): Promise<number> { return value; }", "checked('bad')"),
+        ("async function checked(value): number { return value; }", "checked('bad')"),
+        ("const checked = async (value): Promise<number> => value;", "checked('bad')"),
+        ("class Box { async checked(value): Promise<number> { return value; } }", "new Box().checked('bad')"),
+        ("async function checked(value): Promise<number> { return Promise.resolve(value); }", "checked('bad')"),
+        ("async function checked(value): Promise<number> { return Timer.delay(0, () => value); }", "checked('bad')"),
+        ("async function checked(value): Promise<number> { return Timer.delay(0, () => { System.gc(); return value; }); }", "checked('bad')"),
+        ("async function checked(value): Promise<number> { await Timer.delay(0); return value; }", "checked('bad')"),
+        ("async function checked(value): Promise<number> { if (value) return 1; }", "checked(false)"),
+        ("async function checked(value): Promise<number> { if (value) return 1; return; }", "checked(false)"),
+    ] {
+        return_contract_runtime_error(&format!("{declaration} try {{ await {call}; }} catch (error) {{ }} const result = 1;"));
+    }
+}
+
+#[test]
+fn napalm_async_return_contract_is_fatal_without_awaiting_the_result() {
+    for invoke in ["checked(source)", "new Fiber(() => checked(source)).try()"] {
+        return_contract_runtime_error(&format!(r#"
+            async function checked(value): Promise<number> {{ return value; }}
+            const source = Timer.delay(0, () => 'bad');
+            try {{ {invoke}; await source; }} catch (error) {{ }}
+            const result = 1;
+        "#));
+    }
+}
+
+#[test]
+fn napalm_async_return_contract_persists_on_structural_results() {
+    for return_value in ["value", "Promise.resolve(value)", "Timer.delay(0, () => value)"] {
+        return_contract_runtime_error(&format!(r#"
+            interface Result {{ value: number; }}
+            async function checked(value): Promise<Result> {{ return {return_value}; }}
+            const alias: any = {{value: 1}};
+            const item = await checked(alias);
+            System.gc();
+            try {{ alias.value = 'bad'; }} catch (error) {{ }}
+            const result = 1;
+        "#));
+    }
+}
+
+#[test]
+fn napalm_async_return_contract_preserves_rejection_and_finally_semantics() {
+    run_napalm(r#"
+        let log = '';
+        async function checked(): Promise<number> {
+            try { return Promise.reject('ordinary'); }
+            catch (error) { log += 'caught in body'; return 0; }
+            finally { log += 'finally;'; }
+        }
+        try { await checked(); } catch (error) { log += error; }
+        const result = log;
+    "#, "finally;ordinary");
+}
+
+#[test]
+fn napalm_concurrent_return_contract_cannot_be_caught() {
+    for invoke in ["await launch checked('bad')", "new Fiber(() => launch checked('bad')).try()"] {
+        return_contract_runtime_error(&format!(r#"
+            concurrent function checked(value): number {{ return value; }}
+            try {{ {invoke}; }} catch (error) {{ }}
+            const result = 1;
+        "#));
+    }
+    run_napalm(r#"
+        concurrent function ordinary() { throw 'ordinary'; }
+        let caught = false;
+        try { await launch ordinary(); } catch (error) { caught = true; }
+        const result = caught;
+    "#, "true");
+}
+
+// Fatal contracts must survive both compilation pipelines and JIT settings.
+fn return_contract_runtime_error(source: &str) {
+    for build in [false, true] {
+        let parsed = crate::napalm_front_main::parse("return.nap", source);
+        assert!(!parsed.has_errors(), "{source}: {:?}", parsed.diagnostics);
+        let mut hir = Program::new();
+        let manifest = napalm_builtin::install_hir_builtins(&mut hir);
+        let lowered = lower_module(&mut hir, "return.nap", source, "return", &parsed.module);
+        assert!(!lowered.has_errors(), "{source}: {:?}", lowered.diagnostics);
+        let entry = lowered.lowered.unwrap().entry;
+        let program = if build {
+            crate::napalm_build_pipeline::compile_program(&mut hir).unwrap()
+        } else {
+            compile_program(&mut hir).unwrap()
+        };
+        for jit in [false, true] {
+            let mut vm = source_vm(&program, &manifest);
+            if !jit { vm.set_jit_options(None); }
+            let result = vm.run_module(entry);
+            assert!(matches!(&result, Err(error) if error.message.starts_with(interfaces::TYPE_ERROR)),
+                "build={build}, jit={jit}: {result:?}\n{source}");
+        }
+    }
+}
+
+#[test]
+fn napalm_async_return_contract_validates_combinator_settlements() {
+    for (ty, promise) in [
+        ("number", "Promise.race([Timer.delay(0, () => value)])"),
+        ("number", "Promise.any([Timer.delay(0, () => value)])"),
+        ("Array<number>", "Promise.all([Timer.delay(0, () => value)])"),
+    ] {
+        return_contract_runtime_error(&format!(r#"
+            async function checked(value): Promise<{ty}> {{ return {promise}; }}
+            try {{ await checked('bad'); }} catch (error) {{ }}
+            const result = 1;
+        "#));
+    }
+}
+
+#[test]
+fn napalm_async_return_contract_allows_cancellation() {
+    run_napalm(r#"
+        async function checked(value): Promise<number> { return value; }
+        async function checkpoint() { }
+        const source = Timer.delay(60000);
+        source.cancel();
+        const adopted = checked(source);
+        await checkpoint();
+        const result = source.isCancelled && adopted.isCancelled;
+    "#, "true");
+}
+
+#[test]
+fn napalm_async_return_contract_remains_fatal_in_hot_code() {
+    interface_error(r#"
+        async function checked(): Promise<number> {
+            let total = 0;
+            for (let i = 0; i < 500; i++) total += i;
+            const value: any = total > 0 ? 'bad' : total;
+            return Timer.delay(0, () => value);
+        }
+        try { await checked(); } catch (error) { }
+        const result = 1;
+    "#, true);
 }
 
 #[test]

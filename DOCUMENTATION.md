@@ -1056,7 +1056,7 @@ It is not accurate to say that all its annotations are erased.
 | Annotated parameters | Validated on function entry, including structural contracts. |
 | Annotated or inferred class fields | Constrain writes and reads of uninitialized fields. |
 | Interfaces, structural aliases, typed lists, generic Map/Set | Can install persistent contracts on objects. |
-| Return annotation | Accepted, but is not a return-value contract. |
+| Concrete return annotation | Checks returned values, including async results and concurrent workers; a dynamic mismatch is an unrecoverable contract error. |
 | `class C implements I` | Adds the fields of `I` to `C` and requires the required ones to be initialized (§14.7). |
 | Visibility modifiers, `override` | Do not by themselves implement access control. |
 | `as T`, `<T>value`, `satisfies T`, `value!` | Syntax accepted without converting or checking the value at runtime. |
@@ -1072,22 +1072,47 @@ function needsNumber(value: number) {
     return value;
 }
 try {
-    needsNumber("no es un numero");
+    needsNumber("This is not a number");
 } catch (error) {
-    System.print("este catch no recupera una infraccion de tipo");
+    System.print("This doesn't catch and recover from a contract error");
 }
 ```
 
-By contrast, a return annotation does not enforce the result:
+Return annotations are contracts too. A known
+incompatible return is rejected during compilation. A dynamic return is
+validated before leaving the function, and a violation cannot be caught:
 
-```napalm
-function documentedReturn(): number {
-    return "texto";
+```napalm runtime-error
+function checkedReturn(value): number {
+    return value;
 }
-System.print(documentedReturn()); // texto
+try {
+    checkedReturn("text");
+} catch (error) {
+    System.print("This cannot recover from a return contract violation");
+}
 ```
 
-To validate a dynamic return, assign the result to an annotated variable.
+The check also applies to methods, expression-bodied closures, bare `return`,
+and falling off the end of a function. The latter two return `null`, so they
+violate a `number` result contract unless `null` is explicitly allowed.
+It is not necessary to assign the result to an annotated variable to validate it.
+
+For an `async` function annotated `Promise<T>`, the contract applies to the
+fulfilled value `T`. An annotation of just `T` has the same effect. Returning
+another Promise checks its fulfilled value, including when it settles later;
+the caller does not need to await the result for the contract to apply.
+Ordinary rejections remain recoverable, but a contract violation terminates
+execution rather than rejecting the Promise. Methods and async closures follow
+the same rules.
+
+For a `concurrent` function, the annotation checks the worker's returned value.
+`launch` wraps that result in a Promise. A contract violation in the worker is
+fatal in the launching interpreter too; it cannot be caught by awaiting that
+Promise or using `Fiber.try`.
+
+`any`, erased generic return types, `void`, and `never` currently impose no
+return-value check.
 
 ### 8.2 Recognized Types
 
@@ -3845,7 +3870,7 @@ See [README_FFI.md](README_FFI.md) for the complete C contract.
 | `let x;` is a valid declaration. | Variables require an initializer. |
 | No annotation means any. | Inference can be restrictive. |
 | All types are erased. | Variables, parameters, fields, and contracts can be validated. |
-| A return annotation guarantees the return value. | That annotation is not currently checked. |
+| Return annotations are only documentation. | Concrete return contracts are enforced, including async results and concurrent workers; violations cannot be caught. |
 | `as` converts or validates. | It does not change the value. |
 | Structural `interface` and `type` are interchangeable. | Interface is open; object alias is closed. |
 | `implements` lets an instance bind to an interface annotation. | It adds and checks fields; interface/type annotations still require Maps. Test instances with `instanceof`. |

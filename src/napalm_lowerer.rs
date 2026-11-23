@@ -614,7 +614,7 @@ fn requires_runtime_contract(ty: &Type) -> bool {
         Type::Interface(_) | Type::Record(_) | Type::List(Some(_)) | Type::GenericMap(_, _) | Type::Set(Some(_)) => true,
         Type::GenericInstance { .. } => true,
         Type::Builtin(
-            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet | BuiltinId::Generator,
+            BuiltinId::Event | BuiltinId::Emitter | BuiltinId::Channel | BuiltinId::Receiver | BuiltinId::ConcurrentMap | BuiltinId::ConcurrentSet | BuiltinId::Generator | BuiltinId::Promise,
             Some(_),
         ) => true,
         Type::Union(ts) => ts.iter().any(requires_runtime_contract),
@@ -2989,7 +2989,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
         // annotations resolve to Bottom and `void`/generics to Top: neither
         // constrains returns, so both are treated as "no contract".
         let return_contract = match &node.ast {
-            FunctionAst::Body(body) if !spec.constructor && !spec.is_async => {
+            FunctionAst::Body(body) if !spec.constructor => {
                 body.return_type.as_ref().and_then(|annotation| {
                     if invalid_structural_annotation(annotation, &self.interface_types) {
                         self.diagnostics.push(Diagnostic::error(
@@ -3004,6 +3004,23 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                         &self.top_level_classes,
                         &self.interface_types,
                     );
+                    // Async returns adopt Promises without awaiting them inside
+                    // the body (which would change catch/finally semantics).
+                    // Check immediate values and persist the same contract on
+                    // adopted Promises until they settle.
+                    let expected = if spec.is_async {
+                        let inner = match expected {
+                            Type::Builtin(BuiltinId::Promise, inner) => inner.map_or(Type::Top, |inner| *inner),
+                            other => other,
+                        };
+                        if matches!(inner, Type::Top | Type::Bottom) {
+                            inner
+                        } else {
+                            Type::flow_join_many([inner.clone(), Type::Builtin(BuiltinId::Promise, Some(Box::new(inner)))])
+                        }
+                    } else {
+                        expected
+                    };
                     (!matches!(expected, Type::Top | Type::Bottom)).then(|| StaticBindingType {
                         expected,
                         origin: annotation.span,

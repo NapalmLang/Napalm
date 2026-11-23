@@ -271,8 +271,15 @@ impl Heap {
                     | (BuiltinId::Emitter, Some(HeapObject::Emitter { state }))
                     | (BuiltinId::Channel, Some(HeapObject::Channel { state }))
                     | (BuiltinId::Receiver, Some(HeapObject::Receiver { state })) => unsafe { state.get() },
-                    // Promise payloads are checked when awaited, not stored as handle contracts.
-                    (BuiltinId::Promise, Some(HeapObject::Promise { .. })) => return Ok(()),
+                    (BuiltinId::Promise, Some(HeapObject::Promise { state })) => {
+                        if let Some(element) = element {
+                            if let PromiseState::Fulfilled(result) = unsafe { state.get() } {
+                                self.plan_contract(*result, element, "promise result", plan)?;
+                            }
+                            plan.push((value, expected.clone()));
+                        }
+                        return Ok(());
+                    }
                     _ => return Err(mismatch(path, expected)),
                 };
                 if let Some(element) = element {
@@ -350,9 +357,12 @@ impl Heap {
             };
             let (handle, shape, already_installed) = {
                 let managed = unsafe { managed_object(object) };
-                // The Promise handle entry reuses the contract-pointer word for
-                // its settled payload, so a contract would corrupt it.
-                if matches!(managed.object, HeapObject::Promise { .. }) {
+                // Promise handles use the contract-pointer word for their
+                // settled payload. Keep result contracts in the cell instead.
+                if let HeapObject::Promise { state } = &managed.object {
+                    if let Type::Builtin(BuiltinId::Promise, Some(element)) = ty {
+                        unsafe { state.add_result_contract(*element); }
+                    }
                     continue;
                 }
                 let installed = self.interface_matches(value, &ty);

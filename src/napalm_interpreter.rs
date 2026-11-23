@@ -3205,11 +3205,23 @@ enum PromiseState {
 
 struct PromiseCell {
     state: std::cell::UnsafeCell<PromiseState>,
+    result_contracts: std::cell::UnsafeCell<Vec<Type>>,
 }
 
 impl PromiseCell {
     fn new(state: PromiseState) -> Self {
-        Self { state: std::cell::UnsafeCell::new(state) }
+        Self {
+            state: std::cell::UnsafeCell::new(state),
+            result_contracts: std::cell::UnsafeCell::new(Vec::new()),
+        }
+    }
+
+    // Like state, result contracts are accessed only by the owning interpreter.
+    unsafe fn add_result_contract(&self, expected: Type) {
+        let contracts = unsafe { &mut *self.result_contracts.get() };
+        if !contracts.contains(&expected) {
+            contracts.push(expected);
+        }
     }
 
     #[inline(always)]
@@ -11471,7 +11483,11 @@ impl<'p> Interpreter<'p> {
     /// Select the next runnable continuation. External I/O completions are first
     /// converted into Promise settlements; their continuation edges then enter
     /// the ordinary microtask queue before another execution is selected.
+    /// A false result can also mean fatal failure; callers must preserve it.
     fn schedule_next_ready(&mut self) -> bool {
+        if self.run_state == RunState::Failed {
+            return false;
+        }
         self.drain_http_requests();
         self.drain_fetch_completions();
         self.drain_concurrent_completions();
@@ -11483,7 +11499,7 @@ impl<'p> Interpreter<'p> {
     }
 
     fn drain_fetch_completions(&mut self) {
-        loop {
+        while self.run_state != RunState::Failed {
             let completion = self.fetch.as_mut().and_then(FetchRuntime::try_completion);
             let Some(completion) = completion else {
                 break;
@@ -11496,7 +11512,7 @@ impl<'p> Interpreter<'p> {
     }
 
     fn drain_concurrent_completions(&mut self) {
-        loop {
+        while self.run_state != RunState::Failed {
             let completion = self.concurrent.as_mut().and_then(ConcurrentRuntime::try_completion);
             let Some(completion) = completion else {
                 break;
@@ -11509,7 +11525,8 @@ impl<'p> Interpreter<'p> {
     }
 
     fn drain_runtime_microtasks(&mut self) {
-        while let Some(event) = self.event_loop.pop_microtask() {
+        while self.run_state != RunState::Failed {
+            let Some(event) = self.event_loop.pop_microtask() else { break; };
             self.process_runtime_event(event);
             if self.run_state == RunState::Failed {
                 break;
@@ -11523,6 +11540,9 @@ impl<'p> Interpreter<'p> {
     /// timer deadline arrives without polling.
     fn drive_event_loop_until_runnable(&mut self) -> bool {
         loop {
+            if self.run_state == RunState::Failed {
+                return false;
+            }
             // Consume wake signals before queues: draining them afterwards can
             // lose a notification arriving between queue inspection and sleep.
             while self.external_wake_rx.try_recv().is_ok() {}
@@ -12114,6 +12134,21 @@ impl<'p> Interpreter<'p> {
         outcome: PromiseOutcome,
     ) -> Result<(), RuntimeError> {
         let cell = self.promise_cell(promise)?;
+        if !matches!(unsafe { cell.get() }, PromiseState::Pending { .. }) {
+            return Err(RuntimeError::new("Promise has already been settled"));
+        }
+        if let PromiseOutcome::Fulfilled(value) = outcome {
+            let contracts = unsafe { &*cell.result_contracts.get() }.clone();
+            for expected in contracts {
+                if let Err(error) = self.heap.bind_contract(value, &expected) {
+                    // Some settlement callers deliberately ignore ordinary
+                    // duplicate-resolution errors. Contract errors are fatal
+                    // even without a waiter on this Promise.
+                    self.fail_terminal(error.clone());
+                    return Err(error);
+                }
+            }
+        }
         self.heap.remember_owner(promise);
         let replacement = match outcome {
             PromiseOutcome::Fulfilled(value) => PromiseState::Fulfilled(value),
@@ -13616,6 +13651,11 @@ impl<'p> Interpreter<'p> {
                     PromiseOutcome::Rejected(reason)
                 }
             },
+            Err(message) if message.starts_with(interfaces::TYPE_ERROR) => {
+                self.release_root(promise_root);
+                self.fail_terminal(RuntimeError::new(message));
+                return;
+            }
             Err(message) => {
                 let reason = self.heap.alloc(HeapObject::String(NapalmString::new(StrBytes::from(
                     format!("ConcurrentError: {message}").into_bytes(),
@@ -14874,7 +14914,7 @@ impl<'p> Interpreter<'p> {
         } else {
             self.reject_execution(current, reason);
         }
-        if self.run_state != RunState::Failed && !self.schedule_next_ready() {
+        if !self.schedule_next_ready() && self.run_state != RunState::Failed {
             self.switch_current_fiber(0);
             self.run_state = if self.fiber(0).status == FiberStatus::Done {
                 RunState::Returned
@@ -14933,7 +14973,7 @@ impl<'p> Interpreter<'p> {
                 state.await_raw_pc = await_raw_pc;
                 state.suspend_dst = Some(dst);
 
-                if !self.schedule_next_ready() {
+                if !self.schedule_next_ready() && self.run_state != RunState::Failed {
                     // Park only when the public execution itself is waiting. A
                     // detached async task must not keep an already-completed main
                     // module artificially suspended just because its Promise is
@@ -14971,7 +15011,7 @@ impl<'p> Interpreter<'p> {
             if self.run_state == RunState::Failed {
                 return;
             }
-            if self.schedule_next_ready() {
+            if self.schedule_next_ready() || self.run_state == RunState::Failed {
                 return;
             }
             // No async continuation is runnable. Return control to the public
@@ -14993,7 +15033,7 @@ impl<'p> Interpreter<'p> {
             main.status = FiberStatus::Done;
             main.last_value = value;
             self.result = value;
-            if self.schedule_next_ready() {
+            if self.schedule_next_ready() || self.run_state == RunState::Failed {
                 return;
             }
             self.run_state = RunState::Returned;
@@ -18056,7 +18096,7 @@ impl Interpreter<'_> {
             self.fail_terminal(error);
             return;
         }
-        if self.run_state == RunState::Failed || self.schedule_next_ready() {
+        if self.schedule_next_ready() || self.run_state == RunState::Failed {
             return;
         }
         self.switch_current_fiber(0);
@@ -23360,35 +23400,30 @@ var result = ok * 1000 + failed * 100 + xs.length;
 
         // The bytecode optimizer lays the cold `: 1` arm of `cost` out of line
         // (after the return, jumping back). It must still become a Select:
-        // one side exit per character match would dominate the loop.
+        // a changed comparison must not require a side exit from the loop.
+        // Keep the hot path numeric: string/list fast-path guards can prevent
+        // the original Levenshtein workload from recording this diamond at all.
         let source = r#"
-function lev(a, b) {
-  const m = a.length;
-  const n = b.length;
-  let prev = [];
-  let cur = [];
-  for (let j = 0; j <= n; j++) { prev.push(j); cur.push(0); }
-  for (let i = 1; i <= m; i++) {
-    cur[0] = i;
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] == b[j - 1] ? 0 : 1;
-      let best = prev[j] + 1;
-      if (cur[j - 1] + 1 < best) { best = cur[j - 1] + 1; }
-      if (prev[j - 1] + cost < best) { best = prev[j - 1] + cost; }
-      cur[j] = best;
-    }
-    const t = prev; prev = cur; cur = t;
-  }
-  return prev[n];
-}
-let a = "";
-let b = "";
-for (let k = 0; k < 6; k++) { a = a + "kitten sat "; b = b + "sitting on "; }
-let total = 0;
-for (let r = 0; r < 12; r++) { total = total + lev(a, b) * 100 + lev(b, a); }
-var result = total;
-"#;
+            function cost(a: number, b: number): number {
+                let total = 0;
+                for (let i = 0; i < 200; i++) {
+                    total += a == b ? 0 : 1;
+                    a++;
+                }
+                return total;
+            }
+            var result = cost(0, 50) + cost(50, 0);
+        "#;
         let (program, entry, manifest) = compile_typescript_module(source);
+        let cost = program.functions.iter()
+            .find(|function| function.module == program.function(entry).unwrap().module
+                && function.kind == FunctionKind::Closure)
+            .unwrap();
+        let instructions = crate::napalm_bytecode::Decoder::new(&cost.chunk.code)
+            .map(Result::unwrap).collect::<Vec<_>>();
+        let return_pc = instructions.iter().find(|op| op.opcode == Opcode::Return).unwrap().pc;
+        assert!(instructions.iter().any(|op| op.pc.0 > return_pc.0 && op.opcode == Opcode::Jump),
+            "fixture must keep the cold ternary arm after the return");
         let mut results = Vec::new();
         for native in [false, true] {
             let mut vm = source_vm(&program, &manifest);
@@ -23427,6 +23462,7 @@ var result = total;
             }
         }
         assert_eq!(results[0], results[1], "{} vs {}", f64::from_bits(results[0]), f64::from_bits(results[1]));
+        assert_eq!(f64::from_bits(results[0]), 399.0);
     }
 
     #[test]

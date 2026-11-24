@@ -350,7 +350,7 @@ class ModuleIndexer {
         const buffer = this.openPaths.get(key);
         const uri = buffer === null ? displayUri(path) : buffer.uri;
         if (uri === null) return null;
-        const cached = this.previous === null ? null : this.previous.modules.get(key);
+        const cached = null === this.previous ? null : this.previous.modules.get(key);
         // Closed files can reuse their snapshot until a watched-file notification
         // invalidates them. Open buffers are always checked against their text.
         const canReuseDisk = buffer === null && cached !== null && !this.dirty.has(key) &&
@@ -507,7 +507,9 @@ export function buildModuleIndex(documents, roots) {
 // Module links and diagnostics are always rebuilt, so updates to re-exports,
 // new files, or removed dependencies cannot leave stale cross-module results.
 export function updateModuleIndex(previous, documents, roots, dirtyPaths) {
-    if (previous !== null && previous.roots.join("\n") !== roots.join("\n")) previous = null;
+    // Equality dispatches on the left operand in Napalm. ModuleIndexer has no
+    // equality operator; compare from Null when checking a class instance.
+    if (null !== previous && previous.roots.join("\n") !== roots.join("\n")) previous = null;
     const index = new ModuleIndexer(documents, roots, previous, dirtyPaths);
     for (const uri of documents.keys()) {
         const path = pathFromUri(uri);
@@ -575,6 +577,7 @@ function hit(range, position) {
 function occurrenceLocation(record, symbol) {
     if (symbol === null) return null;
     const link = record.links.get(symbol.id);
+    if (symbol.kind === "import") return link;
     return link === null ? localLocation(record, symbol) : link;
 }
 

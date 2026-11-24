@@ -386,10 +386,15 @@ function installVsix(file: string): void {
     run(invocation.command, invocation.args, invocation.cwd, invocation.shell);
 }
 
-function verifyPackage(vsix: string, binary: {name: string; size: number}): void {
+export function verifyPackage(vsix: string, binary: {name: string; size: number}): void {
     const required = [
         ['extension/package.json', null],
         ['extension/extension.js', null],
+        ['extension/node_modules/vscode-languageclient/package.json', null],
+        ['extension/node_modules/vscode-languageclient/lib/node/main.js', null],
+        ['extension/node_modules/vscode-languageserver-protocol/lib/node/main.js', null],
+        ['extension/node_modules/vscode-jsonrpc/lib/node/main.js', null],
+        ['extension/node_modules/vscode-languageserver-types/lib/umd/main.js', null],
         [`extension/server/${binary.name}`, binary.size],
         ['extension/icons/extension-logo-256.png', null],
         ['extension/icons/flame-32.png', null],
@@ -480,6 +485,14 @@ export function build(options: Options): string {
 
         // The build script lives outside the VS Code extension and has its own tests.
         run(node, ['--test', path.join(REPOSITORY_ROOT, 'lsp', 'tests', 'build-vscode.test.mjs')], REPOSITORY_ROOT);
+        if (options.target === detectTarget()) {
+            const result = spawnSync(node, ['--test', path.join(REPOSITORY_ROOT, 'lsp', 'tests', 'server.test.mjs')], {
+                cwd: REPOSITORY_ROOT, stdio: 'inherit', windowsHide: true,
+                env: {...process.env, NAPALM_LSP_BIN: compiled},
+            });
+            if (result.error) throw result.error;
+            if (result.status !== 0) throw new Error('Compiled LSP failed its protocol and editor feature tests');
+        }
     }
     const binary = stageServer(compiled, options.target);
     const outputFolder = asAbsolute(options.out);

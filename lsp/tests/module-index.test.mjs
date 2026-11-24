@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync, existsSync, realpathSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {posix as path} from 'node:path';
+import path from 'node:path';
 import {pathToFileURL, fileURLToPath} from 'node:url';
 import {dirname, join} from 'node:path';
 import {fileURLToPath as herePath} from 'node:url';
@@ -18,6 +18,7 @@ const sources = ['lexer.napalm', 'parser.napalm', 'semantic.napalm', 'module_ind
     .replaceAll('typeof raw !== "String"', 'typeof raw !== "string"')
     .replaceAll('typeof home === "String"', 'typeof home === "string"')
     .replaceAll('typeof item === "String"', 'typeof item === "string"')
+    .replaceAll('typeof path === "String"', 'typeof path === "string"')
     .replace('for (const entry of properties) value[entry.key] = entry.value;',
       'for (const key of Object.keys(properties)) value[key] = properties[key];')
     .replace('if (node[field] === null) return null;', 'if (node[field] == null) return null;'));

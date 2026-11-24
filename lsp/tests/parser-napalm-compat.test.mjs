@@ -91,5 +91,5 @@ test('No unsupported Set(iterable) or multiple increment expressions in for', ()
 test('The editor passes its existing lexical result to parseLexed', () => {
   assert.match(moduleIndex, /import \{parseLexed\} from "\.\/parser"/);
   assert.match(moduleIndex, /parseLexed\(source, lexical\)/);
-  assert.match(server, /buildModuleIndex\(state\["documents"\]/);
+  assert.match(server, /updateModuleIndex\(state\["moduleIndex"\], state\["documents"\]/);
 });

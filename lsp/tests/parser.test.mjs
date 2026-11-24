@@ -31,7 +31,7 @@ test('parser provides UTF-8 and UTF-16 ranges, error recovery and complexity gua
 
 test('server publishes both lexical and syntax diagnostics from the unsaved document', () => {
   assert.match(moduleIndex, /import \{parseLexed\} from "\.\/parser"/);
-  assert.match(moduleIndex, /const parsed = parseLexed\(source, lexical\)/);
+  assert.match(moduleIndex, /parseLexed\(source, lexical\)/);
   assert.match(moduleIndex, /source: "napalm-parser"/);
   assert.match(server, /method: "textDocument\/publishDiagnostics"/);
 });

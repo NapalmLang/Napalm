@@ -5,16 +5,18 @@ import {existsSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {dirname, resolve, isAbsolute} from 'node:path';
 import {encodeFrame, FrameDecoder} from './protocol.mjs';
+import {EventEmitter} from 'node:events';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const executable = process.env.NAPALM_BIN ?? resolve(
+const standalone = process.env.NAPALM_LSP_BIN;
+const executable = standalone ?? process.env.NAPALM_BIN ?? resolve(
   projectRoot,
   process.platform === 'win32' ? 'target/release/napalm.exe' : 'target/release/napalm',
 );
 const canExecute = isAbsolute(executable) ? existsSync(executable) : true;
 
 async function runServer(frames, {expectedExit = 0, timeoutMs = 30_000} = {}) {
-  const child = spawn(executable, ['lsp/main.napalm'], {
+  const child = spawn(executable, standalone ? [] : ['lsp/main.napalm'], {
     cwd: projectRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
@@ -55,6 +57,98 @@ async function runServer(frames, {expectedExit = 0, timeoutMs = 30_000} = {}) {
 
 const onlyIfPresent = {skip: !canExecute && 'Build Napalm or set NAPALM_BIN to run live LSP tests'};
 
+test('Editor features respond on an open connection and stay fresh after edits', onlyIfPresent, async (t) => {
+  const child = spawn(executable, standalone ? [] : ['lsp/main.napalm'], {
+    cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+  });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
+  const decoder = new FrameDecoder();
+  const received = [];
+  const events = new EventEmitter();
+  let failure = null;
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+  child.on('error', error => { failure = error; events.emit('update'); });
+  child.stdout.on('data', chunk => {
+    try { received.push(...decoder.push(chunk)); }
+    catch (error) { failure = error; }
+    events.emit('update');
+  });
+  const closed = new Promise(resolveClosed => child.once('close', code => {
+    failure ??= new Error(`LSP exited (${code}): ${stderr}`);
+    events.emit('update');
+    resolveClosed(code);
+  }));
+  function waitFor(predicate) {
+    return new Promise((resolveMessage, rejectMessage) => {
+      const timer = setTimeout(() => finish(new Error(`LSP response timed out: ${stderr}`)), 10_000);
+      function finish(error, value) {
+        clearTimeout(timer);
+        events.off('update', check);
+        if (error) rejectMessage(error);
+        else resolveMessage(value);
+      }
+      function check() {
+        const index = received.findIndex(predicate);
+        if (index >= 0) finish(null, received.splice(index, 1)[0]);
+        else if (failure) finish(failure);
+      }
+      events.on('update', check);
+      check();
+    });
+  }
+  function send(method, params, id) {
+    child.stdin.write(encodeFrame({jsonrpc: '2.0', method, params, ...(id === undefined ? {} : {id})}));
+  }
+  let nextId = 1;
+  async function request(method, params) {
+    const id = nextId++;
+    send(method, params, id);
+    const response = await waitFor(message => message.id === id);
+    assert.equal(response.error, undefined, JSON.stringify(response.error));
+    return response.result;
+  }
+  const uri = 'file:///project/interactive.napalm';
+  const textDocument = {uri};
+  const source = 'const value = 1;\nconst result = value;\nconst broken = missing;\n';
+  const diagnostics = version => waitFor(message => message.method === 'textDocument/publishDiagnostics' &&
+    message.params.uri === uri && message.params.version === version);
+  const initialization = await request('initialize', {capabilities: {}});
+  assert.equal(initialization.capabilities.completionProvider.resolveProvider, false);
+  send('initialized', {});
+  send('textDocument/didOpen', {textDocument: {uri, languageId: 'napalm', version: 1, text: source}});
+  assert.ok((await diagnostics(1)).params.diagnostics.some(item => item.code === 'NAPALM-SEM-001'));
+  const position = {line: 1, character: 16};
+  const definition = await request('textDocument/definition', {textDocument, position});
+  assert.deepEqual(definition, {uri, range: {start: {line: 0, character: 6}, end: {line: 0, character: 11}}});
+  const hover = await request('textDocument/hover', {textDocument, position});
+  assert.match(hover.contents.value, /value/);
+  const completions = await request('textDocument/completion', {textDocument, position: {line: 1, character: 18}});
+  assert.ok(completions.items.some(item => item.label === 'value'));
+  const references = await request('textDocument/references', {textDocument, position, context: {includeDeclaration: true}});
+  assert.equal(references.length, 2);
+  const rename = await request('textDocument/rename', {textDocument, position, newName: 'renamed'});
+  assert.equal(rename.changes[uri].length, 2);
+  const tokens = await request('textDocument/semanticTokens/full', {textDocument});
+  assert.ok(tokens.data.length > 0 && tokens.data.length % 5 === 0);
+  send('textDocument/didChange', {textDocument: {uri, version: 2}, contentChanges: [{
+    range: {start: {line: 2, character: 15}, end: {line: 2, character: 22}}, text: 'value',
+  }]});
+  assert.deepEqual((await diagnostics(2)).params.diagnostics, []);
+  const editedDefinition = await request('textDocument/definition', {textDocument, position: {line: 2, character: 16}});
+  assert.deepEqual(editedDefinition, definition);
+  // Exercise the watcher fallback with an existing ModuleIndexer instance.
+  send('workspace/didChangeWatchedFiles', {changes: []});
+  assert.deepEqual((await diagnostics(2)).params.diagnostics, []);
+  assert.equal(await request('shutdown', null), null);
+  send('exit');
+  child.stdin.end();
+  const exitTimer = setTimeout(() => child.kill(), 10_000);
+  try { assert.equal(await closed, 0); }
+  finally { clearTimeout(exitTimer); }
+  assert.equal(stderr, '');
+});
+
 test('Initialize, incremental sync, unknown request, shutdown, exit', onlyIfPresent, async () => {
   const uri = 'file:///project/source.napalm';
   const packets = [
@@ -70,7 +164,7 @@ test('Initialize, incremental sync, unknown request, shutdown, exit', onlyIfPres
       }, rangeLength: 2, text: 'Q'}],
     }},
     {jsonrpc: '2.0', method: 'textDocument/didClose', params: {textDocument: {uri}}},
-    {jsonrpc: '2.0', id: 'no-method', method: 'textDocument/hover', params: {}},
+    {jsonrpc: '2.0', id: 'no-method', method: 'napalm/unknown', params: {}},
     {jsonrpc: '2.0', id: 3, method: 'shutdown', params: null},
     {jsonrpc: '2.0', method: 'exit'},
   ];
@@ -127,7 +221,7 @@ test('Lexer publishes UTF-16 diagnostics for unsaved documents and clears them',
     {jsonrpc: '2.0', id: 2, method: 'shutdown'},
     {jsonrpc: '2.0', method: 'exit'},
   ];
-  const {responses} = await runServer(messages.map(encodeFrame));
+  const {responses} = await runServer(messages.map((message) => encodeFrame(message)));
   const diagnostics = responses.filter((item) => item.method === 'textDocument/publishDiagnostics');
   assert.equal(diagnostics.length, 3);
   assert.equal(diagnostics[0].params.version, 1);
@@ -151,7 +245,7 @@ test('Parser diagnostics recover after a valid incremental edit', onlyIfPresent,
     {jsonrpc: '2.0', id: 2, method: 'shutdown'},
     {jsonrpc: '2.0', method: 'exit'},
   ];
-  const {responses} = await runServer(messages.map(encodeFrame));
+  const {responses} = await runServer(messages.map((message) => encodeFrame(message)));
   const updates = responses.filter((response) => response.method === 'textDocument/publishDiagnostics');
   assert.equal(updates.length, 2);
   assert.equal(updates[0].params.version, 1);
@@ -185,7 +279,7 @@ test('Semantic navigation, document symbols, references and fresh diagnostics', 
     {jsonrpc: '2.0', id: 5, method: 'shutdown'},
     {jsonrpc: '2.0', method: 'exit'},
   ];
-  const {responses} = await runServer(messages.map(encodeFrame));
+  const {responses} = await runServer(messages.map((message) => encodeFrame(message)));
   const requests = responses.filter(item => Object.hasOwn(item, 'id'));
   const [init, definition, references, symbols, shutdown] = requests;
   assert.equal(init.result.capabilities.definitionProvider, true);
@@ -230,7 +324,7 @@ test('Cross-module definition, references, and re-analysis after unsaved edit', 
     {jsonrpc: '2.0', id: 5, method: 'shutdown'},
     {jsonrpc: '2.0', method: 'exit'},
   ];
-  const {responses} = await runServer(messages.map(encodeFrame));
+  const {responses} = await runServer(messages.map((message) => encodeFrame(message)));
   const request = (id) => responses.find((item) => item.id === id);
   assert.equal(request(2).result.uri, base);
   assert.ok(request(3).result.some((item) => item.uri === base));

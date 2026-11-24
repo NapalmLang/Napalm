@@ -32,12 +32,10 @@ From this directory, open VS Code and press **F5** (Extension Development Host),
 then open a `.napalm` source file. Alternatively, link/copy this directory into
 your VS Code extensions directory and restart the editor.
 
-To build a VSIX after installing Node.js:
+To build and install a VSIX after installing Node.js, from the repository root:
 
 ```sh
-npm install
-npx vsce package --allow-missing-repository
-code --install-extension napalm-language-0.1.0.vsix --force
+node lsp/build-vscode.ts --install
 ```
 
 `publisher` is `napalm-local` as a **local packaging placeholder**. Replace it
@@ -94,7 +92,9 @@ TextMate provides fallback colors; semantic tokens are also available from the L
 npm test
 ```
 
-Tests validate the declarative extension's registration and grammar structure.
+Tests validate the extension's registration, grammar and the production
+dependencies selected by VSCE. The builder also runs live protocol tests against
+the compiled server on the native platform before packaging it.
 Opening the sample in VS Code remains a useful visual smoke test; actual
 TextMate tokenization is owned by the editor.
 
@@ -110,25 +110,27 @@ Build the standalone LSP from the repository root:
 .\target\release\napalm.exe --compile .\lsp\main.napalm
 ```
 
-On Windows x64, with the compiled `lsp/main.exe` present:
+On Windows x64, with the compiled `lsp/main.exe` present, from the repository root:
 
 ```powershell
-cd .\lsp\editors\vscode
-npm install
-npm run package:bundled -- --target win32-x64
-code --install-extension ".\napalm-language-0.1.1@win32-x64.vsix" --force
+node .\lsp\build-vscode.ts --skip-compile --target win32-x64
+code --install-extension ".\dist\vscode\napalm-language-0.1.2@win32-x64.vsix" --force
 ```
 
 The packaging script copies `../../main.exe` into
 `server/napalm-lsp.exe`, invokes `@vscode/vsce` with `--target win32-x64`, and
 **verifies the final VSIX ZIP directory** contains that executable with the
-correct uncompressed byte count. It fails if the server is missing, too small,
-or built for a different operating system/architecture.
+correct uncompressed byte count and contains the language client/protocol modules.
+The `files` allowlist must include `node_modules/**`: VSCE collects production
+dependencies, then applies this allowlist. Omitting it produces an extension
+that colors syntax but fails to activate its language client.
+The build also fails if the server is missing, too small, or built for a
+different operating system/architecture.
 
 For an executable built separately or for another target:
 
 ```sh
-npm run package:bundled -- --target linux-arm64 --server /path/to/napalm-lsp
+node lsp/build-vscode.ts --skip-compile --target linux-arm64 --binary /path/to/napalm-lsp
 ```
 
 Supported targets: `win32-x64`, `win32-arm64`, `linux-x64`, `linux-arm64`,
@@ -150,3 +152,22 @@ produced by `napalm --compile`: they are not copied as individual Rust, LLVM,
 or `.napalm` files into the extension. Other platform-specific runtime
 requirements depend on how that executable was linked; validate it on a clean
 machine before publishing.
+
+## If highlighting works but language features do not
+
+Check **Output → Napalm Language Server** and **Output → Log (Extension Host)**.
+An activation error such as `Cannot find module 'vscode-languageclient/node'`
+means the installed VSIX is incomplete; rebuild/install it with the command above
+and run **Developer: Reload Window**. Version 0.1.2 includes the missing client
+dependencies and fixes analysis updates after document edits.
+
+To test the standalone executable without VS Code (PowerShell, repository root):
+
+```powershell
+$env:NAPALM_LSP_BIN = (Resolve-Path .\lsp\main.exe).Path
+node --test .\lsp\tests\server.test.mjs
+Remove-Item Env:NAPALM_LSP_BIN
+```
+
+These tests verify diagnostics, definition, references, hover, completion, rename,
+semantic tokens and unsaved edits while keeping the input connection open.

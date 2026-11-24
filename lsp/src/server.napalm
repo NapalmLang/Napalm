@@ -269,7 +269,7 @@ export function handleMessage(state, request) {
                 if (path !== null) dirtyPaths.push(path);
             }
         }
-        if (dirtyPaths.length === 0 && state["moduleIndex"] !== null) {
+        if (dirtyPaths.length === 0 && null !== state["moduleIndex"]) {
             // An unspecified watcher event may affect any cached disk source.
             for (const record of state["moduleIndex"].order) {
                 if (!state["documents"].has(record.uri)) dirtyPaths.push(record.path);

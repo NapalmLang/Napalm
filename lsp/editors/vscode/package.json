@@ -2,12 +2,12 @@
   "name": "napalm-language",
   "displayName": "Napalm Language",
   "description": "Napalm syntax highlighting, native self-hosted LSP server, branded file icons and extension logo.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "napalm-local",
   "private": true,
   "license": "UNLICENSED",
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.91.0"
   },
   "categories": [
     "Programming Languages"
@@ -102,6 +102,7 @@
   },
   "files": [
     "extension.js",
+    "node_modules/**",
     "server",
     "syntaxes",
     "language-configuration.json",

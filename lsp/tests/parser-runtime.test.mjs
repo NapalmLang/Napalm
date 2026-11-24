@@ -41,3 +41,11 @@ test('Napalm parser AST smoke suite', requiresEngine, async () => {
 test('Napalm parser parses its own source code', requiresEngine, async () => {
   await runNapalmScript('lsp/scripts/parser_selfhost.napalm', /Napalm parser self-hosting smoke tests passed/);
 });
+
+test('Napalm inference, member completion and hover smoke suite', requiresEngine, async () => {
+  await runNapalmScript('lsp/scripts/intelligence_smoke.napalm', /Napalm intelligence smoke tests passed/);
+});
+
+test('Napalm flow, signature help, rename and cached analysis smoke suite', requiresEngine, async () => {
+  await runNapalmScript('lsp/scripts/flow_editor_smoke.napalm', /Napalm LSP milestone 7 smoke tests passed/);
+});

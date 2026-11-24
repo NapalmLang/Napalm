@@ -4,9 +4,11 @@ import {existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {createRequire} from 'node:module';
 import {getVsixEntry, identifyExecutable, validateExecutable} from '../scripts/bundling.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
+const require = createRequire(import.meta.url);
 
 function withTemporaryDirectory(run) {
     const dir = mkdtempSync(path.join(tmpdir(), 'napalm-bundling-'));
@@ -108,4 +110,23 @@ test('extension manifest includes the native server directory for packaging', ()
     assert.ok(manifest.files.includes('server'));
     assert.ok(manifest.scripts['package:bundled']);
     assert.ok(existsSync(path.join(root, 'scripts', 'package-bundled.mjs')));
+});
+
+test('VSCE includes the language client and its runtime dependencies, excluding build tools', {
+    skip: !existsSync(path.join(root, 'node_modules/@vscode/vsce/package.json')) && 'Install extension dependencies first',
+}, async () => {
+    const {listFiles} = require('@vscode/vsce');
+    const files = new Set(await listFiles({cwd: root}));
+    for (const entry of [
+        'vscode-languageclient/package.json',
+        'vscode-languageclient/lib/node/main.js',
+        'vscode-languageserver-protocol/lib/node/main.js',
+        'vscode-jsonrpc/lib/node/main.js',
+        'vscode-languageserver-types/lib/umd/main.js',
+        'vscode-languageserver-textdocument/lib/umd/main.js',
+        'semver/functions/satisfies.js',
+        'minimatch/package.json',
+    ]) assert.ok(files.has(`node_modules/${entry}`), `Missing runtime dependency: ${entry}`);
+    assert.ok(!files.has('node_modules/typescript/package.json'));
+    assert.ok(!files.has('node_modules/@vscode/vsce/package.json'));
 });

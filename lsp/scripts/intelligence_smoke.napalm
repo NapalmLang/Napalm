@@ -20,7 +20,7 @@ const uri = Uri.fromFilePath(Path.resolve("lsp/scripts/intelligence_virtual.napa
 const documents = new Map();
 documents.set(uri, {uri: uri, text: source, version: 1});
 const index = buildModuleIndex(documents, [Process.cwd()]);
-expect(index !== null, "module index created");
+expect(null !== index, "module index created");
 expect(inferSymbolAt(index, uri, {line: 0, character: 7}) === "Number", "number inference");
 expect(inferSymbolAt(index, uri, {line: 4, character: 6}) === "Number", "function result inference");
 const choices = completionAt(index, uri, {line: 3, character: 7});

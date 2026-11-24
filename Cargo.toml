@@ -16,7 +16,7 @@ logos = "0.16.1" # Create ridiculously fast and easy tokenizers
 smallvec = { version = "1.16.6", features = ["serde"] } # Fast hash map
 serde = { version = "1.0.229", features = ["derive"] } # Serialization and deserialization framework for Rust
 serde_json = "1.0.154" # Canonical HIR snapshots for the --build fixed point
-ahash = "0.8.12" # Portable fallback for the runtime hasher
+ahash = "0.8.13" # Portable fallback for the runtime hasher
 hashbrown = "0.17.2" # Fast hash map
 papaya = "0.2.5" # Concurrent hash map
 smallbox = "0.8.9" # Small Box<T> optimization

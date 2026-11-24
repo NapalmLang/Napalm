@@ -12,18 +12,16 @@ readme = "README.md"
 repository = "https://github.com/brugarolas/Napalm/crates/small_map/"
 
 [dependencies]
-hashbrown = { version = "0.17.1", features = [
+hashbrown = { version = "0.17.2", features = [
     "equivalent",
     "inline-more",
 ], default-features = false }
 
 serde = { version = "1", default-features = false, optional = true }
-ahash = { version = "0.8", default-features = false, optional = true }
-rustc-hash = { version = "2", default-features = false, optional = true }
-rapidhash = { version = "4", default-features = false, optional = true }
+ahash = { version = "0.8.13", default-features = false, optional = true }
 
 [dev-dependencies]
-rand = { version = "0.10.3" }
+rand = { version = "0.10.4" }
 criterion = { version = "0.8", features = ["html_reports"] }
 
 micromap = "0.3.0"
@@ -37,10 +35,8 @@ pprof = { version = "0.15", features = ["flamegraph"] }
 [features]
 default = ["ahash", "inline-more"]
 
-hashes = ["ahash", "fxhash", "rapidhash"]
+hashes = ["ahash"]
 ahash = ["dep:ahash"]
-fxhash = ["dep:rustc-hash"]
-rapidhash = ["dep:rapidhash"]
 serde = ["dep:serde", "hashbrown/serde"]
 nightly = []
 inline-more = ["hashbrown/inline-more"]

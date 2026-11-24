@@ -5,9 +5,7 @@ use core::{
     hash::{BuildHasher, Hash},
     iter::FusedIterator,
 };
-use std::collections::hash_map::RandomState;
-
-use crate::{DefaultInlineHasher, Equivalent, SmallMap, DEFAULT_LINEAR_THRESHOLD};
+use crate::{AesBuildHasher, DefaultInlineHasher, Equivalent, SmallMap, DEFAULT_LINEAR_THRESHOLD};
 
 /// A hash set implemented as a [`SmallMap`] where the value is `()`.
 ///
@@ -40,7 +38,7 @@ use crate::{DefaultInlineHasher, Equivalent, SmallMap, DEFAULT_LINEAR_THRESHOLD}
 ///
 /// - `T`: Element type. Must implement `Eq + Hash` for most operations.
 ///
-/// - `SH`: Hasher for heap storage. Default: [`RandomState`].
+/// - `SH`: Hasher for heap storage. Default: [`AesBuildHasher`].
 ///
 /// - `SI`: Hasher for inline storage. Default: `DefaultInlineHasher`.
 ///
@@ -132,7 +130,7 @@ use crate::{DefaultInlineHasher, Equivalent, SmallMap, DEFAULT_LINEAR_THRESHOLD}
 pub struct SmallSet<
     const N: usize,
     T,
-    SH = RandomState,
+    SH = AesBuildHasher,
     SI = DefaultInlineHasher,
     const LINEAR_THRESHOLD: usize = DEFAULT_LINEAR_THRESHOLD,
 > {
@@ -255,7 +253,7 @@ impl<const N: usize, T, SH, SI, const LINEAR_THRESHOLD: usize>
     /// use small_map::SmallSet;
     ///
     /// let heap_hasher = RandomState::default();
-    /// let inline_hasher = rapidhash::fast::RandomState::default();
+    /// let inline_hasher = small_map::AesBuildHasher::default();
     /// let mut set = SmallSet::<8, _>::with_hashers(heap_hasher, inline_hasher);
     /// set.insert(1);
     /// ```
@@ -307,7 +305,7 @@ impl<const N: usize, T, SH, SI, const LINEAR_THRESHOLD: usize>
     /// use small_map::SmallSet;
     ///
     /// let heap_hasher = RandomState::default();
-    /// let inline_hasher = rapidhash::fast::RandomState::default();
+    /// let inline_hasher = small_map::AesBuildHasher::default();
     /// let mut set = SmallSet::<8, _>::with_capacity_and_hashers(10, heap_hasher, inline_hasher);
     /// set.insert(1);
     /// ```
@@ -451,7 +449,7 @@ where
             }
         }
         // Heap storage uses the existing remove/insert semantics to avoid
-        // depending on non-portable hashbrown raw-entry APIs.
+        // without requiring the backend's raw-entry APIs.
         let old = self.take(&value);
         self.map.insert(value, ());
         old

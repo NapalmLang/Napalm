@@ -1,3 +1,6 @@
+[build]
+rustflags = ["-C", "target-feature=+aes"]
+
 # Local LLVM 23.1 used by inkwell/llvm-sys for the LLVM trace tier.
 # The official Windows installer ships no llvm-config, so this points at the
 # extracted clang+llvm-23.1.4-x86_64-pc-windows-msvc release tarball. build.rs
@@ -9,4 +12,4 @@ LLVM_SYS_231_PREFIX = "C:\\Users\\Andre\\llvm-23.1.4"
 # executable produced by `--compile`, which is a copy of it) does not need the
 # Visual C++ Redistributable (VCRUNTIME140.dll). LLVM-C.dll carries its own CRT.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "target-feature=+aes"]

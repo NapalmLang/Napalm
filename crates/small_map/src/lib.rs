@@ -26,12 +26,8 @@ use core::{
     iter::FusedIterator,
     ops::Index,
 };
-use std::{
-    collections::hash_map::RandomState,
-    fmt::{self, Debug},
-};
+use std::fmt::{self, Debug};
 
-use hashbrown::HashMap;
 use inline::Inline;
 
 #[macro_use]
@@ -39,72 +35,20 @@ mod macros;
 mod inline;
 mod raw;
 mod set;
-
-/// Re-exported from [`hashbrown`] for custom key equivalence lookups.
-///
-/// Allows using a different type for lookups than the key type stored in the map.
-pub use hashbrown::Equivalent;
-pub use set::SmallSet;
-
+pub mod runtime_hash;
+mod fast_maps;
 #[cfg(feature = "serde")]
 mod serde;
 
-/// Type alias for [`SmallMap`] using [`rapidhash`](https://docs.rs/rapidhash) as the heap hasher.
-///
-/// Since rapidhash is a fast hasher, `LINEAR_THRESHOLD` is set to 8 to prefer SIMD search earlier.
-///
-/// Requires the `rapidhash` feature.
-#[cfg(feature = "rapidhash")]
-pub type RapidSmallMap<const N: usize, K, V> =
-    SmallMap<N, K, V, rapidhash::fast::RandomState, DefaultInlineHasher, 8>;
+/// The same underlying keyed hash-map type as Napalm's runtime `FastMap`.
+/// A custom builder can still be provided as the third type argument.
+pub use fast_maps::{Equivalent, FastMap, FastSet};
+use fast_maps::{FastMapIntoIter, FastMapIter};
+pub use runtime_hash::{AesBuildHasher, AesHasher};
+pub use set::SmallSet;
 
-/// Type alias for [`SmallMap`] using [`rustc_hash::FxBuildHasher`] as the heap hasher.
-///
-/// Requires the `fxhash` feature.
-#[cfg(feature = "fxhash")]
-pub type FxSmallMap<const N: usize, K, V> = SmallMap<N, K, V, rustc_hash::FxBuildHasher>;
-
-/// Type alias for [`SmallMap`] using [`ahash::AHasher`] as the heap hasher.
-///
-/// Requires the `ahash` feature.
-#[cfg(feature = "ahash")]
-pub type ASmallMap<const N: usize, K, V> =
-    SmallMap<N, K, V, core::hash::BuildHasherDefault<ahash::AHasher>>;
-
-/// Type alias for [`SmallSet`] using [`rapidhash`](https://docs.rs/rapidhash) as the heap hasher.
-///
-/// Since rapidhash is a fast hasher, `LINEAR_THRESHOLD` is set to 8 to prefer SIMD search earlier.
-///
-/// Requires the `rapidhash` feature.
-#[cfg(feature = "rapidhash")]
-pub type RapidSmallSet<const N: usize, T> =
-    SmallSet<N, T, rapidhash::fast::RandomState, DefaultInlineHasher, 8>;
-
-/// Type alias for [`SmallSet`] using [`rustc_hash::FxBuildHasher`] as the heap hasher.
-///
-/// Requires the `fxhash` feature.
-#[cfg(feature = "fxhash")]
-pub type FxSmallSet<const N: usize, T> = SmallSet<N, T, rustc_hash::FxBuildHasher>;
-
-/// Type alias for [`SmallSet`] using [`ahash::AHasher`] as the heap hasher.
-///
-/// Requires the `ahash` feature.
-#[cfg(feature = "ahash")]
-pub type ASmallSet<const N: usize, T> =
-    SmallSet<N, T, core::hash::BuildHasherDefault<ahash::AHasher>>;
-
-#[cfg(feature = "rapidhash")]
-type DefaultInlineHasher = rapidhash::fast::RandomState;
-#[cfg(all(not(feature = "rapidhash"), feature = "fxhash"))]
-type DefaultInlineHasher = rustc_hash::FxBuildHasher;
-#[cfg(all(not(feature = "rapidhash"), not(feature = "fxhash"), feature = "ahash"))]
-type DefaultInlineHasher = core::hash::BuildHasherDefault<ahash::AHasher>;
-#[cfg(all(
-    not(feature = "rapidhash"),
-    not(feature = "fxhash"),
-    not(feature = "ahash")
-))]
-type DefaultInlineHasher = RandomState;
+/// Inline storage and heap storage use the same keyed policy by default.
+pub type DefaultInlineHasher = AesBuildHasher;
 
 /// Default threshold for switching from linear search to SIMD hash search.
 /// When `N` or `len` is less than this value, linear search is used.
@@ -113,29 +57,22 @@ type DefaultInlineHasher = RandomState;
 /// your key/hash/equality workload to find a better value if needed.
 pub const DEFAULT_LINEAR_THRESHOLD: usize = 16;
 
-/// A hybrid map that stores data inline when small, and spills to heap when it grows.
+/// A hybrid map with inline storage and a TLS-seeded AES/aHash `FastMap` on spill.
 ///
 /// # Type Parameters
 ///
 /// - `N`: Maximum number of elements to store inline (must be > 0). When the map exceeds this size,
-///   it automatically spills to a heap-allocated `HashMap`.
+///   it automatically spills to a heap-allocated `FastMap`.
 ///
 /// - `K`: Key type. Must implement `Eq + Hash` for most operations.
 ///
 /// - `V`: Value type.
 ///
-/// - `SH`: Hasher for heap storage. Default: [`RandomState`]. This hasher is used when the map
-///   spills to heap. Note: The standard library's `RandomState` provides HashDoS resistance but is
-///   not the fastest option. Consider your security vs performance requirements - for
-///   non-adversarial workloads, faster alternatives like `rapidhash` or `fxhash` can improve
-///   performance significantly (though they are not cryptographically secure).
+/// - `SH`: Hasher for heap storage. Default: [`AesBuildHasher`], using Napalm's
+///   TLS-seeded AES implementation (with seeded aHash on builds without AES support).
 ///
-/// - `SI`: Hasher for inline storage. Default: `DefaultInlineHasher` (rapidhash if available,
-///   otherwise fxhash, ahash, or RandomState based on features). This hasher is used for
-///   SIMD-accelerated lookups in inline mode. Since inline storage only handles a small number of
-///   elements, HashDoS resistance is generally not a concern here - performance is the priority. We
-///   recommend using the default value and enabling the `rapidhash` or `fxhash` feature for best
-///   performance.
+/// - `SI`: Hasher for inline storage. Default: [`DefaultInlineHasher`], which is
+///   also [`AesBuildHasher`]. Custom hash builders remain supported.
 ///
 /// - `LINEAR_THRESHOLD`: Threshold for switching between linear and SIMD search. Default:
 ///   [`DEFAULT_LINEAR_THRESHOLD`] (16 by default, independent of SIMD width). When `N <
@@ -177,12 +114,12 @@ pub enum SmallMap<
     const N: usize,
     K,
     V,
-    SH = RandomState,
+    SH = AesBuildHasher,
     SI = DefaultInlineHasher,
     const LINEAR_THRESHOLD: usize = DEFAULT_LINEAR_THRESHOLD,
 > {
-    /// Heap-allocated storage using `hashbrown::HashMap`.
-    Heap(HashMap<K, V, SH>),
+    /// Heap-allocated storage using `FastMap`.
+    Heap(FastMap<K, V, SH>),
     /// Inline storage with SIMD-accelerated lookups.
     Inline(Inline<N, K, V, SH, SI, LINEAR_THRESHOLD>),
 }
@@ -239,7 +176,7 @@ impl<const N: usize, K, V, SH: Default, SI: Default, const LINEAR_THRESHOLD: usi
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity > N {
-            Self::Heap(HashMap::with_capacity_and_hasher(
+            Self::Heap(FastMap::with_capacity_and_hasher(
                 capacity,
                 Default::default(),
             ))
@@ -304,7 +241,7 @@ impl<const N: usize, K, V, SH, SI, const LINEAR_THRESHOLD: usize>
         SI: Default,
     {
         if capacity > N {
-            Self::Heap(HashMap::with_capacity_and_hasher(capacity, heap_hasher))
+            Self::Heap(FastMap::with_capacity_and_hasher(capacity, heap_hasher))
         } else {
             Self::Inline(Inline::new(SI::default(), heap_hasher))
         }
@@ -327,7 +264,7 @@ impl<const N: usize, K, V, SH, SI, const LINEAR_THRESHOLD: usize>
     #[inline]
     pub fn with_capacity_and_hashers(capacity: usize, heap_hasher: SH, inline_hasher: SI) -> Self {
         if capacity > N {
-            Self::Heap(HashMap::with_capacity_and_hasher(capacity, heap_hasher))
+            Self::Heap(FastMap::with_capacity_and_hasher(capacity, heap_hasher))
         } else {
             Self::Inline(Inline::new(inline_hasher, heap_hasher))
         }
@@ -488,7 +425,7 @@ where
                     return inner.insert(key, value);
                 }
                 // Keep an inline map inline when an insertion only updates
-                // an existing value. `hashbrown` also retains the old key.
+                // an existing value. `FastMap` also retains the old key.
                 if let Some(existing) = inner.get_mut(&key) {
                     return Some(core::mem::replace(existing, value));
                 }
@@ -541,12 +478,12 @@ where
     /// during rehashing can discard entries not yet transferred.
     #[cold]
     #[inline(never)]
-    fn spill_to_heap(&mut self) -> &mut HashMap<K, V, SH> {
+    fn spill_to_heap(&mut self) -> &mut FastMap<K, V, SH> {
         let heap = match self {
             SmallMap::Inline(inner) => {
                 // `with_hasher` does not allocate or invoke user code.
                 // SAFETY: A live Inline always owns its heap hasher.
-                HashMap::with_hasher(unsafe { inner.take_heap_hasher() })
+                FastMap::with_hasher(unsafe { inner.take_heap_hasher() })
             }
             SmallMap::Heap(_) => unreachable!("spill requires inline storage"),
         };
@@ -685,7 +622,7 @@ impl<const N: usize, K, V, SH, SI, const LINEAR_THRESHOLD: usize>
 }
 
 pub enum Iter<'a, const N: usize, K, V> {
-    Heap(hashbrown::hash_map::Iter<'a, K, V>),
+    Heap(FastMapIter<'a, K, V>),
     Inline(inline::Iter<'a, N, K, V>),
 }
 
@@ -864,7 +801,7 @@ impl<const N: usize, K, V> ExactSizeIterator for IntoValues<N, K, V> {
 impl<const N: usize, K, V> FusedIterator for IntoValues<N, K, V> {}
 
 pub enum IntoIter<const N: usize, K, V> {
-    Heap(hashbrown::hash_map::IntoIter<K, V>),
+    Heap(FastMapIntoIter<K, V>),
     Inline(inline::IntoIter<N, K, V>),
 }
 
@@ -922,7 +859,7 @@ impl<'a, const N: usize, K, V, SH, SI, const LINEAR_THRESHOLD: usize> IntoIterat
     type Item = (&'a K, &'a V);
     type IntoIter = Iter<'a, N, K, V>;
 
-    /// Creates an iterator over the entries of a `HashMap` in arbitrary order.
+    /// Creates an iterator over the entries of a `FastMap` in arbitrary order.
     /// The iterator element type is `(&'a K, &'a V)`.
     #[inline]
     fn into_iter(self) -> Iter<'a, N, K, V> {
@@ -1165,7 +1102,7 @@ where
 mod tests {
     use std::{cell::RefCell, collections::hash_map::RandomState, rc::Rc};
 
-    use hashbrown::HashMap;
+    use crate::FastMap as HashMap;
     use rand::RngExt; // rand 0.10 moved `random`/`random_range` from `Rng` to `RngExt`
 
     use crate::SmallMap;
@@ -2336,5 +2273,57 @@ mod tests {
         assert!(!map.is_inline());
         assert_eq!(map.insert(make(99), 99), None);
         assert_eq!(map.get(&make(99)), Some(&99));
+    }
+}
+
+#[cfg(test)]
+mod napalm_hash_integration_tests {
+    use super::*;
+    use core::hash::BuildHasher;
+
+    #[test]
+    fn defaults_use_napalm_hasher() {
+        let map: SmallMap<8, u64, u64> = SmallMap::new();
+        match map {
+            SmallMap::Inline(_) => {}
+            SmallMap::Heap(_) => panic!("default must start inline"),
+        }
+        let _builder: AesBuildHasher = AesBuildHasher::default();
+        let _fast: FastMap<u64, u64> = FastMap::default();
+        let _set: FastSet<u64> = FastSet::default();
+    }
+
+    #[test]
+    fn seeded_inline_simd_and_heap_preserve_values() {
+        let seed = AesBuildHasher::from_seed(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        let mut map = SmallMap::<32, String, usize, AesBuildHasher, AesBuildHasher, 2>
+            ::with_hashers(seed, seed);
+        for i in 0..32 {
+            assert_eq!(map.insert(format!("key-{i}"), i), None);
+        }
+        assert!(map.is_inline());
+        assert_eq!(map.get("key-7"), Some(&7));
+        assert_eq!(map.insert("key-7".into(), 99), Some(7));
+        assert!(map.is_inline());
+        assert_eq!(map.insert("key-32".into(), 32), None);
+        assert!(!map.is_inline());
+        assert_eq!(map.get("key-7"), Some(&99));
+        assert_eq!(map.remove("key-7"), Some(99));
+        assert!(map.get("key-7").is_none());
+    }
+
+    #[test]
+    fn default_set_uses_napalm_hasher_and_spills() {
+        let mut set: SmallSet<4, String> = SmallSet::new();
+        for i in 0..9 { assert!(set.insert(format!("s-{i}"))); }
+        assert!(!set.is_inline());
+        for i in 0..9 { assert!(set.contains(format!("s-{i}").as_str())); }
+    }
+
+    #[test]
+    fn keyed_hash_builders_are_deterministic_per_seed() {
+        let a = AesBuildHasher::from_seed(100, 200);
+        let b = AesBuildHasher::from_seed(100, 200);
+        assert_eq!(a.hash_one(123u64), b.hash_one(123u64));
     }
 }

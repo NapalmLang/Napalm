@@ -18,14 +18,14 @@ pub type ConcurrentSet<K> = papaya::HashSet<K, crate::napalm_interpreter::runtim
 /// tables). Up to `N` entries live inline with no allocation; beyond that it
 /// spills transparently to a heap hashbrown table.
 ///
-/// Policy: keys must be engine-internal (ids, slots, SSA values), never
-/// user-controlled language data, because the spilled table uses FxHash rather
-/// than the keyed AES hasher above. Iteration order is insertion order while
+/// Reserved for engine-internal keys (ids, slots, SSA values). Both inline
+/// and spilled storage use the dependency's keyed AES/aHash policy.
+/// Iteration order is insertion order while
 /// inline and arbitrary after a spill, so callers must not depend on it.
 ///
 /// Size is roughly `N * (1 + size_of::<K>() + size_of::<V>())`, so keep these
 /// in short-lived or per-compilation state, not in per-object runtime data.
-pub type SmallMapN<const N: usize, K, V> = small_map::ASmallMap<N, K, V>;
+pub type SmallMapN<const N: usize, K, V> = small_map::SmallMap<N, K, V>;
 /// Default inline capacity: two SSE2 control groups.
 pub type SmallMap<K, V> = SmallMapN<64, K, V>;
 /// One SSE2 control group; for tables that are almost always tiny.

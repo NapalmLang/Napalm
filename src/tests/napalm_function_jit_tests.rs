@@ -397,6 +397,57 @@ fn napalm_whole_function_v2_inlines_callees_that_make_calls() {
 }
 
 #[test]
+fn napalm_whole_function_v2_native_number_methods() {
+    let stats = whole_function_only_run(r#"
+        let one = 0;
+        one = 1;
+        function math(n, x, mode) {
+            const a = x.abs;
+            const b = x.floor;
+            const c = x.ceil;
+            const d = x.sqrt;
+            const value = mode == 0 ? a : mode == 1 ? b : mode == 2 ? c : d;
+            if (n < one) return value;
+            return value + math(n - one, x, mode);
+        }
+        let total = 0;
+        for (let i = 0; i < 100; i++) total += math(12, 2.25, i % 4);
+        const edges = [];
+        for (let mode = 0; mode < 4; mode++) {
+            edges.push([math(0, -2.25, mode), math(0, -0.2, mode),
+                math(0, 0 / 0, mode), math(0, 1 / 0, mode), math(0, -1 / 0, mode),
+                1 / math(0, -0.0, mode), 1 / math(0, 0.0, mode)]);
+        }
+        let bad: any = null;
+        try { bad = math(0, 'wrong receiver', 0); } catch (e) { bad = 'err'; }
+        const result = [total, edges, bad, math(3, 4, 3)];
+    "#);
+    assert!(stats.v2_compiled_functions >= 1, "{stats:?}");
+    // Native self-calls reject runtime helpers, so this also proves the four
+    // Number methods were actually lowered, rather than called via the VM.
+    assert!(stats.native_recursive_calls > 100, "{stats:?}");
+}
+
+#[test]
+fn napalm_whole_function_v2_failed_inline_restores_nested_ir() {
+    let stats = whole_function_only_run(r#"
+        let bias = 0;
+        bias = 1;
+        function inner(x) { return x + bias; }
+        function allocating(x) {
+            const y = inner(x);
+            if (x > 0) return {value: y};
+            return {value: -y};
+        }
+        function caller(x) { return allocating(x).value + inner(x); }
+        let total = 0;
+        for (let i = 0; i < 200; i++) total += caller(i - 100);
+        const result = total;
+    "#);
+    assert!(stats.v2_compiled_functions >= 2, "{stats:?}");
+}
+
+#[test]
 fn napalm_whole_function_v2_native_builtin_methods() {
     // List length/subscript/iteration, Boolean not, String equality and
     // codePointAt, and Bytes subscript run natively (or through pure leaf

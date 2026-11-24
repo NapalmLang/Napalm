@@ -285,9 +285,9 @@ impl WfOptimization for Values {
             }
             stack.push((b, Some(added.len())));
             stack.extend(cfg.children[b].iter().map(|&child| (child, None)));
-            let mut bank = Table::default();
-            let mut guards = Table::default();
-            let mut globals = Table::default();
+            let mut bank = crate::napalm_collections::SmallMap16::default();
+            let mut guards = crate::napalm_collections::SmallMap16::default();
+            let mut globals = crate::napalm_collections::SmallMap16::default();
             f.blocks[b].insts.retain_mut(|(result, i)| {
                 uses_mut(i, |v| *v = alias[v.0 as usize]);
                 if matches!(i, WfInst::BoxF64(_) | WfInst::FloatCmp { .. }) {
@@ -453,7 +453,7 @@ impl WfOptimization for BlockRepresentation {
         for (b, block) in f.blocks.iter().enumerate() {
             for &p in &block.params { param_block[p.0 as usize] = Some(b); }
             for &(v, ref inst) in &block.insts {
-                producer[v.0 as usize] = Some(inst.clone());
+                producer[v.0 as usize] = Some(inst);
             }
         }
         let mut incoming = vec![Vec::<(usize, usize)>::new(); f.blocks.len()];
@@ -753,10 +753,10 @@ struct HeapForward;
 impl WfOptimization for HeapForward {
     fn run(&self, f: &mut WfFunction, analyses: &mut Analyses) -> bool {
         let cfg = analyses.cfg(f);
-        let mut producer = vec![None; f.value_types.len()];
+        let mut nonnull = vec![false; f.value_types.len()];
         for block in &f.blocks {
             for (v, i) in &block.insts {
-                producer[v.0 as usize] = Some(i.clone());
+                nonnull[v.0 as usize] = is_known_nonnull(Some(i));
             }
         }
         let mut aliases: Vec<_> = (0..f.value_types.len())
@@ -814,7 +814,7 @@ impl WfOptimization for HeapForward {
                         if state.fresh_local.contains(object) {
                             state.fields.insert((*object, *slot), KnownField {
                                 value: stored,
-                                nonnull: is_known_nonnull(producer[stored.0 as usize].as_ref()),
+                                nonnull: nonnull[stored.0 as usize],
                             });
                         }
                         state.classes.insert(*object, *class_key);
@@ -1419,38 +1419,6 @@ impl WfOptimization for DeadCode {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct FrameKey {
-    callee: u32,
-    call_op: u32,
-    resume_op: u32,
-    registers: Vec<(u8, WfValue)>,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct SnapshotKey {
-    op_index: u32,
-    speculative: bool,
-    registers: Vec<(u8, WfValue)>,
-    frames: Vec<FrameKey>,
-}
-
-impl From<&super::WfDeoptState> for SnapshotKey {
-    fn from(s: &super::WfDeoptState) -> Self {
-        Self {
-            op_index: s.op_index,
-            speculative: s.speculative,
-            registers: s.registers.clone(),
-            frames: s.frames.iter().map(|frame| FrameKey {
-                callee: frame.callee,
-                call_op: frame.call_op,
-                resume_op: frame.resume_op,
-                registers: frame.registers.clone(),
-            }).collect(),
-        }
-    }
-}
-
 struct Snapshots;
 impl WfOptimization for Snapshots {
     fn run(&self, f: &mut WfFunction, _analyses: &mut Analyses) -> bool {
@@ -1470,7 +1438,9 @@ impl WfOptimization for Snapshots {
         for (n, s) in f.deopts.iter().enumerate() {
             if used[n] {
                 let next = WfDeopt(intern.len() as u32);
-                let key = SnapshotKey::from(s);
+                // Borrow the complete snapshot, including GC frame layout;
+                // interning needs no copies of register lists or inline frames.
+                let key = s;
                 if let Some(&id) = intern.get(&key) {
                     remap[n] = id;
                     used[n] = false;
@@ -2022,7 +1992,7 @@ mod wf_opt_tests {
     #[test]
     fn snapshots_intern_only_exact_matches_and_keep_epoch_roots() {
         let mut f = function(
-            &[Tagged, Bool, Bool, Bool, Bool],
+            &[Tagged, Bool, Bool, Bool, Bool, Bool, Bool],
             &[],
             Tagged,
             vec![block(
@@ -2057,6 +2027,8 @@ mod wf_opt_tests {
                             deopt: WfDeopt(4),
                         },
                     ),
+                    (5, GuardEpoch { expected: 6, deopt: WfDeopt(5) }),
+                    (6, GuardEpoch { expected: 7, deopt: WfDeopt(6) }),
                 ],
                 ret(0),
             )],
@@ -2077,9 +2049,16 @@ mod wf_opt_tests {
             reg_count: 4,
             root_map: 0,
         });
+        // Equal register values with different GC layouts must stay distinct.
+        let mut other_map = f.deopts[4].clone();
+        other_map.frames[0].root_map = 1;
+        f.deopts.push(other_map);
+        let mut other_count = f.deopts[4].clone();
+        other_count.frames[0].reg_count = 5;
+        f.deopts.push(other_count);
         f.entry_epoch_guard = Some((7, WfDeopt(0)));
         optimize(&mut f).unwrap();
-        assert_eq!(f.deopts.len(), 4);
+        assert_eq!(f.deopts.len(), 6);
         assert_eq!(
             f.deopts[f.entry_epoch_guard.unwrap().1.0 as usize].op_index,
             10

@@ -160,15 +160,15 @@ pub(super) fn rewrite(f: &mut WfFunction, aliases: &[WfValue]) {
 }
 
 pub(super) struct Cfg {
-    pub pred: Vec<Vec<usize>>,
-    pub children: Vec<Vec<usize>>,
+    pub pred: Vec<smallvec::SmallVec<[usize; 2]>>,
+    pub children: Vec<smallvec::SmallVec<[usize; 2]>>,
     enter: Vec<usize>,
     leave: Vec<usize>,
 }
 impl Cfg {
     pub fn new(f: &WfFunction) -> Self {
         let n = f.blocks.len();
-        let mut pred = vec![Vec::new(); n];
+        let mut pred = vec![smallvec::SmallVec::new(); n];
         for (b, data) in f.blocks.iter().enumerate() {
             for e in edges(data.terminator.as_ref().unwrap()) {
                 pred[e.target.0 as usize].push(b);
@@ -219,7 +219,7 @@ impl Cfg {
                 break;
             }
         }
-        let mut children = vec![Vec::new(); n];
+        let mut children = vec![smallvec::SmallVec::new(); n];
         for &b in &rpo[1..] {
             children[parent[b]].push(b);
         }
@@ -366,7 +366,7 @@ fn verify_with_cfg(f: &WfFunction, cfg: &Cfg) -> Result<(), String> {
                 ),
                 Primitive { kind, receiver, arg, .. } => (
                     kind.result_ty(),
-                    ty(receiver) == Tagged && match arg {
+                    ty(receiver) == (if kind.numeric_receiver() { F64 } else { Tagged }) && match arg {
                         Some(arg) => kind.arity() == 1
                             && ty(arg) == if kind.numeric_arg() { F64 } else { Tagged },
                         None => kind.arity() == 0,

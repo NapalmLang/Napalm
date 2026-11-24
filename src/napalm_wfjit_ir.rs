@@ -22,6 +22,9 @@
 //!   dispatch decision in the body.
 
 use super::*;
+use smallvec::{SmallVec, smallvec};
+
+type RegList = SmallVec<[u8; 4]>;
 
 /// Pass scheduling, CFG/dominator analysis and the SSA verifier.
 #[path = "napalm_wf_ir_optimizer.rs"]
@@ -58,6 +61,11 @@ pub(super) enum WfFloatBin { Add, Sub, Mul, Div }
 /// interpreter re-executes the op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WfPrimitive {
+    /// Pure Number methods with an unboxed F64 receiver and result.
+    NumAbs,
+    NumFloor,
+    NumCeil,
+    NumSqrt,
     /// `list.length` / `list.count` (F64).
     ListCount,
     /// `list[i]` for an in-bounds non-negative integer index (Tagged).
@@ -78,7 +86,14 @@ pub(super) enum WfPrimitive {
 impl WfPrimitive {
     /// Arguments after the receiver.
     pub(super) fn arity(self) -> usize {
-        match self { WfPrimitive::ListCount | WfPrimitive::BoolNot => 0, _ => 1 }
+        match self {
+            WfPrimitive::ListCount | WfPrimitive::BoolNot
+            | WfPrimitive::NumAbs | WfPrimitive::NumFloor | WfPrimitive::NumCeil | WfPrimitive::NumSqrt => 0,
+            _ => 1,
+        }
+    }
+    pub(super) fn numeric_receiver(self) -> bool {
+        matches!(self, WfPrimitive::NumAbs | WfPrimitive::NumFloor | WfPrimitive::NumCeil | WfPrimitive::NumSqrt)
     }
     /// The argument is used as an unboxed Number.
     pub(super) fn numeric_arg(self) -> bool {
@@ -87,7 +102,8 @@ impl WfPrimitive {
     }
     pub(super) fn result_ty(self) -> WfTy {
         match self {
-            WfPrimitive::ListCount => WfTy::F64,
+            WfPrimitive::ListCount | WfPrimitive::NumAbs | WfPrimitive::NumFloor
+            | WfPrimitive::NumCeil | WfPrimitive::NumSqrt => WfTy::F64,
             WfPrimitive::BoolNot | WfPrimitive::StringEq => WfTy::Bool,
             _ => WfTy::Tagged,
         }
@@ -211,7 +227,8 @@ pub(super) enum WfInst {
     /// without touching the bank.
     CallExplicit { target: u32, receiver: Option<WfValue>, args: Vec<WfValue>, state: WfDeopt },
     /// A builtin method on a receiver whose class was already guarded
-    /// (Tagged receiver; the argument is F64 when `kind.numeric_arg()`).
+    /// (F64 receiver when `kind.numeric_receiver()`, otherwise Tagged;
+    /// the argument is F64 when `kind.numeric_arg()`).
     /// Deoptimizes at `deopt` on any case it does not handle.
     Primitive { kind: WfPrimitive, receiver: WfValue, arg: Option<WfValue>, deopt: WfDeopt },
     /// Loop back edge bookkeeping (Bool, meaningless): counts iterations in
@@ -237,7 +254,7 @@ pub(super) enum WfTerminator {
     Return(WfValue),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct WfDeoptState {
     /// Prepared op index the interpreter resumes at.
     pub(super) op_index: u32,
@@ -255,7 +272,7 @@ pub(super) struct WfDeoptState {
     pub(super) frames: Vec<WfInlineDeoptFrame>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct WfInlineDeoptFrame {
     pub(super) callee: u32,
     /// The call op in the parent frame (the root or the previous entry).
@@ -414,6 +431,10 @@ fn native_primitive_site(
     if site.class.0 == 0 { return None; }
     let kind = match site.target {
         CallTarget::Primitive(id) => match source.manifest?.primitive_kind(id)? {
+            P::NumAbs => WfPrimitive::NumAbs,
+            P::NumFloor => WfPrimitive::NumFloor,
+            P::NumCeil => WfPrimitive::NumCeil,
+            P::NumSqrt => WfPrimitive::NumSqrt,
             P::ListCount => WfPrimitive::ListCount,
             P::ListSubscript => WfPrimitive::ListSubscript,
             P::ListIterate => WfPrimitive::ListIterate,
@@ -440,7 +461,7 @@ const MAX_INLINE_TOTAL_OPS: usize = 480;
 struct InlineTarget {
     callee: u32,
     receiver: Option<u8>,
-    args: Vec<u8>,
+    args: RegList,
     class_guard: Option<u64>,
 }
 
@@ -466,7 +487,7 @@ enum OpKind {
     FieldGet { dst: u8, object: u8, slot: u32, nullable: bool },
     FieldSet { object: u8, value: u8, slot: u32, class_key: u64 },
     /// Native allocation; operands are read from the bank (all GPRs).
-    Alloc { dst: u8, kind: WfAllocKind, reads: Vec<u8> },
+    Alloc { dst: u8, kind: WfAllocKind, reads: RegList },
     /// Monomorphic builtin method lowered natively.
     Primitive { dst: u8, receiver: u8, arg: Option<u8>, class: u64, kind: WfPrimitive },
     /// Executed by a host helper unless `inline` is set and inlining succeeds.
@@ -475,7 +496,7 @@ enum OpKind {
     /// every GPR live afterwards is reloaded from the bank.
     Runtime {
         helper: WfRuntimeHelper,
-        reads: Vec<u8>,
+        reads: RegList,
         write: Option<u8>,
         inline: Option<InlineTarget>,
         guard: Option<(u8, u64)>,
@@ -484,21 +505,21 @@ enum OpKind {
 }
 
 impl OpKind {
-    fn reads(&self) -> Vec<u8> {
+    fn visit_reads(&self, mut visit: impl FnMut(u8)) {
         match self {
-            OpKind::Move { src, .. } | OpKind::Return { src } => vec![*src],
-            OpKind::Swap { a, b } => vec![*a, *b],
-            OpKind::JumpIf { cond, .. } => vec![*cond],
-            OpKind::Numeric { lhs, rhs, .. } => std::iter::once(*lhs).chain(*rhs).collect(),
-            OpKind::Identity { lhs, rhs, .. } => vec![*lhs, *rhs],
-            OpKind::MapGet { object, .. } => vec![*object],
+            OpKind::Move { src, .. } | OpKind::Return { src } => visit(*src),
+            OpKind::Swap { a, b } => { visit(*a); visit(*b); }
+            OpKind::JumpIf { cond, .. } => visit(*cond),
+            OpKind::Numeric { lhs, rhs, .. } => std::iter::once(*lhs).chain(*rhs).for_each(visit),
+            OpKind::Identity { lhs, rhs, .. } => { visit(*lhs); visit(*rhs); }
+            OpKind::MapGet { object, .. } => visit(*object),
             OpKind::SelfCall { args, receiver, .. } =>
-                args.iter().flatten().copied().chain(receiver.map(|(reg, _)| reg)).collect(),
-            OpKind::FieldGet { object, .. } => vec![*object],
-            OpKind::FieldSet { object, value, .. } => vec![*object, *value],
-            OpKind::Runtime { reads, .. } | OpKind::Alloc { reads, .. } => reads.clone(),
-            OpKind::Primitive { receiver, arg, .. } => std::iter::once(*receiver).chain(*arg).collect(),
-            _ => Vec::new(),
+                args.iter().flatten().copied().chain(receiver.map(|(reg, _)| reg)).for_each(visit),
+            OpKind::FieldGet { object, .. } => visit(*object),
+            OpKind::FieldSet { object, value, .. } => { visit(*object); visit(*value); }
+            OpKind::Runtime { reads, .. } | OpKind::Alloc { reads, .. } => reads.iter().copied().for_each(visit),
+            OpKind::Primitive { receiver, arg, .. } => std::iter::once(*receiver).chain(*arg).for_each(visit),
+            _ => {}
         }
     }
 
@@ -518,7 +539,7 @@ impl OpKind {
 }
 
 /// GPRs of a call-like op's arguments.
-fn call_args(function: &PreparedFunction, prepared: &PreparedOp) -> Result<Vec<u8>, String> {
+fn call_args(function: &PreparedFunction, prepared: &PreparedOp) -> Result<RegList, String> {
     (0..prepared.c as usize)
         .map(|argument| unsafe { wfjit_call_source_reg(function, prepared, argument) }
             .ok_or_else(|| "call argument register out of range".to_string()))
@@ -535,25 +556,25 @@ fn generic_call_opcode(opcode: Opcode) -> bool {
 /// Register operands of ops executed by their handler whose operand use is
 /// known (checked against the interpreter handlers): (written GPR, read
 /// GPRs). Anything else runs in the conservative generic mode.
-fn precise_operands(opcode: Opcode, op: &PreparedOp) -> Option<(Option<u8>, Vec<u8>)> {
+fn precise_operands(opcode: Opcode, op: &PreparedOp) -> Option<(Option<u8>, RegList)> {
     use Opcode::*;
     Some(match opcode {
         ListGet | ListRemoveAt | MapGet | LoadProperty | IsInstance | StringCodePointAt | MakeRange
         | IAdd | ISub | IMul | IDivS | IRemS | IBitAnd | IBitOr | IBitXor | IShl | IShrU | ISar
         | FAdd | FSub | FMul | FDiv | FRem | ICmpEq | ICmpNe | ICmpLt | ICmpLe | ICmpGt | ICmpGe
-        | FCmpEq | FCmpNe | FCmpLt | FCmpLe | FCmpGt | FCmpGe | RefEq => (Some(op.a), vec![op.b, op.c]),
+        | FCmpEq | FCmpNe | FCmpLt | FCmpLe | FCmpGt | FCmpGe | RefEq => (Some(op.a), smallvec![op.b, op.c]),
         ListLen | LoadCell | AllocCell | AllocListCap
-        | INeg | IBitNot | FNeg | NumToInt32 | NumToF64 | Int32ToNum | F64ToNum => (Some(op.a), vec![op.b]),
-        StringConcat | StringSlice if op.x < 256 => (Some(op.a), vec![op.b, op.c, op.x as u8]),
-        ListSet | MapSet | StoreProperty => (None, vec![op.a, op.b, op.c]),
-        ListAppend | StoreCell => (None, vec![op.a, op.b]),
-        AllocList => (Some(op.a), Vec::new()),
+        | INeg | IBitNot | FNeg | NumToInt32 | NumToF64 | Int32ToNum | F64ToNum => (Some(op.a), smallvec![op.b]),
+        StringConcat | StringSlice if op.x < 256 => (Some(op.a), smallvec![op.b, op.c, op.x as u8]),
+        ListSet | MapSet | StoreProperty => (None, smallvec![op.a, op.b, op.c]),
+        ListAppend | StoreCell => (None, smallvec![op.a, op.b]),
+        AllocList => (Some(op.a), SmallVec::new()),
         _ => return None,
     })
 }
 
 /// Every GPR of the frame (the operand set of a generic runtime op).
-fn all_registers(function: &PreparedFunction) -> Vec<u8> {
+fn all_registers(function: &PreparedFunction) -> RegList {
     let count = (function.frame.general_register_count as usize).min(256);
     (0..count).map(|reg| reg as u8).collect()
 }
@@ -698,14 +719,14 @@ fn classify_ops(
                     object: prepared.a, value: prepared.b, slot: prepared.x, class_key,
                 },
                 // Contracted/generic store: the runtime validates and barriers it.
-                None => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: vec![prepared.a, prepared.b], write: None, inline: None, guard: None, generic: false },
+                None => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: smallvec![prepared.a, prepared.b], write: None, inline: None, guard: None, generic: false },
             },
-            Opcode::SetFieldShape => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: vec![prepared.a, prepared.b, prepared.c], write: None, inline: None, guard: None, generic: false },
-            Opcode::GetFieldShape => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: vec![prepared.b], write: Some(prepared.a), inline: None, guard: None, generic: false },
-            Opcode::StoreModuleVar => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: vec![prepared.a], write: None, inline: None, guard: None, generic: false },
+            Opcode::SetFieldShape => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: smallvec![prepared.a, prepared.b, prepared.c], write: None, inline: None, guard: None, generic: false },
+            Opcode::GetFieldShape => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: smallvec![prepared.b], write: Some(prepared.a), inline: None, guard: None, generic: false },
+            Opcode::StoreModuleVar => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: smallvec![prepared.a], write: None, inline: None, guard: None, generic: false },
             Opcode::InvokeMethodDirect => {
                 let args = call_args(function, &prepared)?;
-                let reads: Vec<u8> = std::iter::once(op.b).chain(args.iter().copied()).collect();
+                let reads: RegList = std::iter::once(op.b).chain(args.iter().copied()).collect();
                 // The prepared op names the bytecode target; it is only valid for
                 // the descriptor's owner class while that class still binds it.
                 let class_key = match data.bytecode.chunk.specializations.get(prepared.x as usize) {
@@ -738,7 +759,7 @@ fn classify_ops(
                 OpKind::Runtime {
                     helper: WfRuntimeHelper::DirectCall, reads: args.clone(), write: Some(op.a),
                     inline: Some(if callee_uses_this(prepared.x) && !args.is_empty() {
-                        InlineTarget { callee: prepared.x, receiver: Some(args[0]), args: args[1..].to_vec(), class_guard: None }
+                        InlineTarget { callee: prepared.x, receiver: Some(args[0]), args: SmallVec::from_slice(&args[1..]), class_guard: None }
                     } else {
                         InlineTarget { callee: prepared.x, receiver: None, args, class_guard: None }
                     }),
@@ -823,7 +844,7 @@ fn liveness(kinds: &[Option<(OpKind, usize)>]) -> Vec<RegSet> {
                 for (word, other) in live.iter_mut().zip(live_in[successor]) { *word |= other; }
             }
             if let Some(dst) = kind.writes() { set_remove(&mut live, dst); }
-            for reg in kind.reads() { set_add(&mut live, reg); }
+            kind.visit_reads(|reg| set_add(&mut live, reg));
             if live != live_in[index] { live_in[index] = live; changed = true; }
         }
         if !changed { return live_in; }
@@ -954,13 +975,13 @@ struct Builder<'a> {
     inline_depth: u32,
     inlined_ops: usize,
     /// Functions being translated (root first): no recursive inlining.
-    inline_stack: Vec<u32>,
+    inline_stack: SmallVec<[u32; 4]>,
     /// Per active inlined call (outermost first): callee, call op in the
     /// parent, and the parent's GPR state and live set at that call.
-    inline_chain: Vec<(u32, usize, Vec<Option<WfValue>>, RegSet)>,
+    inline_chain: SmallVec<[(u32, usize, Vec<Option<WfValue>>, RegSet); 3]>,
     /// Loop-header registers forced to Tagged (a back edge disagreed with
     /// the type seen on entry). Input of this build.
-    loop_tagged: crate::napalm_collections::HashSet<(usize, u8)>,
+    loop_tagged: &'a crate::napalm_collections::SmallSet16<(usize, u8)>,
     /// Registers this build found disagreeing: rebuild with them Tagged.
     loop_retry: Vec<(usize, u8)>,
     /// A host helper ran (it may have rebound methods) since the method
@@ -971,6 +992,55 @@ struct Builder<'a> {
 
 /// `build_with` failure that asks for a rebuild with `loop_retry` applied.
 const LOOP_RETYPE: &str = "loop header types changed";
+
+/// Inlining only appends to the open block and creates new IR data. Keep
+/// lengths rather than cloning all previously compiled blocks and snapshots.
+struct InlineCheckpoint {
+    block: WfBlock,
+    insts: usize,
+    blocks: usize,
+    values: usize,
+    deopts: usize,
+    state: Vec<Option<WfValue>>,
+    inlined_ops: usize,
+    inlined_calls: u32,
+    epoch_dirty: bool,
+    effect_done: bool,
+}
+
+impl InlineCheckpoint {
+    fn save(builder: &Builder<'_>) -> Self {
+        let block = builder.current.expect("inline call outside a block");
+        debug_assert!(builder.out.blocks[block.0 as usize].terminator.is_none());
+        Self {
+            block,
+            insts: builder.out.blocks[block.0 as usize].insts.len(),
+            blocks: builder.out.blocks.len(),
+            values: builder.out.value_types.len(),
+            deopts: builder.out.deopts.len(),
+            state: builder.state.clone(),
+            inlined_ops: builder.inlined_ops,
+            inlined_calls: builder.out.inlined_calls,
+            epoch_dirty: builder.epoch_dirty,
+            effect_done: builder.inline.as_ref().is_some_and(|frame| frame.effect_done),
+        }
+    }
+
+    fn restore(self, builder: &mut Builder<'_>) {
+        builder.out.blocks.truncate(self.blocks);
+        let block = &mut builder.out.blocks[self.block.0 as usize];
+        block.insts.truncate(self.insts);
+        block.terminator = None;
+        builder.out.value_types.truncate(self.values);
+        builder.out.deopts.truncate(self.deopts);
+        builder.out.inlined_calls = self.inlined_calls;
+        builder.state = self.state;
+        builder.current = Some(self.block);
+        builder.inlined_ops = self.inlined_ops;
+        builder.epoch_dirty = self.epoch_dirty;
+        if let Some(frame) = &mut builder.inline { frame.effect_done = self.effect_done; }
+    }
+}
 
 impl Builder<'_> {
     fn new_value(&mut self, ty: WfTy) -> WfValue {
@@ -1168,7 +1238,7 @@ impl Builder<'_> {
         if let (Some(class), Some(receiver)) = (target.class_guard, receiver) {
             self.emit(WfTy::Bool, WfInst::GuardClass { value: receiver, class, deopt: replay });
         }
-        let mut args = Vec::with_capacity(target.args.len());
+        let mut args = SmallVec::<[WfValue; 4]>::with_capacity(target.args.len());
         for &reg in &target.args { args.push(self.read(reg, index)?); }
 
         // Translate the callee with its own GPR state.
@@ -1189,9 +1259,9 @@ impl Builder<'_> {
         self.inline_depth += 1;
         self.inlined_ops += reachable_ops;
         self.inline_stack.push(target.callee);
-        self.inline_chain.push((target.callee, index, caller_state.clone(), *live));
+        self.inline_chain.push((target.callee, index, caller_state, *live));
         let translated = translate(self, data, &kinds);
-        self.inline_chain.pop();
+        let (_, _, caller_state, _) = self.inline_chain.pop().expect("inline chain");
         self.inline_stack.pop();
         self.inline_depth -= 1;
         let frame = std::mem::replace(&mut self.inline, outer).expect("inline frame");
@@ -1308,7 +1378,7 @@ fn build_retyped(
     raw_return: Option<WfTy>,
     param_types: &[WfTy],
 ) -> Result<WfFunction, String> {
-    let mut loop_tagged = crate::napalm_collections::HashSet::default();
+    let mut loop_tagged = crate::napalm_collections::SmallSet16::default();
     for _ in 0..64 {
         match build_with(source, kinds, assume_self_call, raw_return, param_types, &loop_tagged) {
             Ok(built) => return Ok(built),
@@ -1353,7 +1423,7 @@ fn build_with(
     assume_self_call: Option<WfTy>,
     raw_return: Option<WfTy>,
     param_types: &[WfTy],
-    loop_tagged: &crate::napalm_collections::HashSet<(usize, u8)>,
+    loop_tagged: &crate::napalm_collections::SmallSet16<(usize, u8)>,
 ) -> Result<WfFunction, BuildError> {
     let root = source.root;
     let function = root.function;
@@ -1387,9 +1457,9 @@ fn build_with(
         inline: None,
         inline_depth: 0,
         inlined_ops: 0,
-        inline_stack: vec![root.function_index],
-        inline_chain: Vec::new(),
-        loop_tagged: loop_tagged.clone(),
+        inline_stack: smallvec![root.function_index],
+        inline_chain: SmallVec::new(),
+        loop_tagged,
         loop_retry: Vec::new(),
         epoch_dirty: false,
     };
@@ -1467,7 +1537,7 @@ struct LoopHeader {
 /// values.
 fn back_edge(
     builder: &mut Builder<'_>,
-    headers: &crate::napalm_collections::HashMap<usize, LoopHeader>,
+    headers: &crate::napalm_collections::SmallMap16<usize, LoopHeader>,
     from: WfBlock,
     slot: u8,
     header: usize,
@@ -1515,7 +1585,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
     let live_in = live_sets(data.function, kinds);
     let order = block_order(kinds)?;
     let is_header = &order.header;
-    let mut headers: crate::napalm_collections::HashMap<usize, LoopHeader> = Default::default();
+    let mut headers: crate::napalm_collections::SmallMap16<usize, LoopHeader> = Default::default();
 
     let mut pending: Vec<Vec<PendingEdge>> = (0..count).map(|_| Vec::new()).collect();
     // Placeholder targets until the real block exists (patched by set_edge).
@@ -1567,7 +1637,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
             let mut params: Vec<(u8, WfTy)> = Vec::new();
             for reg in 0..=255u8 {
                 if !set_has(&live, reg) { continue; }
-                let values: Option<Vec<WfValue>> = incoming.iter().map(|edge| edge.state[reg as usize]).collect();
+                let values: Option<smallvec::SmallVec<[WfValue; 2]>> = incoming.iter().map(|edge| edge.state[reg as usize]).collect();
                 let Some(values) = values else { continue; };
                 if !loop_header && values.iter().all(|value| *value == values[0]) {
                     merged[reg as usize] = Some(values[0]);
@@ -1595,7 +1665,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 if builder.inline.is_some() {
                     return Err(format!("op {index}: loop inside an inlined body"));
                 }
-                headers.insert(index, LoopHeader { block, params: params.clone() });
+                headers.insert(index, LoopHeader { block, params });
             }
             builder.state = merged;
             builder.current = Some(block);
@@ -1759,10 +1829,14 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
             OpKind::Primitive { dst, receiver, arg, class, kind } => {
                 builder.ensure_epoch(index, &live)?;
                 let deopt = builder.deopt(index, true, &live)?;
-                let receiver = builder.read(receiver, index)?;
-                let receiver = builder.tagged(receiver)?;
+                let receiver = if kind.numeric_receiver() {
+                    builder.number(receiver, index, &mut Some(deopt), &live)?
+                } else {
+                    let value = builder.read(receiver, index)?;
+                    builder.tagged(value)?
+                };
                 // Booleans are immediates: BoolNot checks the tag itself.
-                if kind != WfPrimitive::BoolNot {
+                if kind != WfPrimitive::BoolNot && !kind.numeric_receiver() {
                     builder.emit(WfTy::Bool, WfInst::GuardClass { value: receiver, class, deopt });
                 }
                 let arg = match arg {
@@ -1790,7 +1864,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 // Prefer inlining the call; on failure restore and call out.
                 let mut inlined = None;
                 if let Some(target) = &inline {
-                    let checkpoint = (builder.out.clone(), builder.state.clone(), builder.current, builder.inlined_ops);
+                    let checkpoint = InlineCheckpoint::save(builder);
                     match builder.inline_call(target, index, &live) {
                         Ok(value) => {
                             builder.out.inlined_calls += 1;
@@ -1804,7 +1878,7 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                             if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
                                 eprintln!("[napalm-wfjit] v2 inline declined at op {index} of {:?}: {reason}", data.function.id);
                             }
-                            (builder.out, builder.state, builder.current, builder.inlined_ops) = checkpoint;
+                            checkpoint.restore(builder);
                         }
                     }
                 }

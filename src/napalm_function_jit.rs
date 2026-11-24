@@ -646,9 +646,9 @@ impl WholeFunctionJit {
                     Ok(ir) => {
                         // IR built on the VM thread; Cranelift runs on the
                         // background compiler and the entry is installed later.
-                        let summary = format!("{:?}: {} ops={} insts={} build={:?}", function.id, ir.summary(),
+                        let summary = if events { format!("{:?}: {} ops={} insts={} build={:?}", function.id, ir.summary(),
                             function.ops.len(), ir.blocks.iter().map(|block| block.insts.len()).sum::<usize>(),
-                            started.elapsed());
+                            started.elapsed()) } else { String::new() };
                         match self.submit_v2(function_index, ir, small_map_fast_alloc, summary) {
                             Ok(()) => return Ok(()),
                             Err(reason) => {

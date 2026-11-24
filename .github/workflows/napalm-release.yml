@@ -1,0 +1,201 @@
+name: Napalm release (static LLVM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_version:
+        description: 'LLVM 23.1.x override (empty = latest stable release)'
+        required: false
+        type: string
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: napalm-static-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.llvm.outputs.version }}
+    steps:
+      - name: Resolve LLVM release once for all six targets
+        id: llvm
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.llvm_version }}
+        run: |
+          set -euo pipefail
+          version="$REQUESTED"
+          if [[ -z "$version" ]]; then
+            tag="$(gh api repos/llvm/llvm-project/releases/latest --jq '.tag_name')"
+            version="${tag#llvmorg-}"
+          fi
+          if [[ ! "$version" =~ ^23\.1\.[0-9]+$ ]]; then
+            echo "::error::LLVM $version is not compatible with Napalm's LLVM 23.1 bindings. Update Inkwell and llvm-sys, or select an explicit 23.1.x release."
+            exit 1
+          fi
+          gh api "repos/llvm/llvm-project/releases/tags/llvmorg-$version" --jq '.tag_name' | grep -Fx "llvmorg-$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    name: ${{ matrix.target }} / LLVM ${{ needs.resolve.outputs.version }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            backend: X86
+            msvc_arch: x64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            backend: AArch64
+            msvc_arch: arm64
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            backend: X86
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            backend: AArch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            backend: X86
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            backend: AArch64
+    defaults:
+      run:
+        shell: bash
+    env:
+      LLVM_VERSION: ${{ needs.resolve.outputs.version }}
+      LLVM_BACKEND: ${{ matrix.backend }}
+      RUST_TARGET: ${{ matrix.target }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-ci
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '3'
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+      CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up MSVC (native target)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Install native build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build cmake build-essential pkg-config libclang-dev binutils
+
+      - name: Set up paths and native Rust nightly
+        run: |
+          set -euo pipefail
+          python -c 'import os; from pathlib import Path; p=Path(os.environ["RUNNER_TEMP"])/"napalm-llvm-sdk"; f=open(os.environ["GITHUB_ENV"],"a",encoding="utf-8"); print(f"LLVM_SYS_231_PREFIX={p}",file=f); print(f"LLVM_PREFIX={p}",file=f); f.close()'
+          rustup toolchain install "nightly-$RUST_TARGET" --profile minimal --component rust-src
+          rustc "+nightly-$RUST_TARGET" -vV
+          cmake --version
+          ninja --version
+          python --version
+
+      - name: Restore static LLVM SDK
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.LLVM_PREFIX }}
+          key: llvm-static-${{ matrix.runner }}-${{ matrix.target }}-${{ env.LLVM_VERSION }}-${{ hashFiles('.github/scripts/static-llvm.py', '.github/workflows/napalm-release.yml') }}
+
+      - name: Compile LLVM from source
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          python .github/scripts/static-llvm.py build-llvm --prefix "$LLVM_PREFIX" --version "$LLVM_VERSION" --backend "$LLVM_BACKEND" --jobs 3
+
+      - name: Verify LLVM SDK
+        run: |
+          python .github/scripts/static-llvm.py verify-llvm --prefix "$LLVM_PREFIX" --version "$LLVM_VERSION" --backend "$LLVM_BACKEND"
+
+      - name: Save static LLVM SDK
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.LLVM_PREFIX }}
+          key: ${{ steps.llvm-cache.outputs.cache-primary-key }}
+
+      - name: Enable static LLVM in the disposable checkout
+        run: python .github/scripts/static-llvm.py prepare
+
+      - name: Build Napalm
+        run: |
+          set -euo pipefail
+          # The repository currently does not track Cargo.lock.
+          if [[ ! -f Cargo.lock ]]; then
+            cargo "+nightly-$RUST_TARGET" generate-lockfile
+          fi
+          cargo "+nightly-$RUST_TARGET" build --locked --release --target "$RUST_TARGET" --no-default-features --features llvm-static --bin napalm
+
+      - name: Verify imports, LLVM JIT and compression smoke tests
+        run: |
+          set -euo pipefail
+          suffix=''
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix='.exe'; fi
+          python .github/scripts/static-llvm.py smoke --binary "$CARGO_TARGET_DIR/$RUST_TARGET/release/napalm$suffix"
+
+      - name: Package binary, LLVM license and checksums
+        run: |
+          set -euo pipefail
+          python - <<'PYTHON'
+          from pathlib import Path
+          import hashlib
+          import os
+          import shutil
+          import subprocess
+
+          target = os.environ["RUST_TARGET"]
+          suffix = ".exe" if os.name == "nt" else ""
+          directory = Path("dist")
+          directory.mkdir(exist_ok=True)
+          binary = Path(os.environ["CARGO_TARGET_DIR"]) / target / "release" / f"napalm{suffix}"
+          shutil.copy2(binary, directory / binary.name)
+          shutil.copy2(Path(os.environ["LLVM_PREFIX"]) / "LLVM-LICENSE.txt", directory)
+          for name in ("LICENSE", "LICENSE.md", "LICENSE.txt", "LICENSE.TXT", "COPYING"):
+              if Path(name).is_file():
+                  shutil.copy2(name, directory / "NAPALM-LICENSE.txt")
+                  break
+          shutil.copy2("Cargo.lock", directory)
+          info = (f"Napalm commit: {os.environ['GITHUB_SHA']}\n"
+                  f"LLVM: {os.environ['LLVM_VERSION']}\nTarget: {target}\n")
+          info += subprocess.check_output(["rustc", f"+nightly-{target}", "-vV"], text=True)
+          (directory / "BUILD-INFO.txt").write_text(info, encoding="utf-8")
+          lines = []
+          for path in sorted(directory.iterdir()):
+              if path.is_file() and path.name != "SHA256SUMS":
+                  with path.open("rb") as file:
+                      lines.append(f"{hashlib.file_digest(file, 'sha256').hexdigest()}  {path.name}\n")
+          (directory / "SHA256SUMS").write_text("".join(lines), encoding="utf-8")
+          PYTHON
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: napalm-${{ matrix.target }}-llvm-${{ env.LLVM_VERSION }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

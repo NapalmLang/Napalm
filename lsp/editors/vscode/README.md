@@ -18,8 +18,9 @@ This produces `lsp/main.exe` on Windows or `lsp/main` on Linux/macOS,
 which the extension locates automatically in a workspace rooted at the Napalm
 repository. Alternatively set the VS Code setting `napalm.languageServerPath`
 to an absolute executable path, or a path relative to your workspace. This
-setting is useful for projects outside the Napalm repository. Reload the
-VS Code window after changing the setting.
+setting is useful for projects outside the Napalm repository. Changing it
+restarts the server automatically. **Napalm: Restart Language Server** also
+restarts it after a failed launch or an executable rebuild.
 
 The extension synchronizes open `.napalm` documents (including unsaved
 changes) and forwards `**/*.napalm` file changes to the server. Standard
@@ -28,9 +29,14 @@ analysis stays inside the Napalm executable.
 
 ## Install for local development
 
-From this directory, open VS Code and press **F5** (Extension Development Host),
-then open a `.napalm` source file. Alternatively, link/copy this directory into
-your VS Code extensions directory and restart the editor.
+After installing this directory's dependencies and building the server, launch
+an Extension Development Host from the repository root:
+
+```powershell
+code --extensionDevelopmentPath="$PWD/lsp/editors/vscode" .
+```
+
+Then open a `.napalm` source file.
 
 To build and install a VSIX after installing Node.js, from the repository root:
 
@@ -92,11 +98,25 @@ TextMate provides fallback colors; semantic tokens are also available from the L
 npm test
 ```
 
-Tests validate the extension's registration, grammar and the production
+Tests validate activation, error recovery, registration, grammar and the production
 dependencies selected by VSCE. The builder also runs live protocol tests against
 the compiled server on the native platform before packaging it.
 Opening the sample in VS Code remains a useful visual smoke test; actual
 TextMate tokenization is owned by the editor.
+
+On Windows, run the actual client and server in an isolated VS Code profile:
+
+```powershell
+npm run test:editor:windows
+# Or test the contents of an extracted VSIX with a specific VS Code installation:
+.\scripts\Test-VSCode.ps1 -CodePath 'C:\Program Files\Microsoft VS Code\Code.exe' -ExtensionPath 'C:\path\to\extracted\extension'
+```
+
+This verifies activation, diagnostics, navigation, hover, completion, references,
+rename, semantic tokens, unsaved edits, restart and recovery from an invalid
+server path. Reports and logs remain under the repository's `target` directory.
+Language features currently apply to local `file:` documents; a new untitled
+buffer must be saved as a `.napalm` file first.
 
 ## Production distribution: bundle the native server inside the VSIX
 
@@ -114,7 +134,7 @@ On Windows x64, with the compiled `lsp/main.exe` present, from the repository ro
 
 ```powershell
 node .\lsp\build-vscode.ts --skip-compile --target win32-x64
-code --install-extension ".\dist\vscode\napalm-language-0.1.2@win32-x64.vsix" --force
+code --install-extension ".\dist\vscode\napalm-language-0.1.3@win32-x64.vsix" --force
 ```
 
 The packaging script copies `../../main.exe` into
@@ -160,6 +180,8 @@ An activation error such as `Cannot find module 'vscode-languageclient/node'`
 means the installed VSIX is incomplete; rebuild/install it with the command above
 and run **Developer: Reload Window**. Version 0.1.2 includes the missing client
 dependencies and fixes analysis updates after document edits.
+Version 0.1.3 uses the log channel required by languageclient 11, reports launch
+errors with their cause and lets the client recover without reloading the window.
 
 To test the standalone executable without VS Code (PowerShell, repository root):
 

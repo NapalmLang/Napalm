@@ -80,9 +80,8 @@ fn napalm_whole_function_trees_survive_gc_and_shape_bailouts() {
             let stats = vm.whole_function_jit_stats().unwrap();
             assert!(stats.compiled_functions >= 2, "{stats:?}");
             assert!(stats.native_recursive_calls > 1000, "{stats:?}");
-            // v1 unrolls one recursion level; v2 recurses natively with
-            // shadow banks for the allocating `make`.
-            assert!(stats.inlined_recursive_sites >= 4 || stats.v2_compiled_functions >= 2, "{stats:?}");
+            // Native recursion with shadow banks for the allocating `make`.
+            assert!(stats.v2_compiled_functions >= 2, "{stats:?}");
         }
         assert!(vm.native_shadow_top.is_null());
     }
@@ -522,6 +521,53 @@ fn napalm_whole_function_v2_rebuilds_inlined_frames_after_effects() {
 }
 
 #[test]
+fn napalm_whole_function_v2_stores_references_with_the_write_barrier() {
+    // Constructors store heap references (child nodes, strings, lists) into
+    // exact-class fields: the native store runs the generational barrier
+    // instead of deoptimizing, and the stored graph survives collections.
+    let stats = whole_function_only_run(r#"
+        class Node { constructor(left, right, tag) { this.left = left; this.right = right; this.tag = tag; } }
+        function make(d) {
+            if (d == 0) return new Node(null, null, 'leaf');
+            return new Node(make(d - 1), make(d - 1), [d]);
+        }
+        function count(n) { return n == null ? 0 : 1 + count(n.left) + count(n.right); }
+        function main() {
+            let total = 0;
+            for (let i = 0; i < 40; i++) { const tree = make(7); System.gc(); total += count(tree); }
+            return total;
+        }
+        const result = main();
+    "#);
+    assert!(stats.v2_compiled_functions >= 2, "{stats:?}");
+    assert_eq!(stats.deoptimized_functions, 0, "{stats:?}");
+}
+
+#[test]
+fn napalm_whole_function_v2_recompiles_failed_sites_generically() {
+    // `add` speculates on Numbers, then its site starts seeing strings: the
+    // deopt feedback names the failed op, and the recompiled body runs that
+    // site through its helper, so the function stays compiled.
+    let stats = whole_function_only_run(r#"
+        let one = 0;
+        one = 1;
+        function add(a, b) { return a + b + one * 0; }
+        function main() {
+            let out: any = 0;
+            for (let i = 0; i < 300; i++) out = add(i, one);
+            let text: any = '';
+            for (let i = 0; i < 3000; i++) text = add(i % 2 == 0 ? 'a' : 1, 'b');
+            for (let i = 0; i < 300; i++) out = out + add(i, one);
+            return [out, text];
+        }
+        const result = main();
+    "#);
+    assert!(stats.deoptimized_functions >= 1, "{stats:?}");
+    assert!(stats.v2_compiled_functions >= 2, "{stats:?}");
+    assert_eq!(stats.rejected_functions, 0, "{stats:?}");
+}
+
+#[test]
 fn napalm_whole_function_recursion_replays_guards_and_depth_limit() {
     let (program, entry, manifest) = whole_function_program(r#"
         function chain(depth, value) {
@@ -599,10 +645,9 @@ fn napalm_whole_function_read_only_recursion_replays_deep_and_changed_shapes() {
         if native {
             assert!(vm.whole_function_jit_stats().unwrap().compiled_functions >= 2);
             assert!(vm.whole_function_jit_stats().unwrap().native_recursive_calls > 1000);
-            // Each recursive function takes a native-recursion path: v1 inlines
-            // one recursion level, v2 (typed SSA) compiles it without a bank.
+            // Each recursive function compiles with native self-calls.
             let stats = vm.whole_function_jit_stats().unwrap();
-            assert!(stats.inlined_recursive_sites + stats.v2_compiled_functions >= 2, "{stats:?}");
+            assert!(stats.v2_compiled_functions >= 2, "{stats:?}");
         }
     }
 }

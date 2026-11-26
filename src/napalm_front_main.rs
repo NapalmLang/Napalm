@@ -4745,6 +4745,7 @@ impl<'a> Parser<'a> {
                 span: self.end(start),
             });
         }
+        crate::napalm_front::synthesize_not_equal(name.span, &mut methods);
         let class = ClassDecl {
             name: name.clone(),
             superclass,

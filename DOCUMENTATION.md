@@ -456,7 +456,21 @@ to `!=` and `!==`. There is no JavaScript-style loose equality.
 - Strings: comparison by contents.
 - Booleans and null: comparison of their values.
 - Ordinary collections and objects: identity, not deep equality.
-- Instances with equality operators: may define their own comparison.
+- Class instances: identity too, unless the class defines `operator ==`. So
+  any instance can be compared with `null` (`node == null`, `node !== null`)
+  or with another reference, as in JavaScript.
+- Instances with equality operators: may define their own comparison. A class
+  that defines `operator ==` without `operator !=` gets `!=` as its negation,
+  so `a != b` is always `!(a == b)`.
+
+```napalm
+class Node { next: Node | null = null; constructor() {} }
+function length(node: Node | null) {
+    let count = 0;
+    while (node != null) { count++; node = node.next; }
+    return count;
+}
+```
 
 There is a deliberate difference in **Map/Set key** equality: all NaN values
 are grouped as one key; `0` and `-0` are also grouped together.
@@ -1950,6 +1964,10 @@ base-class initialization. Do not assume an empty derived class automatically
 forwards all arguments or runs all initializers.
 When derived initializers are present, the parser requires a direct call to
 super before inserting them.
+
+A class used as a type is nominal: `let shape: Shape = new Rectangle(6, 7)`,
+a `Shape` parameter, a `Shape | null` field or a `List<Shape>` accept instances
+of `Shape` and of any subclass, including subclasses declared in other modules.
 
 `instanceof` is useful for user class hierarchies: `value instanceof C` is true
 for instances of `C` and of any subclass. Its right-hand side can also be an

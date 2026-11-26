@@ -10,6 +10,23 @@ fn mismatch(path: &str, expected: &Type) -> RuntimeError {
 }
 
 impl Heap {
+    /// Nominal class test: the class in `class_slot` or one of its ancestors
+    /// belongs to `classes` (an instance of a subclass satisfies the class
+    /// types of its ancestors, including those declared in other modules).
+    pub(super) fn class_slot_in_set(&self, class_slot: u32, classes: &ClassSet) -> bool {
+        let mut cursor = Some(class_slot);
+        // Bounded by the class count: superclass links never form a cycle,
+        // but a corrupt table must not hang the check.
+        for _ in 0..=self.contract_class_ids.len() {
+            let Some(slot) = cursor else { return false };
+            if self.contract_class_ids.get(slot as usize).is_some_and(|id| classes.contains(*id)) {
+                return true;
+            }
+            cursor = self.contract_class_parents.get(slot as usize).copied().flatten();
+        }
+        false
+    }
+
     pub(super) fn has_contract(&self, value: Value) -> bool {
         if let Some(c) = self.concurrent_table(value).and_then(MapDictionary::concurrent_contracts) { return !c.read().is_empty(); }
         value
@@ -101,8 +118,7 @@ impl Heap {
             Type::Fiber => matches!(self.get(value), Some(HeapObject::FiberObject { .. })),
             Type::Instance(classes) => match self.get(value) {
                 Some(HeapObject::Instance(InstanceObject { class_slot, .. })) | Some(HeapObject::Foreign { class_slot, .. }) => {
-                    classes.is_unknown() || self.contract_class_ids.get(*class_slot as usize)
-                        .is_some_and(|id| classes.contains(*id))
+                    classes.is_unknown() || self.class_slot_in_set(*class_slot, classes)
                 }
                 _ => false,
             },
@@ -141,7 +157,7 @@ impl Heap {
                 let Some(HeapObject::Instance(values @ InstanceObject { class_slot, .. })) = self.get(value) else {
                     return Err(mismatch(path, expected));
                 };
-                if self.contract_class_ids.get(*class_slot as usize) != Some(class) {
+                if !self.class_slot_in_set(*class_slot, &ClassSet::singleton(*class)) {
                     return Err(mismatch(path, expected));
                 }
                 let names = self.class_field_names.get(*class_slot as usize);

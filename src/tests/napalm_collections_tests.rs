@@ -139,6 +139,66 @@ fn napalm_collections_instance_protocol_inheritance_overrides_and_gc() {
 }
 
 #[test]
+fn napalm_instances_compare_with_null_and_by_reference_like_javascript() {
+    // Classes without `operator ==` compare by identity (`==`/`===`, and the
+    // negations), so `x == null` works for any instance; a class defining
+    // only `operator ==` gets `!=` as its negation.
+    run_napalm(r#"
+        class Node { next: Node | null = null; constructor() {} }
+        class Child extends Node { constructor() { super(); } }
+        class Point {
+            constructor(x) { this.x = x; }
+            operator ==(other) { return other != null && this.x == other.x; }
+        }
+        function len(n: Node | null): Number { let c = 0; while (n != null) { c = c + 1; n = n.next; } return c; }
+        function isNull(n: Node | null): Boolean { return n === null; }
+        const a = new Node();
+        const b = new Node();
+        a.next = new Child();
+        let none: any = null;
+        const result = [
+            a == null, a === null, a != null, a !== null, null == a, none === null,
+            a == a, a == b, a != b, a.next == a.next, a.next.next == null, len(a),
+            new Point(1) == new Point(1), new Point(1) != new Point(1), new Point(1) != new Point(2),
+            new Point(1) == null, new Point(1) != null, isNull(b), isNull(null),
+        ];
+    "#, "[false, false, true, true, false, true, true, false, true, true, true, 2, true, false, true, false, true, false, true]");
+}
+
+#[test]
+fn napalm_subclass_instances_satisfy_their_ancestors_class_types() {
+    // Class annotations are nominal: locals, parameters, unions, typed fields
+    // and typed lists of `Node` accept every descendant, inherited methods see
+    // the real receiver class, and calls dispatch to overrides. An unrelated
+    // class still fails the contract.
+    run_napalm(r#"
+        class Node {
+            next: Node | null = null;
+            constructor() {}
+            kind() { return this instanceof Child ? 'child' : 'node'; }
+            name() { return 'node'; }
+            describe() { return this.name(); }
+        }
+        class Child extends Node { constructor() { super(); } name() { return 'child'; } }
+        class Grand extends Child { constructor() { super(); } }
+        class Other { constructor() {} }
+        function k(n: Node): String { return n.kind() + '/' + n.describe(); }
+        function maybe(n: Node | null): Boolean { return n === null; }
+        let local: Node = new Grand();
+        let child: Child = new Grand();
+        const xs: List<Node> = [new Node(), new Child(), new Grand()];
+        xs.push(new Grand());
+        const head = new Node();
+        head.next = new Child();
+        head.next.next = new Grand();
+        const kinds = [];
+        for (const x of xs) kinds.push(k(x));
+        const result = [kinds, k(local), child instanceof Node, maybe(head.next), maybe(null),
+            head.next.next.describe(), new Other() instanceof Node];
+    "#, "[[node/node, child/child, child/child, child/child], child/child, true, false, true, child, false]");
+}
+
+#[test]
 fn napalm_collections_instance_subscript_reads_and_writes_fields_by_name() {
     run_napalm(r#"
         interface Point { x: number; y: number; }

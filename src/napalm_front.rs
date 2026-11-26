@@ -1202,6 +1202,41 @@ pub struct ClassDecl {
     pub methods: Vec<MethodDecl>,
 }
 
+/// JavaScript semantics: `a != b` is `!(a == b)`. A class defining
+/// `operator ==` without `operator !=` gets that negation as its `!=`, so its
+/// inequality never falls back to reference identity (the default of classes
+/// that define neither).
+pub fn synthesize_not_equal(span: Span, methods: &mut Vec<MethodDecl>) {
+    let defines = |methods: &[MethodDecl], wanted: OperatorName| methods.iter().any(|method| matches!(&method.signature,
+        MethodSignatureAst::InfixOperator { operator, .. } if *operator == wanted));
+    if !defines(methods, OperatorName::EqualEqual) || defines(methods, OperatorName::BangEqual) {
+        return;
+    }
+    let other: Ident = Spanned::new("<other>".into(), span);
+    let equal = Expr::new(ExprKind::Binary {
+        left: Box::new(Expr::new(ExprKind::This, span)),
+        operator: BinaryOp::Equal,
+        right: Box::new(Expr::new(ExprKind::Name(other.clone()), span)),
+    }, span);
+    let negated = Expr::new(ExprKind::Unary { operator: UnaryOp::Not, operand: Box::new(equal) }, span);
+    methods.push(MethodDecl {
+        signature: MethodSignatureAst::InfixOperator { operator: OperatorName::BangEqual, param: other.clone() },
+        is_async: false,
+        is_static: false,
+        is_foreign: false,
+        is_constructor: false,
+        attributes: Vec::new(),
+        body: Some(FunctionBody {
+            params: vec![other],
+            param_types: vec![None],
+            return_type: None,
+            kind: FunctionBodyKind::Statements(vec![Stmt { kind: StmtKind::Return(Some(negated)), span }]),
+            span,
+        }),
+        span,
+    });
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassFieldDecl {
     /// Internal storage name (`_x` for instance fields, `__x` for static fields).
@@ -2069,6 +2104,8 @@ impl<'a> Parser<'a> {
             "NAPALM-P011",
             "expected `}` after class body",
         )?;
+        let mut methods = methods;
+        synthesize_not_equal(name.span, &mut methods);
 
         Ok(Stmt {
             kind: StmtKind::Class(ClassDecl {

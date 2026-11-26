@@ -447,6 +447,87 @@ impl ThreadRecord {
     }
 }
 
+/// MMTk virtual memory layout for this process, or None for MMTk's default.
+///
+/// MMTk's 64-bit default places its spaces at fixed addresses from 2 TiB
+/// (space `i` owns `[i << 41, (i + 1) << 41)`), which is exactly where mimalloc,
+/// the global allocator, starts its randomized hints for aligned OS
+/// reservations (2-30 TiB). Whenever a mimalloc segment landed near 2 TiB
+/// before the collector started, quarantining the Immix space failed and the
+/// process panicked at startup. The space map fixes the geometry (the heap
+/// spans `[1 << E, 17 << E)` for a space extent `2^E`), so pick the smallest
+/// extent that comfortably holds the heap and keeps the whole range below
+/// 2 TiB, and check that the range is free before handing it to MMTk.
+#[cfg(target_pointer_width = "64")]
+fn heap_layout(heap_bytes: usize) -> Option<mmtk::util::heap::vm_layout::VMLayout> {
+    heap_layout_with(heap_bytes, address_range_is_free)
+}
+
+#[cfg(target_pointer_width = "64")]
+fn heap_layout_with(
+    heap_bytes: usize,
+    is_free: impl Fn(usize, usize) -> bool,
+) -> Option<mmtk::util::heap::vm_layout::VMLayout> {
+    use mmtk::util::Address;
+    use mmtk::util::heap::vm_layout::VMLayout;
+    const MIMALLOC_HINT_BASE: usize = 2 << 40;
+    // Every space may grow to the whole heap; leave room for fragmentation.
+    let needed = heap_bytes.saturating_mul(4).max(8 << 30);
+    (33..=40usize)
+        .filter(|&extent| (1usize << extent) >= needed && (17usize << extent) <= MIMALLOC_HINT_BASE)
+        .find(|&extent| is_free(1usize << extent, 16usize << extent))
+        .map(|extent| VMLayout {
+            log_address_space: 47,
+            heap_start: unsafe { Address::from_usize(1usize << extent) },
+            heap_end: unsafe { Address::from_usize(17usize << extent) },
+            log_space_extent: extent,
+            force_use_contiguous_spaces: true,
+        })
+}
+
+#[cfg(not(target_pointer_width = "64"))]
+fn heap_layout(_heap_bytes: usize) -> Option<mmtk::util::heap::vm_layout::VMLayout> {
+    None
+}
+
+/// Whether nothing is mapped or reserved in `[start, start + bytes)`: reserve
+/// it (no commit) at exactly that address and release it again. MMTk then
+/// quarantines the spaces it needs inside the range.
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn address_range_is_free(start: usize, bytes: usize) -> bool {
+    unsafe extern "system" {
+        fn VirtualAlloc(address: *mut std::ffi::c_void, size: usize, kind: u32, protect: u32) -> *mut std::ffi::c_void;
+        fn VirtualFree(address: *mut std::ffi::c_void, size: usize, kind: u32) -> i32;
+    }
+    const MEM_RESERVE: u32 = 0x2000;
+    const MEM_RELEASE: u32 = 0x8000;
+    const PAGE_NOACCESS: u32 = 0x01;
+    unsafe {
+        let reserved = VirtualAlloc(start as *mut _, bytes, MEM_RESERVE, PAGE_NOACCESS);
+        if reserved.is_null() { return false; }
+        VirtualFree(reserved, 0, MEM_RELEASE);
+        reserved as usize == start
+    }
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn address_range_is_free(start: usize, bytes: usize) -> bool {
+    unsafe {
+        // A hint (no MAP_FIXED): the kernel honors it only when the whole
+        // range is free, and never replaces an existing mapping.
+        let mapped = libc::mmap(start as *mut _, bytes, libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE, -1, 0);
+        if mapped == libc::MAP_FAILED { return false; }
+        libc::munmap(mapped, bytes);
+        mapped as usize == start
+    }
+}
+
+#[cfg(all(not(any(windows, unix)), target_pointer_width = "64"))]
+fn address_range_is_free(_start: usize, _bytes: usize) -> bool {
+    true
+}
+
 impl Collector {
     #[cfg(test)]
     pub(crate) fn config_external_threshold_for_test(&self) -> usize {
@@ -480,6 +561,9 @@ impl Collector {
             "gc_trigger",
             &format!("FixedHeapSize:{}", config.heap_bytes)
         ));
+        if let Some(layout) = heap_layout(config.heap_bytes) {
+            builder.set_vm_layout(layout);
+        }
         let mmtk = Box::leak(mm::mmtk_init::<Binding>(&builder));
         let collector = Self {
             mmtk,
@@ -1972,5 +2056,36 @@ impl vm::ReferenceGlue<Binding> for References {
     }
     fn enqueue_references(objects: &[ObjectReference], _tls: VMWorkerThread) {
         assert!(objects.is_empty());
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod heap_layout_tests {
+    use super::*;
+
+    #[test]
+    fn heap_layout_stays_below_mimalloc_hints_and_holds_the_heap() {
+        for heap in [8usize << 20, 256 << 20, 2 << 30, 16 << 30] {
+            let layout = heap_layout_with(heap, |_, _| true).expect("a layout below 2 TiB");
+            let extent = 1usize << layout.log_space_extent;
+            assert_eq!(layout.heap_start.as_usize(), extent);
+            assert_eq!(layout.heap_end.as_usize(), 17 * extent);
+            assert!(layout.heap_end.as_usize() <= 2 << 40, "{layout:?}");
+            assert!(extent >= heap * 4, "{layout:?}");
+        }
+    }
+
+    #[test]
+    fn heap_layout_skips_occupied_ranges_and_falls_back_to_the_default() {
+        // The first candidate is taken: the next extent is chosen.
+        let layout = heap_layout_with(256 << 20, |start, _| start != 1 << 33).unwrap();
+        assert_eq!(layout.log_space_extent, 34);
+        // Nothing below 2 TiB is free: MMTk keeps its own default layout.
+        assert!(heap_layout_with(256 << 20, |_, _| false).is_none());
+        // The real probe reports memory that is already in use as occupied.
+        let buffer = vec![1u8; 4 << 20];
+        let page = (buffer.as_ptr() as usize + (1 << 20)) & !0xffff;
+        assert!(!address_range_is_free(page, 1 << 16));
+        drop(buffer);
     }
 }

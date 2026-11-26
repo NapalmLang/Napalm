@@ -482,7 +482,7 @@ fn annotation_mentions_type_params(annotation: &TypeAnnotation, params: &[Ident]
 /// concrete arguments when instantiating a generic class (`T` -> number).
 fn resolve_type_annotation(
     annotation: &TypeAnnotation,
-    classes: &HashMap<CompactString, ClassId>,
+    classes: &HashMap<CompactString, ClassSet>,
     interfaces: &HashMap<CompactString, Type>,
 ) -> Type {
     resolve_type_annotation_with(annotation, classes, interfaces, &HashMap::default())
@@ -490,7 +490,7 @@ fn resolve_type_annotation(
 
 fn resolve_type_annotation_with(
     annotation: &TypeAnnotation,
-    classes: &HashMap<CompactString, ClassId>,
+    classes: &HashMap<CompactString, ClassSet>,
     interfaces: &HashMap<CompactString, Type>,
     env: &HashMap<CompactString, Type>,
 ) -> Type {
@@ -569,8 +569,8 @@ fn resolve_type_annotation_with(
             "Array" | "List" => Type::List(None),
             class_name => classes
                 .get(class_name)
-                .copied()
-                .map(|class| Type::Instance(ClassSet::singleton(class)))
+                .cloned()
+                .map(Type::Instance)
                 .unwrap_or(Type::Top),
         },
         K::Union(types) => {
@@ -872,7 +872,7 @@ impl<'ast> RootAnalysis<'ast> {
 
     fn resolved_binding_types(
         &self,
-        classes: &HashMap<CompactString, ClassId>,
+        classes: &HashMap<CompactString, ClassSet>,
         interfaces: &HashMap<CompactString, Type>,
     ) -> &HashMap<BindingId, StaticBindingType> {
         self.resolved_binding_types.get_or_init(|| {
@@ -1572,6 +1572,10 @@ struct ModuleLowerer<'p, 's, 'a> {
     symbols: SymbolTable,
     class_plans: HashMap<Span, ClassPlan>,
     top_level_classes: HashMap<CompactString, ClassId>,
+    /// What a class name means in a type annotation: the class plus every
+    /// class of this module that (transitively) extends it. ClassSet holds
+    /// exact runtime classes, so a nominal annotation needs the descendants.
+    top_level_class_sets: HashMap<CompactString, ClassSet>,
     interface_types: HashMap<CompactString, Type>,
     string_ids: HashMap<CompactString, ir::StringId>,
     /// Source import spelling -> canonical resolved module StringId. Kept
@@ -1627,6 +1631,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             symbols: SymbolTable::default(),
             class_plans: HashMap::default(),
             top_level_classes: HashMap::default(),
+            top_level_class_sets: HashMap::default(),
             interface_types: HashMap::default(),
             string_ids: HashMap::default(),
             import_ids: HashMap::default(),
@@ -1810,7 +1815,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                         name: field.name.value.to_string(),
                         ty: resolve_type_annotation(
                             &field.annotation,
-                            &self.top_level_classes,
+                            &self.top_level_class_sets,
                             &self.interface_types,
                         ),
                         optional: field.optional,
@@ -1848,7 +1853,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 // arguments remain a compile-time-only surface feature for now.
                 let resolved = resolve_type_annotation(
                     &decl.annotation,
-                    &self.top_level_classes,
+                    &self.top_level_class_sets,
                     &self.interface_types,
                 );
                 self.interface_types
@@ -1930,7 +1935,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             let args: Vec<Type> = generic_use
                 .args
                 .iter()
-                .map(|arg| resolve_type_annotation(arg, &self.top_level_classes, &self.interface_types))
+                .map(|arg| resolve_type_annotation(arg, &self.top_level_class_sets, &self.interface_types))
                 .collect();
             let env: HashMap<CompactString, Type> = class
                 .type_params
@@ -1949,7 +1954,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     }
                     Some(ir::InterfaceFieldType {
                         name: field.storage.value.strip_prefix('_').unwrap_or(&field.storage.value).to_owned(),
-                        ty: resolve_type_annotation_with(annotation, &self.top_level_classes, &self.interface_types, &env),
+                        ty: resolve_type_annotation_with(annotation, &self.top_level_class_sets, &self.interface_types, &env),
                         optional: false,
                         readonly: false,
                     })
@@ -2009,7 +2014,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             }
             let (expected, origin, display) = match source_type.as_ref() {
                 Some(annotation) => (
-                    resolve_type_annotation(annotation, &self.top_level_classes, &self.interface_types),
+                    resolve_type_annotation(annotation, &self.top_level_class_sets, &self.interface_types),
                     annotation.span,
                     display_type_annotation(annotation),
                 ),
@@ -2135,6 +2140,38 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     methods: Vec::new(),
                 },
             );
+        }
+
+        // Annotation types are nominal: `Node` admits every class of this
+        // module that (transitively) extends `Node` by name. Subclasses from
+        // other modules, or behind a computed `extends`, are not visible here;
+        // the runtime contract check accepts them by walking the superclass
+        // chain.
+        let parents: HashMap<CompactString, CompactString> = declarations
+            .iter()
+            .filter(|&&(_, top_level)| top_level)
+            .filter_map(|&(class_ptr, _)| {
+                let class = unsafe { &*class_ptr };
+                match class.superclass.as_ref().map(|expr| &expr.kind) {
+                    Some(ExprKind::Name(parent)) => Some((class.name.value.clone(), parent.value.clone())),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (name, &id) in &self.top_level_classes {
+            let descendants = self.top_level_classes.iter().filter(|(candidate, _)| {
+                let mut cursor = parents.get(*candidate);
+                // Bounded: a cyclic `extends` is reported elsewhere.
+                for _ in 0..self.top_level_classes.len() {
+                    match cursor {
+                        Some(parent) if parent == name => return true,
+                        Some(parent) => cursor = parents.get(parent),
+                        None => return false,
+                    }
+                }
+                false
+            }).map(|(_, &descendant)| descendant);
+            self.top_level_class_sets.insert(name.clone(), ClassSet::from_iter(std::iter::once(id).chain(descendants)));
         }
 
         // Field names are lexical to the class and can appear in nested closures
@@ -2336,7 +2373,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                 .map(|annotation| {
                     resolve_type_annotation(
                         annotation,
-                        &self.top_level_classes,
+                        &self.top_level_class_sets,
                         &self.interface_types,
                     )
                 })
@@ -2345,7 +2382,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                         |annotation| {
                             resolve_type_annotation(
                                 &annotation,
-                                &self.top_level_classes,
+                                &self.top_level_class_sets,
                                 &self.interface_types,
                             )
                         },
@@ -3001,7 +3038,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
                     }
                     let expected = resolve_type_annotation(
                         annotation,
-                        &self.top_level_classes,
+                        &self.top_level_class_sets,
                         &self.interface_types,
                     );
                     // Async returns adopt Promises without awaiting them inside
@@ -3082,7 +3119,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             let ty = if mode == CaptureMode::ByCell {
                 Type::Cell(Box::new(Type::Top))
             } else if info.shared {
-                info.source_type.as_ref().map(|a| resolve_type_annotation(a, &self.top_level_classes, &self.interface_types)).unwrap_or(Type::Top)
+                info.source_type.as_ref().map(|a| resolve_type_annotation(a, &self.top_level_class_sets, &self.interface_types)).unwrap_or(Type::Top)
             } else {
                 Type::Top
             };
@@ -3108,7 +3145,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             }
         });
 
-        let binding_types = analysis.resolved_binding_types(&self.top_level_classes, &self.interface_types);
+        let binding_types = analysis.resolved_binding_types(&self.top_level_class_sets, &self.interface_types);
 
         let context = FunctionCompilerContext {
             source_name: self.source_name,
@@ -3121,6 +3158,7 @@ impl<'p, 's, 'a> ModuleLowerer<'p, 's, 'a> {
             worker_function_names: &self.worker_function_names,
             interface_types: &self.interface_types,
             top_level_classes: &self.top_level_classes,
+            top_level_class_sets: &self.top_level_class_sets,
             implicit_this: self.ast.exports.is_none(),
             symbols: &self.symbols,
             class_plans: &self.class_plans,
@@ -3273,6 +3311,7 @@ struct FunctionCompilerContext<'a> {
     module_binding_types: &'a HashMap<CompactString, StaticBindingType>,
     worker_function_names: &'a HashSet<CompactString>,
     top_level_classes: &'a HashMap<CompactString, ClassId>,
+    top_level_class_sets: &'a HashMap<CompactString, ClassSet>,
     interface_types: &'a HashMap<CompactString, Type>,
     implicit_this: bool,
     symbols: &'a SymbolTable,
@@ -3429,7 +3468,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             }
         }
         let expected = if let Some(annotation) = annotation {
-            resolve_type_annotation(annotation, self.context.top_level_classes, self.context.interface_types)
+            resolve_type_annotation(annotation, self.context.top_level_class_sets, self.context.interface_types)
         } else if initializer.is_some() {
             let actual = semantic_source_type(self.builder.value_type(value));
             if matches!(actual, Type::Null) {
@@ -3443,7 +3482,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                     .source_type
                     .as_ref()
                     .map(|annotation| {
-                        resolve_type_annotation(annotation, self.context.top_level_classes, self.context.interface_types)
+                        resolve_type_annotation(annotation, self.context.top_level_class_sets, self.context.interface_types)
                     })
                     .unwrap_or(Type::Top)
             } else {
@@ -3998,7 +4037,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
                 let explicit_expected = annotation.as_ref().map(|annotation| {
                     resolve_type_annotation(
                         annotation,
-                        self.context.top_level_classes,
+                        self.context.top_level_class_sets,
                         self.context.interface_types,
                     )
                 });
@@ -4720,7 +4759,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
             ExprKind::Map(entries) => self.lower_map(entries),
             ExprKind::TypedCollection { expression, annotation } => {
                 let value = self.lower_expr(expression);
-                let expected = resolve_type_annotation(annotation, self.context.top_level_classes, self.context.interface_types);
+                let expected = resolve_type_annotation(annotation, self.context.top_level_class_sets, self.context.interface_types);
                 self.bind_interface(value, &expected)
             }
             ExprKind::Grouped(inner) => self.lower_expr(inner),
@@ -4801,7 +4840,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         yielded: Option<&TypeAnnotation>, resumed: Option<&TypeAnnotation>, span: Span) -> ValueId {
         let value = self.lower_expr(expression);
         let packet = if delegated { value } else {
-            let expected = yielded.map(|t| resolve_type_annotation(t, self.context.top_level_classes,
+            let expected = yielded.map(|t| resolve_type_annotation(t, self.context.top_level_class_sets,
                 self.context.interface_types)).unwrap_or(Type::Top);
             let value = self.bind_interface(value, &expected);
             self.builder.emit1(Inst::FiberYield { value }, Type::List(None))
@@ -4831,7 +4870,7 @@ impl<'p, 'a, 'd> FunctionCompiler<'p, 'a, 'd> {
         self.builder.position_at(throwing);
         self.builder.emit0(Inst::FiberAbort { error: value });
         self.builder.position_at(next);
-        let expected = resumed.map(|t| resolve_type_annotation(t, self.context.top_level_classes,
+        let expected = resumed.map(|t| resolve_type_annotation(t, self.context.top_level_class_sets,
             self.context.interface_types)).unwrap_or(Type::Top);
         self.bind_interface(value, &expected)
     }

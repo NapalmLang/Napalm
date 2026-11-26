@@ -415,6 +415,13 @@ pub(super) struct WfSource<'a> {
     pub(super) loop_counters: &'a std::cell::RefCell<crate::napalm_collections::HashMap<usize, usize>>,
     /// Builtin primitive identities (native builtin method lowering).
     pub(super) manifest: Option<&'a crate::napalm_builtin::BuiltinManifest>,
+    /// False compiles without any speculative guard (every profiled site runs
+    /// through its host helper): `NAPALM_WFJIT_SPECULATE=0`.
+    pub(super) speculate: bool,
+    /// Root ops whose speculative guards failed in earlier compilations: they
+    /// compile without speculation. `u32::MAX` marks the entry's parameter
+    /// types (no native self-call specialization).
+    pub(super) failed_sites: &'a [u32],
 }
 
 /// A monomorphic Invoke site whose profiled target is a builtin the v2 tier
@@ -1301,6 +1308,16 @@ pub(super) fn build(source: &WfSource<'_>) -> Result<WfFunction, String> {
     // Everything code generation reads from the VM is captured now, on the
     // VM thread: the lowering itself may run on the background compiler.
     let root = source.root;
+    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DUMP.get_or_init(|| std::env::var_os("NAPALM_WFJIT_DUMP").is_some()) {
+        eprintln!("[napalm-wfjit] IR dump f={}:", root.function_index);
+        for (index, block) in ir.blocks.iter().enumerate() {
+            eprintln!("  block{index}:");
+            for (value, inst) in &block.insts {
+                eprintln!("    v{} = {inst:?}", value.0);
+            }
+        }
+    }
     ir.frame = WfFrameInfo::of(root.function);
     for block in &ir.blocks {
         for (_, inst) in &block.insts {
@@ -1319,11 +1336,19 @@ pub(super) fn build(source: &WfSource<'_>) -> Result<WfFunction, String> {
 
 fn build_unoptimized(source: &WfSource<'_>) -> Result<WfFunction, String> {
     let function = source.root.function;
+    let arity = function.arity as usize;
+    if !source.speculate || source.failed_sites.contains(&u32::MAX) {
+        // No native self-call specialization: its parameter types are a guess.
+        let mut kinds = classify_ops(source.root, source, false)?;
+        strip_failed_sites(source, &mut kinds);
+        return build_retyped(source, &kinds, None, None, &vec![WfTy::Tagged; arity]);
+    }
     // Native self-calls run nested frames without a register bank: they need
     // a replay-safe body (no stores, no host helpers, no captures read from
     // the bank). Otherwise calls to itself go through the interpreter's call
     // path, which gives every level a real frame.
-    let native = classify_ops(source.root, source, true)?;
+    let mut native = classify_ops(source.root, source, true)?;
+    strip_failed_sites(source, &mut native);
     let self_calls = native.iter().flatten().any(|(kind, _)| matches!(kind, OpKind::SelfCall { .. }));
     if self_calls && function.capture_count == 0 {
         match build_specialized(source, &native) {
@@ -1335,9 +1360,52 @@ fn build_unoptimized(source: &WfSource<'_>) -> Result<WfFunction, String> {
             }
         }
     }
-    let kinds = if self_calls { classify_ops(source.root, source, false)? } else { native };
-    let arity = function.arity as usize;
+    let kinds = if self_calls {
+        let mut kinds = classify_ops(source.root, source, false)?;
+        strip_failed_sites(source, &mut kinds);
+        kinds
+    } else { native };
     build_retyped(source, &kinds, None, None, &vec![WfTy::Tagged; arity])
+}
+
+/// Turn the root ops named in `failed_sites` (all of them without
+/// speculation) into their non-speculative form.
+fn strip_failed_sites(source: &WfSource<'_>, kinds: &mut [Option<(OpKind, usize)>]) {
+    let function = source.root.function;
+    for (index, entry) in kinds.iter_mut().enumerate() {
+        if let Some((kind, _)) = entry {
+            if !source.speculate || source.failed_sites.contains(&(index as u32)) {
+                strip_speculation(function, kind);
+            }
+        }
+    }
+}
+
+/// Non-speculative form of one op: when its native form relies on a profile
+/// (numeric/identity/PIC/primitive dispatch, exact-class field access,
+/// guarded or inlined calls, native self-calls) it runs through its host
+/// helper instead, so no speculative guard is left for it. Register traffic,
+/// control flow and allocation stay native.
+fn strip_speculation(function: &PreparedFunction, kind: &mut OpKind) {
+    let replacement = match kind {
+        OpKind::Numeric { .. } | OpKind::Identity { .. } | OpKind::MapGet { .. }
+        | OpKind::Primitive { .. } | OpKind::SelfCall { .. }
+        | OpKind::Runtime { guard: Some(_), .. } => OpKind::Runtime {
+            helper: WfRuntimeHelper::CallToReturn, reads: all_registers(function), write: None,
+            inline: None, guard: None, generic: true,
+        },
+        OpKind::FieldGet { dst, object, .. } => OpKind::Runtime {
+            helper: WfRuntimeHelper::Op, reads: smallvec![*object], write: Some(*dst),
+            inline: None, guard: None, generic: false,
+        },
+        OpKind::FieldSet { object, value, .. } => OpKind::Runtime {
+            helper: WfRuntimeHelper::Op, reads: smallvec![*object, *value], write: None,
+            inline: None, guard: None, generic: false,
+        },
+        OpKind::Runtime { inline, .. } => { *inline = None; return; }
+        _ => return,
+    };
+    *kind = replacement;
 }
 
 /// Native self-call specialization. Optimistically type self-call results as

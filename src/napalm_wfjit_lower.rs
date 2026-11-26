@@ -31,7 +31,7 @@ pub(super) struct WfHelperRefs {
     pub(super) direct_method: FuncRef,
     pub(super) profiled_method: FuncRef,
     pub(super) call_to_return: FuncRef,
-    // Allocation (shared with v1's emitters).
+    // Allocation (TLAB emitters in napalm_function_jit.rs).
     pub(super) profiled_small_map: FuncRef,
     pub(super) profiled_small_map_commit: FuncRef,
     pub(super) bind_factory_contract: FuncRef,
@@ -46,6 +46,8 @@ pub(super) struct WfHelperRefs {
     pub(super) string_eq: FuncRef,
     pub(super) string_code_point_at: FuncRef,
     pub(super) bytes_index: FuncRef,
+    /// Generational post-barrier `(vm, owner address, stored word)`.
+    pub(super) write_barrier: FuncRef,
 }
 
 /// Only heap-independent words can retain their *bank equality* fact after
@@ -609,12 +611,6 @@ impl Lowering<'_, '_> {
                 let plain = self.b.ins().icmp_imm(IntCC::Equal, reactive, 0);
                 self.guard(plain, *deopt);
                 let stored = self.value(*value);
-                if !*value_immediate {
-                    // A heap reference would need the generational barrier.
-                    let is_heap = self.is_heap(stored);
-                    let immediate = self.b.ins().bxor_imm(is_heap, 1);
-                    self.guard(immediate, *deopt);
-                }
                 let receiver_id = *object;
                 let object = self.value(receiver_id);
                 let (entry, address) = self.live_instance(object, *slot, *deopt);
@@ -625,6 +621,18 @@ impl Lowering<'_, '_> {
                 let data = emit_heap_data_base(self.b, entry, address);
                 self.b.ins().store(flags, stored, data,
                     *slot as i32 * std::mem::size_of::<RegisterWord>() as i32);
+                if !*value_immediate {
+                    // A heap reference runs the generational post-barrier (a
+                    // non-allocating leaf: no safepoint, no frame state).
+                    let is_heap = self.is_heap(stored);
+                    let barrier = self.b.create_block();
+                    let done = self.b.create_block();
+                    self.b.ins().brif(is_heap, barrier, &[], done, &[]);
+                    self.b.switch_to_block(barrier);
+                    self.b.ins().call(self.helpers.write_barrier, &[self.vm, address, stored]);
+                    self.b.ins().jump(done, &[]);
+                    self.b.switch_to_block(done);
+                }
                 // Different SSA receivers may alias the same instance.
                 self.field_written.retain(|(_, field, _)| *field != *slot);
                 if self.local_objects.contains(&receiver_id) {
@@ -1052,12 +1060,13 @@ impl Lowering<'_, '_> {
         block
     }
 
-    /// Shared cold block for a speculative failure in a nested frame: count it
-    /// and unwind.
+    /// Shared cold block for a speculative failure in a nested frame (param:
+    /// the failed op): count it and unwind.
     fn nested_speculative_bail(&mut self) -> cranelift::prelude::Block {
         if let Some(block) = self.nested_spec_bail { return block; }
         let block = self.b.create_block();
         self.b.set_cold_block(block);
+        self.b.append_block_param(block, types::I32);
         self.nested_spec_bail = Some(block);
         block
     }
@@ -1070,7 +1079,7 @@ impl Lowering<'_, '_> {
             let (root_map, pc) = (self.b.block_params(block)[0], self.b.block_params(block)[1]);
             if speculative {
                 let function = self.b.ins().iconst(types::I32, self.ir.function_index as i64);
-                self.b.ins().call(self.helpers.speculation_failed, &[self.vm, function]);
+                self.b.ins().call(self.helpers.speculation_failed, &[self.vm, function, pc]);
             }
             let hot_frame = self.b.ins().load(types::I64, flags, self.vm,
                 offset_of!(Interpreter<'static>, hot_frame) as i32);
@@ -1081,8 +1090,9 @@ impl Lowering<'_, '_> {
         }
         if let Some(block) = self.nested_spec_bail {
             self.b.switch_to_block(block);
+            let site = self.b.block_params(block)[0];
             let function = self.b.ins().iconst(types::I32, self.ir.function_index as i64);
-            self.b.ins().call(self.helpers.speculation_failed, &[self.vm, function]);
+            self.b.ins().call(self.helpers.speculation_failed, &[self.vm, function, site]);
             let bail = self.bail_block();
             self.b.ins().jump(bail, &[]);
         }
@@ -1103,9 +1113,15 @@ impl Lowering<'_, '_> {
             // A nested native frame unwinds; only the top frame materializes.
             let materialize = self.b.create_block();
             self.b.set_cold_block(materialize);
-            let unwind = if speculative { self.nested_speculative_bail() } else { self.bail_block() };
             let is_top = self.is_top(frame);
-            self.b.ins().brif(is_top, materialize, &[], unwind, &[]);
+            if speculative {
+                let unwind = self.nested_speculative_bail();
+                let site = self.b.ins().iconst(types::I32, state.op_index as i64);
+                self.b.ins().brif(is_top, materialize, &[], unwind, &[BlockArg::Value(site)]);
+            } else {
+                let unwind = self.bail_block();
+                self.b.ins().brif(is_top, materialize, &[], unwind, &[]);
+            }
             self.b.switch_to_block(materialize);
         }
         let registers = &state.registers;
@@ -1121,7 +1137,7 @@ impl Lowering<'_, '_> {
         }
         if speculative {
             let function = self.b.ins().iconst(types::I32, self.ir.function_index as i64);
-            self.b.ins().call(self.helpers.speculation_failed, &[self.vm, function]);
+            self.b.ins().call(self.helpers.speculation_failed, &[self.vm, function, pc]);
         }
         let hot_frame = self.b.ins().load(types::I64, flags, self.vm,
             offset_of!(Interpreter<'static>, hot_frame) as i32);

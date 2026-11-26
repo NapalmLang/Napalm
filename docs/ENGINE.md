@@ -277,6 +277,10 @@ Every managed object owns a stable handle and needs cleanup when it dies: the ha
 
 Current collector tuning is configurable through environment variables such as heap size, worker count and external-memory threshold in the GC integration.
 
+### Virtual memory layout
+
+MMTk's 64-bit default puts space `i` at the fixed range `[i << 41, (i + 1) << 41)`, starting at 2 TiB, which is where mimalloc (the global allocator) begins its randomized hints for aligned OS reservations. A mimalloc segment placed there before the collector starts made the Immix reservation fail at startup. Napalm therefore passes its own layout: the smallest space extent `2^E` that is at least four times the heap (and 8 GiB) and keeps the whole heap range `[2^E, 17 * 2^E)` below 2 TiB, after checking that the range is free (it tries the next extent otherwise, and keeps MMTk's default if none is).
+
 ## 7. Tracing JIT with Cranelift
 
 Hot execution can leave the baseline interpreter and enter native Cranelift code.
@@ -314,14 +318,16 @@ before eligible recursive functions switch to whole-function native code.
 Rejected functions and functions awaiting sufficient runtime profiles retain
 their normal tracing entry and loop paths.
 
-### Whole-function tier v2: typed SSA
+### Whole-function tier: typed SSA
 
-The typed-SSA generation of the whole-function tier is tried first; v1 remains
-the fallback (and the non-speculative tier after repeated deopts).
-`NAPALM_WFJIT_V2=0` disables v2. `NAPALM_JIT_EVENTS=1` reports, for each
-function, whether v2 compiled it (with a summary: return type, parameter types,
-native self-calls, helpers, allocations, back edges, inlined calls) or why it
-declined.
+The whole-function tier compiles a typed-SSA IR (the first, register-bank code
+generator was removed once this one covered all it did). `NAPALM_JIT_EVENTS=1`
+reports, for each function, whether it compiled (with a summary: return type,
+parameter types, native self-calls, helpers, allocations, back edges, inlined
+calls) or why it declined. Diagnostics: `NAPALM_WFJIT_DUMP=1` prints the IR,
+`NAPALM_WFJIT_BAILOUTS=1` each bailout, `NAPALM_WFJIT_HELPERS=1` a histogram
+of helper calls, `NAPALM_WFJIT_OPT=0` skips the IR optimizer and
+`NAPALM_WFJIT_SPECULATE=0` compiles everything without speculation.
 
 - **Background compilation.** When a function becomes hot, its IR is built
   on the VM thread, the only phase that reads live profiles and quickening
@@ -330,9 +336,9 @@ declined.
   thread (`napalm-wfjit`) with a `JITModule` of its own. Meanwhile the
   function keeps running in the interpreter or the tracer, and the entry is
   installed at the next call that finds the result ready. A code generation
-  failure falls back to v1 on the next tier-up. `NAPALM_WFJIT_SYNC=1` (and
-  unit tests) wait for each compilation, for deterministic tiering. The
-  synchronous v1 generator is unchanged.
+  failure leaves the function to the interpreter and the tracer.
+  `NAPALM_WFJIT_SYNC=1` (and unit tests) wait for each compilation, for
+  deterministic tiering.
 - **IR** (`src/napalm_wfjit_ir.rs`). A backend-neutral IR with blocks, typed block
   parameters (`Tagged`, `F64`, `Bool`), one value per instruction and explicit
   deoptimization states. Basic blocks are translated in reverse postorder, with
@@ -347,13 +353,15 @@ declined.
   (`RuntimeOp`, top frame only), an allocation, or a native self-call of an
   allocating recursion.
 - **Coverage.** Natively: moves, constants, module loads, branches, loops,
-  numeric quickening, identity, Map PICs, class fields, small literals and typed
+  numeric quickening, identity, Map PICs, class fields (reference stores run the
+  generational post-barrier; with reactivity enabled stores go through the
+  runtime so they notify), small literals and typed
   arrays (inline TLAB path), self-calls, inlining. Calls run through helpers that
   let the callee tier up: `CallDirect` (direct call), profiled monomorphic
   `Invoke` and resolved `InvokeMethodDirect` (receiver class guarded natively),
   and everything else (polymorphic `Invoke`, `InvokeSuper`, `CallClosure`,
   `CallPrimitive`, `new`) through the interpreter's generic call path, run to
-  completion. Any other op v1 accepts, plus `throw`, executes through its own
+  completion. Any other synchronous op, plus `throw`, executes through its own
   handler; its operands are not modelled, so it reads every GPR and every GPR
   live afterwards is reloaded from the bank.
 - **Deoptimization.** A failed guard (type, shape, class, epoch) materializes the
@@ -383,8 +391,16 @@ declined.
   this frame caught an exception and the body leaves. Closure captures are read
   from their registers at entry; hot closures enter the tier through the closure
   call path.
-- **Deopt policy.** Repeated speculative failures, but not depth-limit bailouts,
-  drop the function back to the non-speculative v1 tier.
+- **Deopt policy.** Each failed speculative guard reports its op (inlined
+  bodies report the root call op; the entry trampoline reports its parameter
+  checks). When failures pile up (8 or more, at least one per 64 entries; depth
+  limit bailouts do not count), the code is dropped and the function recompiles
+  once hot again: the failed sites run through their helpers (an inlined call
+  is no longer inlined, failed parameter checks disable the native self-call
+  specialization) and everything else speculates anew on the current profiles.
+  After 3 such recompilations the function is left to the interpreter and the
+  tracer. A body that bails out on most entries for other reasons is rejected
+  too.
 - **Inliner.** Callees are translated into the caller's IR (call-site arguments
   become the callee's SSA registers; returns join at a block parameter). Three
   kinds of call can be inlined:

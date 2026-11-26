@@ -4818,6 +4818,10 @@ struct Heap {
     recycled_handles: Vec<u32>,
     /// Immutable slot-to-class identity for contracts checked by host primitives.
     contract_class_ids: Vec<ClassId>,
+    /// Per class slot: its superclass slot, filled when the class layout is
+    /// linked. Class contracts are nominal: an instance of a subclass
+    /// satisfies its ancestors' class types.
+    contract_class_parents: Vec<Option<u32>>,
     /// Per class slot: every interface/object type the class (or an ancestor)
     /// declares with `implements`. Filled when the class layout is linked.
     class_implements: Vec<Vec<Type>>,
@@ -4885,6 +4889,7 @@ impl Default for Heap {
             shared_mode: false,
             recycled_handles: Vec::with_capacity(HANDLE_RECYCLE_BATCH),
             contract_class_ids: Vec::new(),
+            contract_class_parents: Vec::new(),
             class_implements: Vec::new(),
             class_field_names: Vec::new(),
             ascii_char_strings: Value::NULL,
@@ -9392,6 +9397,7 @@ impl<'p> Interpreter<'p> {
             heap.map_shapes = shapes;
         }
         heap.contract_class_ids = program.metadata.classes.iter().map(|class| class.id).collect();
+        heap.contract_class_parents = vec![None; program.metadata.classes.len()];
         heap.class_implements = program.metadata.classes.iter().map(|class| class.implements.clone()).collect();
         heap.class_field_names = vec![Vec::new(); program.metadata.classes.len()];
         for layout in &program.metadata.structural_layouts {
@@ -15162,6 +15168,9 @@ impl Interpreter<'_> {
             .ok_or_else(|| RuntimeError::new("class instance field layout exceeds 65535 slots"))?;
 
         {
+            if let Some(slot) = self.heap.contract_class_parents.get_mut(class_index) {
+                *slot = superclass;
+            }
             let class = &mut self.classes[class_index];
             class.superclass = superclass;
             class.field_base = field_base;
@@ -15359,6 +15368,35 @@ impl Interpreter<'_> {
             .copied()
             .flatten()
             .or_else(|| self.to_string_fallback_for_table(table, method))
+            .or_else(|| if is_static { None } else { self.identity_equality_fallback(table, method) })
+    }
+
+    /// Reference equality for instances whose class does not define it:
+    /// `==`/`!=` (also spelled `===`/`!==`) compare identities, as every
+    /// builtin object does, so comparing an instance with null or another
+    /// reference behaves as in JavaScript. A class that defines its own `==`
+    /// gets no implicit `!=` (that would silently disagree with it). The
+    /// targets are Map's, which the JIT tiers recognize as identity tests.
+    #[cold]
+    fn identity_equality_fallback(&self, table: &[Option<CallTarget>], method: MethodSymbol) -> Option<CallTarget> {
+        use crate::napalm_ir::MethodKind;
+        let metadata = &self.program.metadata;
+        let signature = metadata.methods.get(method.0 as usize)?;
+        if signature.arity != 1 || !matches!(signature.kind, MethodKind::Method) {
+            return None;
+        }
+        let name = metadata.string(signature.name)?;
+        if name == "!=" {
+            let defines_eq = metadata.methods.iter().enumerate().any(|(index, other)| {
+                other.arity == 1 && matches!(other.kind, MethodKind::Method)
+                    && metadata.string(other.name) == Some("==")
+                    && table.get(index).copied().flatten().is_some()
+            });
+            if defines_eq { return None; }
+        } else if name != "==" {
+            return None;
+        }
+        self.builtin_methods.get(BuiltinClass::Map as usize)?.get(method.0 as usize).copied().flatten()
     }
 
     #[inline(always)]
@@ -17406,9 +17444,7 @@ impl Interpreter<'_> {
             Some(HeapObject::Foreign { class_slot, .. }) if !want_class_object => *class_slot,
             _ => return false,
         };
-        if set.is_unknown() { return true; }
-        let id = self.classes[slot as usize].id;
-        set.contains(id)
+        set.is_unknown() || self.heap.class_slot_in_set(slot, set)
     }
 
     #[cold]
@@ -17667,16 +17703,20 @@ impl Interpreter<'_> {
             Type::Interface(_) | Type::Record(_) => self.contract_name(ty).unwrap_or("Object").to_owned(),
             Type::Range => "Range".to_owned(),
             Type::Class(_) => "Class".to_owned(),
-            Type::Instance(classes) => match classes.as_slice() {
-                [class] => self
-                    .program
-                    .metadata
-                    .class(*class)
+            Type::Instance(classes) if !classes.is_unknown() => {
+                // A class annotation's set also lists the subclasses: name
+                // only the members no other member is an ancestor of.
+                let roots: Vec<&str> = classes.as_slice().iter().filter(|&&class| {
+                    let parent = self.prepared.class_by_id.get(&class)
+                        .and_then(|&slot| self.classes.get(slot as usize))
+                        .and_then(|info| info.superclass);
+                    !parent.is_some_and(|parent| self.heap.class_slot_in_set(parent, classes))
+                }).map(|&class| self.program.metadata.class(class)
                     .and_then(|info| self.program.metadata.string(info.name))
-                    .unwrap_or("Instance")
-                    .to_owned(),
-                _ => "Instance".to_owned(),
-            },
+                    .unwrap_or("Instance")).collect();
+                if roots.is_empty() { "Instance".to_owned() } else { roots.join(" | ") }
+            }
+            Type::Instance(_) => "Instance".to_owned(),
             Type::Closure(_) => "Function".to_owned(),
             Type::Fiber => "Fiber".to_owned(),
             Type::Foreign(_) => "Instance".to_owned(),

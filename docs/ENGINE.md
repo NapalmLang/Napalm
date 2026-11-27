@@ -332,8 +332,10 @@ of helper calls, `NAPALM_WFJIT_OPT=0` skips the IR optimizer and
 - **Background compilation.** When a function becomes hot, its IR is built
   on the VM thread, the only phase that reads live profiles and quickening
   state. Everything code generation needs is captured with it: frame layout,
-  GC maps and allocation sites. Lowering and Cranelift then run on a worker
-  thread (`napalm-wfjit`) with a `JITModule` of its own. Meanwhile the
+  GC maps and allocation sites. Lowering and Cranelift then run on a pool of
+  worker threads (`napalm-wfjit-N`, up to 3 leaving a core to the
+  interpreter; `NAPALM_WFJIT_WORKERS` overrides), each with a `JITModule` of
+  its own, taking jobs from one queue. Meanwhile the
   function keeps running in the interpreter or the tracer, and the entry is
   installed at the next call that finds the result ready. A code generation
   failure leaves the function to the interpreter and the tracer.
@@ -390,7 +392,8 @@ of helper calls, `NAPALM_WFJIT_OPT=0` skips the IR optimizer and
   helper the interpreter must stand at the op's successor; otherwise a handler of
   this frame caught an exception and the body leaves. Closure captures are read
   from their registers at entry; hot closures enter the tier through the closure
-  call path.
+  call path. `MakeClosure` runs through its handler with precise operands (the
+  captured registers in, the closure out).
 - **Deopt policy.** Each failed speculative guard reports its op (inlined
   bodies report the root call op; the entry trampoline reports its parameter
   checks). When failures pile up (8 or more, at least one per 64 entries; depth
@@ -417,24 +420,47 @@ of helper calls, `NAPALM_WFJIT_OPT=0` skips the IR optimizer and
   interpreter would, fills the callee registers and resumes the innermost frame
   at the failed op.
 
-  An inlined body may itself make calls whose target is statically known
-  (`CallDirect`, profiled or resolved method calls): `CallExplicit` enters the
-  target with explicit arguments, as if the root frame were executing its
-  outermost call op. The root's live GPRs are in its bank. Every inlined frame
-  is published as a GC shadow frame (zeroed native stack bank, callee GC map
-  at the current op) for the duration of the call. The result lands in the
+  An inlined body may itself make calls: `CallExplicit` enters the target with
+  explicit arguments, as if the root frame were executing its outermost call
+  op. The target is either statically known (`CallDirect`, profiled or
+  resolved method calls) or, for a polymorphic `Invoke`, dispatched at run time
+  through that op's own inline cache (`napalm_wfjit_invoke_explicit`: any target
+  kind, bytecode or host method, invoked as the interpreter would; a missing
+  method or the `instance + String` fallback declines, and the interpreter
+  replays the op). At most 8 dispatched calls are inlined per root: each costs a
+  call sequence plus frame-rebuilding deopts for the guards after it, for the
+  saving of one callee frame. The root's live GPRs are in its bank. Every
+  inlined frame is published as a GC shadow frame (native stack bank whose GC
+  map reference slots are filled or nulled, callee GC map at the current op)
+  for the duration of the call. The result lands in the
   root op's destination register, which stays dead until the inlined call
   returns. An exception unwinds from the root's call site (inlined bodies have
   no handlers). Async and concurrent targets are declined before any effect;
   the body then deoptimizes with rebuilt frames and the interpreter makes the
   call. A call is an effect, so later guards rebuild frames too.
 
+  Inlined bodies may also allocate and store:
+  - **Allocation** (small Map literals, objects with a profiled shape) and
+    **String concatenation** are safepoints. The root frame stands at its
+    outermost call op (live GPRs published, that op's GC map and PC), the
+    inlined frames are published as shadow frames, the allocation reads its
+    operands from the innermost bank, and the published roots are reloaded on
+    both edges. A failure (contract, non-String operand) deoptimizes with
+    rebuilt frames. Other object factories need the interpreter's own
+    registers and still decline.
+  - **Class field stores with a type contract** (anywhere, not only inlined)
+    run in a non-allocating leaf helper that validates the value (field type,
+    generic field), applies the write barrier and stores. A rejected value
+    deoptimizes before the store, and the interpreter reports the error. With
+    reactivity enabled the op runs through its handler instead (it notifies).
+
   Declines:
   - recursive inlining (a callee already being translated);
-  - stores, or calls from inlined bodies, when the root recurses natively
-    (nested frames replay the outermost self-call);
-  - other helpers (polymorphic `Invoke`, generic ops), allocations and loops
-    inside an inlined body;
+  - stores, allocations, or calls from inlined bodies, when the root recurses
+    natively (nested frames replay the outermost self-call);
+  - other helpers (generic ops, structural bindings), the remaining
+    allocation kinds and loops inside an inlined body; dispatched calls past
+    the budget;
   - memoized callees that make calls.
 
   A declined site stays a `RuntimeOp`. `NAPALM_JIT_EVENTS=1` prints each

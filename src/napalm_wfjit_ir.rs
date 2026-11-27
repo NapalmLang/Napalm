@@ -146,6 +146,17 @@ pub(super) enum WfRuntimeHelper {
 /// of one loop (cumulative): hot loops then belong to the loop tracer.
 pub(super) const WF_LOOP_HANDOFF_ITERATIONS: u32 = 1000;
 
+/// What a `CallExplicit` calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WfCallTarget {
+    /// A statically known bytecode function (prepared index).
+    Static(u32),
+    /// The method an `Invoke` of inlined function `function` dispatches to
+    /// for the receiver's class, resolved at run time through the op's own
+    /// inline cache `ic_slot` (any target kind: bytecode or host method).
+    Dynamic { function: u32, ic_slot: u32 },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum WfInst {
     /// Declared argument `n` (Tagged).
@@ -186,7 +197,10 @@ pub(super) enum WfInst {
     /// may be a nested frame's shadow bank. Inline TLAB path when profiled,
     /// else an explicit-bank helper; failure deoptimizes at `state` before
     /// the object is exposed. Allocation is replay-safe.
-    AllocObject { op_index: u32, kind: WfAllocKind, state: WfDeopt },
+    /// `function` owns op `op_index` (the root, or an inlined callee: then
+    /// `state` holds the inlined frames, published as GC shadow frames whose
+    /// innermost bank the allocation reads its operands from).
+    AllocObject { op_index: u32, kind: WfAllocKind, state: WfDeopt, function: u32 },
     /// Tagged: class instance field `slot` (absolute). Deoptimizes unless the
     /// object is a live Instance with that slot, reactive tracking is off, and
     /// (unless `nullable`) the field is initialized (non-null).
@@ -196,6 +210,16 @@ pub(super) enum WfInst {
     /// (heap value needing a barrier, reactivity, other class). The result
     /// value is a meaningless Bool.
     InstanceFieldSet { object: WfValue, value: WfValue, slot: u32, class_key: u64, value_immediate: bool, deopt: WfDeopt },
+    /// Bool, meaningless: a class field store the runtime validates against
+    /// the field's type (contract, generic field), with the write barrier, in
+    /// a non-allocating leaf helper. A rejected store (or any receiver it does
+    /// not handle) deoptimizes at `deopt` before the store; the interpreter
+    /// then reports the error. Never emitted with reactivity enabled.
+    InstanceFieldStoreChecked { object: WfValue, value: WfValue, slot: u32, deopt: WfDeopt },
+    /// Tagged: `left + right` of two Strings (a new String), inside an
+    /// inlined body. An allocation: the frames of `state` are published as at
+    /// an inlined `AllocObject`; non-String operands deoptimize at `state`.
+    StringConcat { left: WfValue, right: WfValue, state: WfDeopt },
     /// Run op `op_index` through a host helper (top frame only; a nested
     /// frame deoptimizes instead). `state` lists the live GPRs, which are
     /// materialized first because the helper reads operands from the bank and
@@ -225,7 +249,9 @@ pub(super) enum WfInst {
     /// (`state.frames`) is published as a GC shadow frame. Tagged result; on
     /// failure (exception, the interpreter took over) the body bails out
     /// without touching the bank.
-    CallExplicit { target: u32, receiver: Option<WfValue>, args: Vec<WfValue>, state: WfDeopt },
+    /// `scratch` is that destination register (the only root GPR the call
+    /// writes).
+    CallExplicit { target: WfCallTarget, receiver: Option<WfValue>, args: Vec<WfValue>, state: WfDeopt, scratch: u8 },
     /// A builtin method on a receiver whose class was already guarded
     /// (F64 receiver when `kind.numeric_receiver()`, otherwise Tagged;
     /// the argument is F64 when `kind.numeric_arg()`).
@@ -283,6 +309,9 @@ pub(super) struct WfInlineDeoptFrame {
     /// the frame is published as a native shadow frame (`CallExplicit`).
     pub(super) reg_count: u16,
     pub(super) root_map: u32,
+    /// The GPRs that GC map marks as references (all the collector scans in
+    /// a shadow frame): those without a value in `registers` are nulled.
+    pub(super) gc_refs: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -324,7 +353,8 @@ pub(super) struct WfFunction {
     /// background thread) never reads live VM metadata.
     pub(super) frame: WfFrameInfo,
     /// Allocation sites of the `AllocObject` ops, captured with the IR.
-    pub(super) alloc_sites: Vec<(u32, WfAllocSite)>,
+    /// Allocation sites by (function, op).
+    pub(super) alloc_sites: Vec<((u32, u32), WfAllocSite)>,
 }
 
 /// The parts of a prepared function's frame layout the lowering needs.
@@ -422,6 +452,8 @@ pub(super) struct WfSource<'a> {
     /// compile without speculation. `u32::MAX` marks the entry's parameter
     /// types (no native self-call specialization).
     pub(super) failed_sites: &'a [u32],
+    /// Reactivity is enabled (it never turns off again): stores must notify.
+    pub(super) reactive: bool,
 }
 
 /// A monomorphic Invoke site whose profiled target is a builtin the v2 tier
@@ -461,6 +493,8 @@ fn native_primitive_site(
 const MAX_INLINE_DEPTH: u32 = 3;
 const MAX_INLINE_CALLEE_OPS: usize = 96;
 const MAX_INLINE_TOTAL_OPS: usize = 480;
+/// Dispatched calls (polymorphic `Invoke`) allowed in inlined bodies per root.
+const MAX_INLINED_DISPATCHED_CALLS: u32 = 8;
 
 /// A call the builder may inline: its prepared target, receiver, arguments
 /// and the receiver class to guard (method dispatch).
@@ -493,6 +527,8 @@ enum OpKind {
     SelfCall { dst: u8, args: Vec<Option<u8>>, receiver: Option<(u8, Option<u64>)> },
     FieldGet { dst: u8, object: u8, slot: u32, nullable: bool },
     FieldSet { object: u8, value: u8, slot: u32, class_key: u64 },
+    /// A field store the runtime validates (`InstanceFieldStoreChecked`).
+    FieldStoreChecked { object: u8, value: u8, slot: u32 },
     /// Native allocation; operands are read from the bank (all GPRs).
     Alloc { dst: u8, kind: WfAllocKind, reads: RegList },
     /// Monomorphic builtin method lowered natively.
@@ -523,7 +559,7 @@ impl OpKind {
             OpKind::SelfCall { args, receiver, .. } =>
                 args.iter().flatten().copied().chain(receiver.map(|(reg, _)| reg)).for_each(visit),
             OpKind::FieldGet { object, .. } => visit(*object),
-            OpKind::FieldSet { object, value, .. } => { visit(*object); visit(*value); }
+            OpKind::FieldSet { object, value, .. } | OpKind::FieldStoreChecked { object, value, .. } => { visit(*object); visit(*value); }
             OpKind::Runtime { reads, .. } | OpKind::Alloc { reads, .. } => reads.iter().copied().for_each(visit),
             OpKind::Primitive { receiver, arg, .. } => std::iter::once(*receiver).chain(*arg).for_each(visit),
             _ => {}
@@ -725,7 +761,9 @@ fn classify_ops(
                 Some(&class_key) => OpKind::FieldSet {
                     object: prepared.a, value: prepared.b, slot: prepared.x, class_key,
                 },
-                // Contracted/generic store: the runtime validates and barriers it.
+                // Contracted/generic store: validated (and barriered) by a leaf
+                // helper; with reactivity on, the op itself runs so it notifies.
+                None if !source.reactive => OpKind::FieldStoreChecked { object: prepared.a, value: prepared.b, slot: prepared.x },
                 None => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: smallvec![prepared.a, prepared.b], write: None, inline: None, guard: None, generic: false },
             },
             Opcode::SetFieldShape => OpKind::Runtime { helper: WfRuntimeHelper::Op, reads: smallvec![prepared.a, prepared.b, prepared.c], write: None, inline: None, guard: None, generic: false },
@@ -785,6 +823,24 @@ fn classify_ops(
             Opcode::DefineArrayWithGenerics if !native_self_calls =>
                 OpKind::Alloc { dst: op.a, kind: WfAllocKind::TypedArray, reads: all_registers(function) },
             other if generic_call_opcode(other) => generic(WfRuntimeHelper::CallToReturn),
+            // A closure captures register values and cells of this frame (the
+            // op's `call_args` list) and allocates: its handler reads exactly
+            // those registers from the bank and writes the closure to `a`.
+            Opcode::MakeClosure => {
+                let count = (op.b as usize) | ((op.c as usize) << 8);
+                let start = op.args_offset as usize;
+                let captures: Option<RegList> = (0..count)
+                    .map(|index| function.call_args.get(start + index)
+                        .and_then(|reg| u8::try_from(reg.0).ok()))
+                    .collect();
+                match captures {
+                    Some(reads) => OpKind::Runtime {
+                        helper: WfRuntimeHelper::Op, reads, write: Some(op.a),
+                        inline: None, guard: None, generic: false,
+                    },
+                    None => generic(WfRuntimeHelper::Op),
+                }
+            }
             // `throw`: the handler unwinds; the helper reports no successor and
             // the body bails out (or a handler of this frame took over).
             Opcode::FiberAbort => generic(WfRuntimeHelper::Op),
@@ -995,6 +1051,8 @@ struct Builder<'a> {
     /// epoch was last checked on the current path; epoch-dependent ops check
     /// it again first.
     epoch_dirty: bool,
+    /// Dispatched calls (`WfCallTarget::Dynamic`) emitted in inlined bodies.
+    dispatched_calls: u32,
 }
 
 /// `build_with` failure that asks for a rebuild with `loop_retry` applied.
@@ -1012,6 +1070,7 @@ struct InlineCheckpoint {
     inlined_ops: usize,
     inlined_calls: u32,
     epoch_dirty: bool,
+    dispatched_calls: u32,
     effect_done: bool,
 }
 
@@ -1029,6 +1088,7 @@ impl InlineCheckpoint {
             inlined_ops: builder.inlined_ops,
             inlined_calls: builder.out.inlined_calls,
             epoch_dirty: builder.epoch_dirty,
+            dispatched_calls: builder.dispatched_calls,
             effect_done: builder.inline.as_ref().is_some_and(|frame| frame.effect_done),
         }
     }
@@ -1045,6 +1105,7 @@ impl InlineCheckpoint {
         builder.current = Some(self.block);
         builder.inlined_ops = self.inlined_ops;
         builder.epoch_dirty = self.epoch_dirty;
+        builder.dispatched_calls = self.dispatched_calls;
         if let Some(frame) = &mut builder.inline { frame.effect_done = self.effect_done; }
     }
 }
@@ -1117,7 +1178,15 @@ impl Builder<'_> {
             let reg_count = data.function.frame.general_register_count;
             let root_map = *data.function.gc_map_by_op.get(resume_op as usize)
                 .ok_or_else(|| format!("op {op_index}: no GC map at inlined op {resume_op}"))?;
-            frames.push(WfInlineDeoptFrame { callee: *callee, call_op: *call_op as u32, resume_op, registers, reg_count, root_map });
+            let gc_refs = data.function.gc_maps.get(root_map as usize).map_or_else(Vec::new, |map| {
+                (0..reg_count.min(256))
+                    .filter(|&reg| map.general_is_reference(Reg(reg as u8)))
+                    .map(|reg| reg as u8)
+                    .collect()
+            });
+            frames.push(WfInlineDeoptFrame {
+                callee: *callee, call_op: *call_op as u32, resume_op, registers, reg_count, root_map, gc_refs,
+            });
         }
         let (_, root_call, root_state, root_live) = &chain[0];
         let registers = registers_of(root_state, root_live);
@@ -1321,13 +1390,16 @@ pub(super) fn build(source: &WfSource<'_>) -> Result<WfFunction, String> {
     ir.frame = WfFrameInfo::of(root.function);
     for block in &ir.blocks {
         for (_, inst) in &block.insts {
-            if let WfInst::AllocObject { op_index, kind, .. } = inst {
+            if let WfInst::AllocObject { op_index, kind, function, .. } = inst {
                 let index = *op_index as usize;
-                let site = match kind {
-                    WfAllocKind::TypedArray => WfAllocSite::TypedArray(typed_array_site(root.function, root.bytecode, index)),
-                    _ => WfAllocSite::Object(native_profiled_small_map_site(root.function, root.bytecode, index)),
+                let data = if *function == root.function_index { root } else {
+                    source.callees.get(function).ok_or("allocation in a callee without data")?
                 };
-                ir.alloc_sites.push((*op_index, site));
+                let site = match kind {
+                    WfAllocKind::TypedArray => WfAllocSite::TypedArray(typed_array_site(data.function, data.bytecode, index)),
+                    _ => WfAllocSite::Object(native_profiled_small_map_site(data.function, data.bytecode, index)),
+                };
+                ir.alloc_sites.push(((*function, *op_index), site));
             }
         }
     }
@@ -1530,6 +1602,7 @@ fn build_with(
         loop_tagged,
         loop_retry: Vec::new(),
         epoch_dirty: false,
+        dispatched_calls: 0,
     };
     let unsupported = BuildError::Unsupported;
 
@@ -1875,6 +1948,20 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 let value = builder.emit(WfTy::Tagged, WfInst::InstanceFieldGet { object, slot, nullable, deopt });
                 builder.state[dst as usize] = Some(value);
             }
+            OpKind::FieldStoreChecked { object, value, slot } => {
+                if builder.root_self_calls {
+                    return Err(format!("op {index}: field store in a natively recursive function"));
+                }
+                // A rejected store is an error the interpreter reports, not a
+                // failed speculation: nothing to recompile for.
+                let deopt = builder.deopt(index, false, &live)?;
+                let object = builder.read(object, index)?;
+                let object = builder.tagged(object)?;
+                let stored = builder.read(value, index)?;
+                let stored = builder.tagged(stored)?;
+                builder.emit(WfTy::Bool, WfInst::InstanceFieldStoreChecked { object, value: stored, slot, deopt });
+                if let Some(frame) = builder.inline.as_mut() { frame.effect_done = true; }
+            }
             OpKind::FieldSet { object, value, slot, class_key } => {
                 if builder.inline.is_some() && builder.root_self_calls {
                     return Err(format!("op {index}: store inlined into a natively recursive function"));
@@ -1916,15 +2003,35 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 builder.state[dst as usize] = Some(value);
             }
             OpKind::Alloc { dst, kind, .. } => {
-                if builder.inline.is_some() {
-                    // Operand registers belong to the callee, not to the bank.
-                    return Err(format!("op {index}: allocation inside an inlined body"));
-                }
-                let state = builder.deopt(index, false, &live)?;
-                let value = builder.emit(WfTy::Tagged, WfInst::AllocObject { op_index: index as u32, kind, state });
+                let state = if builder.inline.is_some() {
+                    // The operands are the callee's registers: the inlined frames
+                    // are published as shadow frames and the allocation reads
+                    // the innermost bank. Only the paths that never need the
+                    // interpreter's own registers qualify: small Map literals
+                    // and objects with a profiled shape (TLAB path).
+                    let qualifies = !builder.root_self_calls && match kind {
+                        WfAllocKind::SmallMapLiteral => true,
+                        WfAllocKind::SpecializedObject =>
+                            native_profiled_small_map_site(data.function, data.bytecode, index).is_some(),
+                        WfAllocKind::TypedArray => false,
+                    };
+                    if !qualifies {
+                        return Err(format!("op {index}: allocation inside an inlined body"));
+                    }
+                    let state = builder.chain_state(index, false, &live)?;
+                    if builder.out.deopts[state.0 as usize].frames.iter().any(|frame| frame.root_map == u32::MAX) {
+                        return Err(format!("op {index}: inlined frame without a GC map"));
+                    }
+                    state
+                } else {
+                    builder.deopt(index, false, &live)?
+                };
+                let value = builder.emit(WfTy::Tagged, WfInst::AllocObject {
+                    op_index: index as u32, kind, state, function: data.function_index,
+                });
                 builder.state[dst as usize] = Some(value);
             }
-            OpKind::Runtime { helper, write, inline, guard, generic, .. } => {
+            OpKind::Runtime { helper, write, inline, guard, generic, reads } => {
                 // Inlined bodies and guarded direct calls rely on the epoch.
                 if inline.is_some() || guard.is_some() {
                     builder.ensure_epoch(index, &live)?;
@@ -1958,15 +2065,53 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                         // A call with a statically known target runs from the
                         // inlined body with explicit arguments; the inlined
                         // frames are published as GC shadow frames meanwhile.
+                        let opcode = data.bytecode.chunk.code.get(data.function.raw_pcs[index] as usize)
+                            .and_then(|word| word.opcode());
+                        // String concatenation allocates: run it with the
+                        // inlined frames published as GC shadow frames.
+                        if matches!((helper, generic, opcode), (WfRuntimeHelper::Op, false, Some(Opcode::StringConcat)))
+                            && !builder.root_self_calls && reads.len() >= 2
+                        {
+                            let left = builder.read(reads[0], index)?;
+                            let left = builder.tagged(left)?;
+                            let right = builder.read(reads[1], index)?;
+                            let right = builder.tagged(right)?;
+                            let state = builder.chain_state(index, false, &live)?;
+                            if builder.out.deopts[state.0 as usize].frames.iter().any(|frame| frame.root_map == u32::MAX) {
+                                return Err(format!("op {index}: inlined frame without a GC map"));
+                            }
+                            let value = builder.emit(WfTy::Tagged, WfInst::StringConcat { left, right, state });
+                            if let Some(dst) = write { builder.state[dst as usize] = Some(value); }
+                            continue_after_runtime = true;
+                        } else {
                         let explicit = matches!(helper, WfRuntimeHelper::DirectCall
                             | WfRuntimeHelper::ProfiledMethod(_) | WfRuntimeHelper::DirectMethod)
                             && !builder.root_self_calls;
-                        let Some(target) = inline.as_ref().filter(|_| explicit) else {
-                            let opcode = data.bytecode.chunk.code.get(data.function.raw_pcs[index] as usize)
-                                .and_then(|word| word.opcode());
-                            return Err(format!("op {index}: host helper call ({helper:?} {opcode:?}) inside an inlined body"));
+                        // A polymorphic or unprofiled method call dispatches at
+                        // run time through the op's own inline cache.
+                        let original = data.function.original_ops[index];
+                        let dynamic_slot = match (helper, generic, opcode) {
+                            _ if builder.root_self_calls => None,
+                            (WfRuntimeHelper::CallToReturn, false, Some(Opcode::Invoke)) => Some(original.x),
+                            (WfRuntimeHelper::CallToReturn, false, Some(Opcode::InvokeMethodDirect)) => Some(original.cache),
+                            _ => None,
                         };
-                        let receiver = match target.receiver {
+                        let (call_target, receiver_reg, arg_regs): (WfCallTarget, Option<u8>, RegList) =
+                            match (inline.as_ref().filter(|_| explicit), dynamic_slot) {
+                                (Some(target), _) =>
+                                    (WfCallTarget::Static(target.callee), target.receiver, target.args.clone()),
+                                // Each one costs a shadow-frame call sequence and frame-rebuilding
+                                // deopts for every later guard, for the saving of one callee
+                                // frame: past the budget the callee is called, not inlined.
+                                (None, Some(_)) if builder.dispatched_calls >= MAX_INLINED_DISPATCHED_CALLS =>
+                                    return Err(format!("op {index}: dispatched call budget of inlined bodies exhausted")),
+                                (None, Some(ic_slot)) if !reads.is_empty() => (
+                                    WfCallTarget::Dynamic { function: data.function_index, ic_slot },
+                                    Some(reads[0]), reads[1..].iter().copied().collect(),
+                                ),
+                                _ => return Err(format!("op {index}: host helper call ({helper:?} {opcode:?}) inside an inlined body")),
+                            };
+                        let receiver = match receiver_reg {
                             Some(reg) => { let value = builder.read(reg, index)?; Some(builder.tagged(value)?) }
                             None => None,
                         };
@@ -1974,8 +2119,8 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                             let deopt = builder.deopt(index, true, &live)?;
                             builder.emit(WfTy::Bool, WfInst::GuardClass { value, class, deopt });
                         }
-                        let mut args = Vec::with_capacity(target.args.len());
-                        for &reg in &target.args {
+                        let mut args = Vec::with_capacity(arg_regs.len());
+                        for &reg in &arg_regs {
                             let value = builder.read(reg, index)?;
                             args.push(builder.tagged(value)?);
                         }
@@ -1984,12 +2129,18 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                         if snapshot.frames.iter().any(|frame| frame.root_map == u32::MAX) {
                             return Err(format!("op {index}: inlined frame without a GC map"));
                         }
-                        let result = builder.emit(WfTy::Tagged, WfInst::CallExplicit { target: target.callee, receiver, args, state });
+                        if matches!(call_target, WfCallTarget::Dynamic { .. }) { builder.dispatched_calls += 1; }
+                        let root_call = builder.out.deopts[state.0 as usize].op_index as usize;
+                        let scratch = builder.source.root.function.ops.get(root_call)
+                            .map(|op| op.a)
+                            .ok_or_else(|| format!("op {index}: root call op out of range"))?;
+                        let result = builder.emit(WfTy::Tagged, WfInst::CallExplicit { target: call_target, receiver, args, state, scratch });
                         if let Some(dst) = write { builder.state[dst as usize] = Some(result); }
                         // A call is an effect: later guards rebuild the frames.
                         if let Some(frame) = builder.inline.as_mut() { frame.effect_done = true; }
                         builder.epoch_dirty = true;
                         continue_after_runtime = true;
+                        }
                     }
                     if continue_after_runtime {
                         // Handled above.

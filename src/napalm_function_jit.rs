@@ -130,6 +130,7 @@ struct JitHelpers {
     string_code_point_at: cranelift::module::FuncId,
     bytes_index: cranelift::module::FuncId,
     call_explicit: cranelift::module::FuncId,
+    invoke_explicit: cranelift::module::FuncId,
     small_map_literal_regs: cranelift::module::FuncId,
     profiled_small_map: cranelift::module::FuncId,
     profiled_small_map_commit: cranelift::module::FuncId,
@@ -138,6 +139,8 @@ struct JitHelpers {
     reserved_typed_array: cranelift::module::FuncId,
     speculation_failed: cranelift::module::FuncId,
     write_barrier: cranelift::module::FuncId,
+    store_field_checked: cranelift::module::FuncId,
+    string_concat: cranelift::module::FuncId,
 }
 
 /// A Cranelift module for whole-function code with every runtime helper
@@ -165,6 +168,7 @@ fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
         builder.symbol("napalm_wfjit_string_code_point_at", napalm_wfjit_string_code_point_at as *const u8);
         builder.symbol("napalm_wfjit_bytes_index", napalm_wfjit_bytes_index as *const u8);
         builder.symbol("napalm_wfjit_call_explicit", napalm_wfjit_call_explicit as *const u8);
+        builder.symbol("napalm_wfjit_invoke_explicit", napalm_wfjit_invoke_explicit as *const u8);
         builder.symbol(
             "napalm_wfjit_small_map_literal_regs",
             napalm_wfjit_small_map_literal_regs as *const u8,
@@ -191,6 +195,8 @@ fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
         );
         builder.symbol("napalm_wfjit_speculation_failed", napalm_wfjit_speculation_failed as *const u8);
         builder.symbol("napalm_wfjit_write_barrier", trace_heap_write_barrier as *const u8);
+        builder.symbol("napalm_wfjit_store_field_checked", napalm_wfjit_store_field_checked as *const u8);
+        builder.symbol("napalm_wfjit_string_concat", napalm_wfjit_string_concat as *const u8);
         let mut module = JITModule::new(builder);
         if module.target_config().pointer_type() != types::I64 {
             return Err("Napalm whole-function JIT requires a 64-bit host".to_owned());
@@ -250,6 +256,19 @@ fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
         let call_explicit_id = module
             .declare_function("napalm_wfjit_call_explicit", Linkage::Import, &explicit_sig)
             .map_err(|e| format!("cannot declare whole-function explicit call helper: {e}"))?;
+        let mut invoke_sig = module.make_signature();
+        invoke_sig.params.push(AbiParam::new(pointer)); // vm
+        invoke_sig.params.push(AbiParam::new(types::I32)); // root call op
+        invoke_sig.params.push(AbiParam::new(types::I32)); // inlined function
+        invoke_sig.params.push(AbiParam::new(types::I32)); // its inline cache slot
+        invoke_sig.params.push(AbiParam::new(types::I64)); // receiver
+        invoke_sig.params.push(AbiParam::new(pointer)); // arguments
+        invoke_sig.params.push(AbiParam::new(types::I32)); // argument count
+        invoke_sig.params.push(AbiParam::new(pointer)); // result slot
+        invoke_sig.returns.push(AbiParam::new(types::I32));
+        let invoke_explicit_id = module
+            .declare_function("napalm_wfjit_invoke_explicit", Linkage::Import, &invoke_sig)
+            .map_err(|e| format!("cannot declare whole-function dispatched call helper: {e}"))?;
 
         // Lightweight native-recursion helpers receive the owning function/op
         // identity plus the explicit register base. They never rely on hot-frame
@@ -342,6 +361,15 @@ fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
         let write_barrier_id = module
             .declare_function("napalm_wfjit_write_barrier", Linkage::Import, &barrier_sig)
             .map_err(|e| format!("cannot declare write barrier helper: {e}"))?;
+        let mut store_sig = module.make_signature();
+        store_sig.params.extend([AbiParam::new(pointer), AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I32)]);
+        store_sig.returns.push(AbiParam::new(types::I32));
+        let store_field_checked_id = module
+            .declare_function("napalm_wfjit_store_field_checked", Linkage::Import, &store_sig)
+            .map_err(|e| format!("cannot declare checked field store helper: {e}"))?;
+        let concat_id = module
+            .declare_function("napalm_wfjit_string_concat", Linkage::Import, &leaf_sig)
+            .map_err(|e| format!("cannot declare string concatenation helper: {e}"))?;
 
         Ok((module, JitHelpers {
             runtime_op: runtime_id,
@@ -354,6 +382,7 @@ fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
             string_code_point_at: string_code_point_id,
             bytes_index: bytes_index_id,
             call_explicit: call_explicit_id,
+            invoke_explicit: invoke_explicit_id,
             small_map_literal_regs: small_map_regs_id,
             profiled_small_map: profiled_small_map_id,
             profiled_small_map_commit: profiled_small_map_commit_id,
@@ -362,6 +391,8 @@ fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
             reserved_typed_array: reserved_typed_array_id,
             speculation_failed: speculation_failed_id,
             write_barrier: write_barrier_id,
+            store_field_checked: store_field_checked_id,
+            string_concat: concat_id,
         }))
 }
 
@@ -482,6 +513,7 @@ impl WholeFunctionJit {
         native_plain_store_classes: &crate::napalm_collections::HashMap<usize, u64>,
         inline_callees: &crate::napalm_collections::HashMap<u32, wf_ir::WfFunctionData<'_>>,
         manifest: Option<&crate::napalm_builtin::BuiltinManifest>,
+        reactive_enabled: bool,
     ) -> Result<(), String> {
         self.stats.compile_attempts = self.stats.compile_attempts.saturating_add(1);
         // Methods and constructors (`uses_this`) are eligible: their frame is
@@ -559,6 +591,7 @@ impl WholeFunctionJit {
             loop_counters: &counters,
             manifest,
             speculate: wfjit_speculation_enabled(),
+            reactive: reactive_enabled,
             failed_sites: &failed_sites,
         };
         let events = std::env::var_os("NAPALM_JIT_EVENTS").is_some();
@@ -647,7 +680,10 @@ impl WfCodegen {
                 string_code_point_at: self.module.declare_func_in_func(self.helpers.string_code_point_at, func),
                 bytes_index: self.module.declare_func_in_func(self.helpers.bytes_index, func),
                 call_explicit: self.module.declare_func_in_func(self.helpers.call_explicit, func),
+                invoke_explicit: self.module.declare_func_in_func(self.helpers.invoke_explicit, func),
                 write_barrier: self.module.declare_func_in_func(self.helpers.write_barrier, func),
+                store_field_checked: self.module.declare_func_in_func(self.helpers.store_field_checked, func),
+                string_concat: self.module.declare_func_in_func(self.helpers.string_concat, func),
             };
             let mut b = FunctionBuilder::new(&mut self.context.func, &mut self.function_context);
             wf_lower::lower_body(&mut b, ir, fast_alloc, helpers);
@@ -784,46 +820,73 @@ struct WfDone {
     result: Result<(usize, usize), String>,
 }
 
-/// The v2 background compiler: one worker thread owning a `WfCodegen`.
-/// Generated code lives in the worker's module, which outlives every entry
-/// handed out: the worker only exits once the VM side drops the job sender.
+/// The v2 background compiler: a small pool of worker threads, each owning a
+/// `WfCodegen` (its own `JITModule`), taking jobs from one shared queue. A
+/// function has at most one job in flight (it stays `Compiling` until
+/// installed), so results may complete in any order. Generated code lives in
+/// its worker's module, which outlives every entry handed out: workers only
+/// exit once the VM side drops the job sender.
 struct WfBackground {
     jobs: Option<std::sync::mpsc::Sender<WfJob>>,
     done: std::sync::mpsc::Receiver<WfDone>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
     /// Submitted, not yet installed: function index -> (summary, inlined calls).
     pending: crate::napalm_collections::HashMap<u32, (String, u32)>,
+}
+
+/// Background compiler threads: `NAPALM_WFJIT_WORKERS`, or up to 3 while
+/// leaving a core to the interpreter.
+fn wfjit_worker_count() -> usize {
+    std::env::var("NAPALM_WFJIT_WORKERS").ok().and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism()
+            .map_or(1, |cores| cores.get().saturating_sub(1).clamp(1, 3)))
+        .clamp(1, 16)
 }
 
 impl WfBackground {
     fn start() -> Result<Self, String> {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<WfJob>();
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
         let (done_tx, done_rx) = std::sync::mpsc::channel::<WfDone>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let thread = std::thread::Builder::new()
-            .name("napalm-wfjit".into())
-            .spawn(move || {
-                let mut codegen = match WfCodegen::new() {
-                    Ok(codegen) => { let _ = ready_tx.send(Ok(())); codegen }
-                    Err(error) => { let _ = ready_tx.send(Err(error)); return; }
-                };
-                while let Ok(job) = job_rx.recv() {
-                    let result = codegen.compile(&job.ir, job.fast_alloc)
-                        .map(|entry| (entry as usize, codegen.last_clif_insts));
-                    if done_tx.send(WfDone { function_index: job.function_index, result }).is_err() { break; }
-                }
-            })
-            .map_err(|error| format!("cannot start the v2 background compiler: {error}"))?;
-        ready_rx.recv().map_err(|error| error.to_string())??;
-        Ok(Self { jobs: Some(job_tx), done: done_rx, thread: Some(thread), pending: Default::default() })
+        let workers = wfjit_worker_count();
+        let mut threads = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let (job_rx, done_tx, ready_tx) = (job_rx.clone(), done_tx.clone(), ready_tx.clone());
+            let thread = std::thread::Builder::new()
+                .name(format!("napalm-wfjit-{worker}"))
+                .spawn(move || {
+                    let mut codegen = match WfCodegen::new() {
+                        Ok(codegen) => { let _ = ready_tx.send(Ok(())); codegen }
+                        Err(error) => { let _ = ready_tx.send(Err(error)); return; }
+                    };
+                    loop {
+                        // Hold the queue only while taking a job.
+                        let job = match job_rx.lock() {
+                            Ok(queue) => queue.recv(),
+                            Err(_) => break,
+                        };
+                        let Ok(job) = job else { break };
+                        let result = codegen.compile(&job.ir, job.fast_alloc)
+                            .map(|entry| (entry as usize, codegen.last_clif_insts));
+                        if done_tx.send(WfDone { function_index: job.function_index, result }).is_err() { break; }
+                    }
+                })
+                .map_err(|error| format!("cannot start the v2 background compiler: {error}"))?;
+            threads.push(thread);
+        }
+        for _ in 0..workers {
+            ready_rx.recv().map_err(|error| error.to_string())??;
+        }
+        Ok(Self { jobs: Some(job_tx), done: done_rx, threads, pending: Default::default() })
     }
 }
 
 impl Drop for WfBackground {
     fn drop(&mut self) {
-        // Closing the job channel ends the worker after its current job.
+        // Closing the job channel ends every worker after its current job.
         self.jobs.take();
-        if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        for thread in self.threads.drain(..) { let _ = thread.join(); }
     }
 }
 
@@ -1710,6 +1773,7 @@ unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeF
                 &native_plain_store_classes,
                 &inline_callees,
                 manifest.map(|manifest| unsafe { &*manifest }),
+                vm.reactive_enabled,
             )
         } {
             unsafe { (*jit_ptr).reject(target); }
@@ -2419,9 +2483,99 @@ unsafe extern "C" fn napalm_wfjit_call_explicit(
         // Like CallDirect: a method target takes `this` from the first source.
         vm.enter_direct_bytecode_call(&op, target, &words[..argc as usize], None);
     }
-    if vm.run_state == RunState::Running && vm.current_fiber == caller_fiber
-        && vm.fiber(caller_fiber).frames.len() > caller_depth
-    {
+    unsafe { finish_explicit_call(vm, op, Some(target), caller_fiber, caller_depth, caller_function, out) }
+}
+
+/// v2 `CallExplicit` with a dispatched target: an `Invoke` of an inlined
+/// body (function `function`) whose receiver class is not known statically.
+/// The method is looked up through that op's own inline cache (filling it on
+/// a miss, like the interpreter), then invoked exactly as the interpreter
+/// would (bytecode, host primitive, native builtin or foreign method), with
+/// the root frame's outermost call op `root_op` as the carrier: its
+/// destination register receives the result. Same status protocol as
+/// `napalm_wfjit_call_explicit`; a missing method declines (2), so the
+/// interpreter replays the op with its own error or fallback.
+unsafe extern "C" fn napalm_wfjit_invoke_explicit(
+    vm: *mut c_void,
+    root_op: u32,
+    function: u32,
+    ic_slot: u32,
+    receiver: u64,
+    args: *const u64,
+    argc: u32,
+    out: *mut u64,
+) -> u32 {
+    use crate::napalm_ir::MethodKind;
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running || vm.hot_frame.is_null() || argc as usize > 16 { return 2; }
+    count_helper(vm, "invoke", root_op);
+    let receiver_word = RegisterWord(receiver);
+    let Ok(class) = vm.receiver_class(Value::from_word(receiver_word)) else { return 2; };
+    let cached = vm.inline_caches.get(function as usize)
+        .and_then(|caches| caches.get(ic_slot as usize))
+        .and_then(|cache| cache.probe(class));
+    let target = match cached {
+        Some(target) => target,
+        None => match vm.resolve_invoke_miss(function, ic_slot, class) {
+            Ok(target) => target,
+            Err(_) => return 2,
+        },
+    };
+    let mut words = [RegisterWord(0); 16];
+    for index in 0..argc as usize {
+        words[index] = RegisterWord(unsafe { *args.add(index) });
+    }
+    let words = &words[..argc as usize];
+    match target {
+        CallTarget::Bytecode(callee) => {
+            // Same restriction as the static path.
+            let Some(callee) = vm.prepared.functions.get(callee as usize) else { return 2; };
+            if callee.is_async || callee.is_concurrent { return 2; }
+        }
+        CallTarget::Foreign(_) => {}
+        _ => {
+            // `anything + String` falls back to concatenation when no real
+            // overload exists: leave that case to the interpreter's own op.
+            let is_string = |word: RegisterWord| matches!(vm.heap.get(Value::from_word(word)), Some(HeapObject::String(_)));
+            let plus = vm.program.functions.get(function as usize)
+                .and_then(|bytecode| bytecode.chunk.inline_caches.get(ic_slot as usize))
+                .and_then(|descriptor| vm.program.metadata.method(descriptor.method))
+                .is_some_and(|signature| matches!(signature.kind, MethodKind::Method)
+                    && vm.program.metadata.string(signature.name) == Some("+"));
+            if plus && words.len() == 1 && is_string(words[0]) && !is_string(receiver_word) { return 2; }
+        }
+    }
+    let caller_fiber = vm.current_fiber;
+    let caller_depth = vm.fiber(caller_fiber).frames.len();
+    let caller_function = vm.hot_function_index;
+    unsafe { vm.set_pc(root_op); }
+    let op = unsafe { *vm.current_prepared().ops.get_unchecked(root_op as usize) };
+    // The carrier's own operands belong to the root's call op: no inline
+    // cache lookup of the root function may read them as this Invoke's.
+    let mut carrier = op;
+    carrier.x = u32::MAX;
+    vm.invoke_target(&carrier, target, receiver_word, words);
+    let entered = match target { CallTarget::Bytecode(callee) => Some(callee), _ => None };
+    unsafe { finish_explicit_call(vm, op, entered, caller_fiber, caller_depth, caller_function, out) }
+}
+
+/// Second half of an explicit call: run a bytecode callee that was entered
+/// (natively when compiled), finish whatever the interpreter has left of it,
+/// and report whether control is back at the carrier op's successor in the
+/// caller frame (0, result in `out`) or the interpreter took over (1).
+unsafe fn finish_explicit_call(
+    vm: &mut Interpreter<'static>,
+    op: PreparedOp,
+    entered: Option<u32>,
+    caller_fiber: u32,
+    caller_depth: usize,
+    caller_function: u32,
+    out: *mut u64,
+) -> u32 {
+    let in_callee = |vm: &Interpreter<'static>| vm.run_state == RunState::Running
+        && vm.current_fiber == caller_fiber
+        && vm.fiber(caller_fiber).frames.len() > caller_depth;
+    if let Some(target) = entered.filter(|&target| in_callee(vm) && vm.hot_function_index == target) {
         match unsafe { compiled_entry(vm, target) } {
             Some(entry) => {
                 if let Some(jit) = vm.whole_function_jit.as_mut() {
@@ -2446,15 +2600,14 @@ unsafe extern "C" fn napalm_wfjit_call_explicit(
             }
             None => {}
         }
-        // Finish whatever remains of the callee in baseline.
-        while vm.run_state == RunState::Running && vm.current_fiber == caller_fiber
-            && vm.fiber(caller_fiber).frames.len() > caller_depth
-        {
-            let pc = vm.hot_pc as usize;
-            let handler = unsafe { *vm.hot_handlers.add(pc) };
-            let prepared_op = unsafe { vm.hot_ops.add(pc) };
-            unsafe { handler(vm, prepared_op); }
-        }
+    }
+    // Finish whatever remains of the callee (or of the frames a host method
+    // pushed) in baseline.
+    while in_callee(vm) {
+        let pc = vm.hot_pc as usize;
+        let handler = unsafe { *vm.hot_handlers.add(pc) };
+        let prepared_op = unsafe { vm.hot_ops.add(pc) };
+        unsafe { handler(vm, prepared_op); }
     }
     if vm.run_state == RunState::Running && vm.current_fiber == caller_fiber
         && vm.fiber(caller_fiber).frames.len() == caller_depth
@@ -2466,6 +2619,55 @@ unsafe extern "C" fn napalm_wfjit_call_explicit(
     } else {
         1
     }
+}
+
+/// v2 `InstanceFieldStoreChecked`: the class field store of `h_store_field`
+/// (field type contract, generic field check, generational barrier) with
+/// explicit operands. A leaf: contracts live in the handle sidecar, so
+/// nothing allocates in the managed heap, collects or runs Napalm code.
+/// Returns 0 when stored; 1 with nothing changed when the interpreter must
+/// execute the op instead (it then reports the type error), including a
+/// receiver that is not an instance and enabled reactivity (stores notify).
+unsafe extern "C" fn napalm_wfjit_store_field_checked(vm: *mut c_void, object: u64, value: u64, slot: u32) -> u32 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running || vm.reactive_enabled { return 1; }
+    count_helper(vm, "store_field", slot);
+    let object = Value::from_word(RegisterWord(object));
+    let value = Value::from_word(RegisterWord(value));
+    let index = slot as usize;
+    let class_slot = match vm.heap.get(object) {
+        Some(HeapObject::Instance(fields @ InstanceObject { class_slot, .. })) if index < fields.len() => *class_slot,
+        _ => return 1,
+    };
+    let expected = vm.classes[class_slot as usize].instance_field_types.get(index).cloned().unwrap_or(Type::Top);
+    if vm.enforce_runtime_type(value, &expected, "Class field type error").is_err() { return 1; }
+    if vm.classes[class_slot as usize].generic_fields.get(index).copied().unwrap_or(false)
+        && vm.check_generic_field_store(object, class_slot, index, value).is_err()
+    {
+        return 1;
+    }
+    vm.heap.remember_if_reference(object, value);
+    let Some(HeapObject::Instance(fields)) = vm.heap.get_mut(object) else { return 1; };
+    fields[index] = value;
+    0
+}
+
+/// v2 `StringConcat` (inside an inlined body): `h_string_concat` with
+/// explicit operands. It may collect: the caller published every root (the
+/// root frame at its call op, the inlined frames as shadow frames).
+/// `WFJIT_BAILOUT` when an operand is not a String (the interpreter then
+/// replays the op and reports it).
+unsafe extern "C" fn napalm_wfjit_string_concat(vm: *mut c_void, left: u64, right: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Interpreter<'static>) };
+    if vm.run_state != RunState::Running { return WFJIT_BAILOUT; }
+    count_helper(vm, "string_concat", 0);
+    let (left, right) = (Value::from_word(RegisterWord(left)), Value::from_word(RegisterWord(right)));
+    let (a, b) = match (vm.heap.get(left), vm.heap.get(right)) {
+        (Some(HeapObject::String(a)), Some(HeapObject::String(b))) => (a.clone(), b.clone()),
+        _ => return WFJIT_BAILOUT,
+    };
+    vm.maybe_collect();
+    vm.heap.alloc(HeapObject::String(NapalmString::concat(&a, &b))).raw_bits()
 }
 
 /// v2 pure leaf helpers for native builtin methods (`WfInst::Primitive`).

@@ -18,4 +18,4 @@ node_modules
 *.exe
 package-lock.json
 dist
-scripts/__napalm_package_example__/
+__napalm_*

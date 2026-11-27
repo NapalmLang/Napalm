@@ -11079,13 +11079,14 @@ impl<'p> Interpreter<'p> {
     }
 
     #[inline(always)]
-    unsafe fn gather_call_words_const<const N: usize>(&self, op: &PreparedOp) -> [RegisterWord; 4] {
+    /// The first `N` (at most 4) packed call arguments of `op`, exactly `N`
+    /// words long so a slice of the result has the call's arity.
+    unsafe fn gather_call_words_const<const N: usize>(&self, op: &PreparedOp) -> [RegisterWord; N] {
         debug_assert!(N <= 4);
-        let mut out = [RegisterWord(0); 4];
-        if N > 0 { out[0] = self.reg(Self::packed_call_reg(op, 0)); }
-        if N > 1 { out[1] = self.reg(Self::packed_call_reg(op, 1)); }
-        if N > 2 { out[2] = self.reg(Self::packed_call_reg(op, 2)); }
-        if N > 3 { out[3] = self.reg(Self::packed_call_reg(op, 3)); }
+        let mut out = [RegisterWord(0); N];
+        for (index, word) in out.iter_mut().enumerate() {
+            *word = self.reg(Self::packed_call_reg(op, index));
+        }
         out
     }
 

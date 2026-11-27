@@ -521,6 +521,106 @@ fn napalm_whole_function_v2_rebuilds_inlined_frames_after_effects() {
 }
 
 #[test]
+fn napalm_whole_function_v2_inlined_bodies_dispatch_polymorphic_invokes() {
+    // `apply` is inlined into `drive`; its `o.f(x)` sees several receiver
+    // classes (bytecode methods, a Map property holding a closure, a List
+    // builtin), so it dispatches at run time through the op's inline cache.
+    // A missing method and `instance + String` (concatenation fallback) are
+    // left to the interpreter, with its error and result.
+    let stats = whole_function_only_run(r#"
+        class A { f(x) { return x + 1; } }
+        class B { f(x) { return x * 2; } }
+        class C { f(x) { throw 'boom ' + x; } }
+        class P { constructor(v) { this.v = v; } }
+        function apply(o, x) { return o.f(x); }
+        function drive(o, x) { return apply(o, x) + 1; }
+        function size(o, v) { return o.includes(v); }
+        function check(o, v) { return size(o, v) ? 1 : 0; }
+        function cat(o, s) { return o + s; }
+        function glue(o, s) { return cat(o, s); }
+        function main() {
+            const objects = [new A(), new B(), {f: (x) => x - 3}];
+            let total = 0;
+            for (let i = 0; i < 600; i++) total += drive(objects[i % 3], i);
+            let hits = 0;
+            for (let i = 0; i < 300; i++) hits += i % 2 == 0 ? check([1, 2, 3], 2) : check('x2y', '2');
+            let caught = '';
+            try { drive(new C(), 7); } catch (e) { caught = e; }
+            let missing = '';
+            try { drive(5, 1); } catch (e) { missing = 'missing'; }
+            let text = '';
+            for (let i = 0; i < 300; i++) text = glue(i % 2 == 0 ? new P(i) : 'p', '!');
+            return [total, hits, caught, missing, text];
+        }
+        const result = main();
+    "#);
+    assert!(stats.v2_inlined_calls >= 2, "{stats:?}");
+}
+
+#[test]
+fn napalm_whole_function_v2_inlined_bodies_allocate_concatenate_and_store_checked_fields() {
+    // Small callees that build object literals, concatenate strings and store
+    // into typed (contract-checked) fields are inlined: the allocations run
+    // with the inlined frames published as GC shadow frames, and the field
+    // stores are validated by the runtime. Frequent collections check that
+    // every live reference of the inlined frames is a root meanwhile.
+    let stats = whole_function_only_run(r#"
+        class Box { item: List<Number> | null = null; label: String = ''; constructor() {} }
+        function point(x, y) { return {x: x, y: y + 1}; }
+        function tag(s, n) { return s + '#' + n.toString(); }
+        function fill(box, xs, s) { box.item = xs; box.label = s; return box; }
+        function step(i, box) {
+            const p = point(i, i * 2);
+            const text = tag('n', i);
+            fill(box, [p.x, p.y], text);
+            return p.x + p.y + text.length;
+        }
+        function main() {
+            const box = new Box();
+            let total = 0;
+            for (let i = 0; i < 2000; i++) {
+                total += step(i, box);
+                if (i % 97 == 0) System.gc();
+            }
+            return [total, box.label, box.item];
+        }
+        const result = main();
+    "#);
+    assert!(stats.v2_inlined_calls >= 3, "{stats:?}");
+}
+
+#[test]
+fn napalm_whole_function_v2_compiles_closure_creation() {
+    // Closures created in hot functions (and in their loops) capture values
+    // and mutable cells; the captured state must be shared with the frame.
+    let stats = whole_function_only_run(r#"
+        function adder(n) { return (x) => x + n; }
+        function sumWith(xs) {
+            let total = 0;
+            xs.forEach((x) => { total = total + x; });
+            return total;
+        }
+        function counters(n) {
+            const fns = [];
+            for (let i = 0; i < n; i++) { let k = i; fns.push(() => k * 2); }
+            let s = 0;
+            for (const f of fns) s = s + f();
+            return s;
+        }
+        function main() {
+            let out = 0;
+            for (let i = 0; i < 400; i++) {
+                out = out + adder(i)(1) + sumWith([i, 1, 2]) + counters(3);
+                if (i % 50 == 0) System.gc();
+            }
+            return out;
+        }
+        const result = main();
+    "#);
+    assert!(stats.v2_compiled_functions >= 3, "{stats:?}");
+}
+
+#[test]
 fn napalm_whole_function_v2_stores_references_with_the_write_barrier() {
     // Constructors store heap references (child nodes, strings, lists) into
     // exact-class fields: the native store runs the generational barrier

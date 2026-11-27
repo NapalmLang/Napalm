@@ -456,8 +456,8 @@ impl ThreadRecord {
 /// before the collector started, quarantining the Immix space failed and the
 /// process panicked at startup. The space map fixes the geometry (the heap
 /// spans `[1 << E, 17 << E)` for a space extent `2^E`), so pick the smallest
-/// extent that comfortably holds the heap and keeps the whole range below
-/// 2 TiB, and check that the range is free before handing it to MMTk.
+/// extent that comfortably holds the heap whose space reservations are free
+/// right now (small extents keep the heap below mimalloc's hint area).
 #[cfg(target_pointer_width = "64")]
 fn heap_layout(heap_bytes: usize) -> Option<mmtk::util::heap::vm_layout::VMLayout> {
     heap_layout_with(heap_bytes, address_range_is_free)
@@ -470,12 +470,18 @@ fn heap_layout_with(
 ) -> Option<mmtk::util::heap::vm_layout::VMLayout> {
     use mmtk::util::Address;
     use mmtk::util::heap::vm_layout::VMLayout;
-    const MIMALLOC_HINT_BASE: usize = 2 << 40;
-    // Every space may grow to the whole heap; leave room for fragmentation.
+    // Space `i` (1-based, in creation order; no plan here allocates from the
+    // top) reserves `2 * heap` (MMTk's reasonable contiguous extent) at the
+    // start of `[i << E, (i + 1) << E)`. Check exactly those ranges (with a
+    // margin, for up to 8 spaces): anything else in the heap range is fine.
+    // A whole-range check fails far too often on Windows, whose randomized
+    // placement of large reservations (mimalloc arenas) lands anywhere.
+    const PROBED_SPACES: usize = 8;
     let needed = heap_bytes.saturating_mul(4).max(8 << 30);
-    (33..=40usize)
-        .filter(|&extent| (1usize << extent) >= needed && (17usize << extent) <= MIMALLOC_HINT_BASE)
-        .find(|&extent| is_free(1usize << extent, 16usize << extent))
+    let reserved = heap_bytes.saturating_mul(4).max(1 << 30);
+    (33..=43usize)
+        .filter(|&extent| (1usize << extent) >= needed)
+        .find(|&extent| (1..=PROBED_SPACES).all(|space| is_free(space << extent, reserved)))
         .map(|extent| VMLayout {
             log_address_space: 47,
             heap_start: unsafe { Address::from_usize(1usize << extent) },
@@ -561,7 +567,15 @@ impl Collector {
             "gc_trigger",
             &format!("FixedHeapSize:{}", config.heap_bytes)
         ));
-        if let Some(layout) = heap_layout(config.heap_bytes) {
+        let layout = heap_layout(config.heap_bytes);
+        if std::env::var_os("NAPALM_GC_LAYOUT_TRACE").is_some() {
+            match &layout {
+                Some(layout) => eprintln!("[napalm-gc] heap layout: space extent 2^{} from {:#x}",
+                    layout.log_space_extent, layout.heap_start.as_usize()),
+                None => eprintln!("[napalm-gc] heap layout: MMTk default"),
+            }
+        }
+        if let Some(layout) = layout {
             builder.set_vm_layout(layout);
         }
         let mmtk = Box::leak(mm::mmtk_init::<Binding>(&builder));
@@ -2077,10 +2091,14 @@ mod heap_layout_tests {
 
     #[test]
     fn heap_layout_skips_occupied_ranges_and_falls_back_to_the_default() {
-        // The first candidate is taken: the next extent is chosen.
-        let layout = heap_layout_with(256 << 20, |start, _| start != 1 << 33).unwrap();
+        let occupied = |address: usize| move |start: usize, bytes: usize| !(start <= address && address < start + bytes);
+        // A space reservation of the first candidate is taken: the next extent.
+        let layout = heap_layout_with(256 << 20, occupied((3 << 33) + 4096)).unwrap();
         assert_eq!(layout.log_space_extent, 34);
-        // Nothing below 2 TiB is free: MMTk keeps its own default layout.
+        // Something between two reservations does not matter.
+        let layout = heap_layout_with(256 << 20, occupied((1 << 33) + (3 << 30))).unwrap();
+        assert_eq!(layout.log_space_extent, 33);
+        // No candidate is free: MMTk keeps its own default layout.
         assert!(heap_layout_with(256 << 20, |_, _| false).is_none());
         // The real probe reports memory that is already in use as occupied.
         let buffer = vec![1u8; 4 << 20];

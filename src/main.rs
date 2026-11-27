@@ -99,7 +99,43 @@ const EXIT_USAGE_ERROR: u8 = 2;
 const EXIT_IO_ERROR: u8 = 3;
 const EXIT_RUNTIME_ERROR: u8 = 4;
 
+/// `NAPALM_CRASH_TRACE=1`: report a native crash (exception code, faulting
+/// address, thread and a backtrace) on stderr before the process dies.
+/// Diagnostics only; symbols need a build with debug line tables.
+#[cfg(windows)]
+fn install_crash_trace() {
+    if std::env::var_os("NAPALM_CRASH_TRACE").is_none() { return; }
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        record: *mut ExceptionRecord,
+        address: *mut std::ffi::c_void,
+        parameter_count: u32,
+        information: [usize; 15],
+    }
+    #[repr(C)]
+    struct ExceptionPointers { record: *mut ExceptionRecord, context: *mut std::ffi::c_void }
+    type Filter = unsafe extern "system" fn(*mut ExceptionPointers) -> i32;
+    unsafe extern "system" {
+        fn SetUnhandledExceptionFilter(filter: Option<Filter>) -> Option<Filter>;
+    }
+    unsafe extern "system" fn report(info: *mut ExceptionPointers) -> i32 {
+        let record = unsafe { &*(*info).record };
+        eprintln!("[napalm-crash] exception {:#x} at {:p} (thread {:?}) access={:#x} target={:#x}",
+            record.code, record.address, std::thread::current().name(),
+            record.information[0], record.information[1]);
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        0 // EXCEPTION_CONTINUE_SEARCH: the process still terminates.
+    }
+    unsafe { SetUnhandledExceptionFilter(Some(report)); }
+}
+
+#[cfg(not(windows))]
+fn install_crash_trace() {}
+
 fn main() -> ExitCode {
+    install_crash_trace();
     // Never let process exit wait for (or tear down) background LLVM compilers.
     napalm_tracing_jit::use_fast_process_exit();
     let code = run(); // drops the VM, flushing all program output

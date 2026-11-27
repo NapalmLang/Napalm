@@ -40,14 +40,19 @@ pub(super) struct WfHelperRefs {
     pub(super) reserved_typed_array: FuncRef,
     /// Rebuilds inlined frames on a deopt after an effect.
     pub(super) reconstruct: FuncRef,
-    /// Calls from inlined bodies (`CallExplicit`).
+    /// Calls from inlined bodies (`CallExplicit`): static and dispatched.
     pub(super) call_explicit: FuncRef,
+    pub(super) invoke_explicit: FuncRef,
     /// Pure leaf helpers of native builtin methods.
     pub(super) string_eq: FuncRef,
     pub(super) string_code_point_at: FuncRef,
     pub(super) bytes_index: FuncRef,
     /// Generational post-barrier `(vm, owner address, stored word)`.
     pub(super) write_barrier: FuncRef,
+    /// Validated class field store `(vm, object, value, slot) -> status`.
+    pub(super) store_field_checked: FuncRef,
+    /// `(vm, left, right) -> String word | BAILOUT` (allocates).
+    pub(super) string_concat: FuncRef,
 }
 
 /// Only heap-independent words can retain their *bank equality* fact after
@@ -132,13 +137,20 @@ fn bank_entry_facts(ir: &WfFunction) -> Vec<Vec<Option<WfValue>>> {
             for &(result, ref inst) in &ir.blocks[b].insts {
                 match inst {
                     WfInst::FrameLoad(reg) => known[*reg as usize] = Some(result),
-                    WfInst::SelfCall { .. } | WfInst::AllocObject { .. } => {
+                    WfInst::SelfCall { .. } | WfInst::AllocObject { .. } | WfInst::StringConcat { .. } => {
                         // These may allocate, collect and publish other roots.
                         // A later guard must be able to reconstruct every root.
                         retain_gc_independent(&independent, &mut known);
                     }
-                    // Runs code and writes the root's call destination slot.
-                    WfInst::CallExplicit { .. } => known.fill(None),
+                    // Runs code (a safepoint) and writes only the root's call
+                    // destination slot; its root registers were published.
+                    WfInst::CallExplicit { state, scratch, .. } => {
+                        for &(reg, v) in &ir.deopts[state.0 as usize].registers {
+                            known[reg as usize] = Some(v);
+                        }
+                        retain_gc_independent(&independent, &mut known);
+                        known[*scratch as usize] = None;
+                    }
                     WfInst::RuntimeOp { state, dest, clobbers, .. } => {
                         for &(reg, v) in &ir.deopts[state.0 as usize].registers {
                             known[reg as usize] = Some(v);
@@ -276,6 +288,140 @@ impl Lowering<'_, '_> {
         block
     }
 
+    /// Publish every inlined frame of `state` as a GC shadow frame on the
+    /// native stack (outermost first, so the innermost ends on top): a bank
+    /// holding the frame's live registers (the GC map's other reference slots
+    /// nulled), its function and its GC map at the current op. Returns the
+    /// previous `native_shadow_top` (to restore afterwards) and the banks.
+    fn publish_shadow_frames(&mut self, state: WfDeopt) -> (Option<ClValue>, SmallVec<[ClValue; 4]>) {
+        let flags = MemFlagsData::trusted();
+        let ir = self.ir;
+        let mut first_previous = None;
+        let mut banks = SmallVec::new();
+        for level in &ir.deopts[state.0 as usize].frames {
+            let count = u32::from(level.reg_count.max(1));
+            let bank_slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot, count * 8, 3));
+            let bank = self.b.ins().stack_addr(types::I64, bank_slot, 0);
+            // The collector reads only the map's reference slots: those the IR
+            // holds no value for must not keep stale words.
+            let null = self.b.ins().iconst(types::I64, TAG_NULL as i64);
+            for &reg in &level.gc_refs {
+                if !level.registers.iter().any(|&(held, _)| held == reg) {
+                    self.b.ins().store(flags, null, bank, i32::from(reg) * 8);
+                }
+            }
+            for &(reg, value) in &level.registers {
+                let word = self.tagged(value);
+                self.b.ins().store(flags, word, bank, reg as i32 * 8);
+            }
+            let shadow_slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot, std::mem::size_of::<NativeShadowFrame>() as u32, 3));
+            let shadow = self.b.ins().stack_addr(types::I64, shadow_slot, 0);
+            let previous = self.b.ins().load(types::I64, flags, self.vm,
+                offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+            first_previous.get_or_insert(previous);
+            self.b.ins().store(flags, previous, shadow, offset_of!(NativeShadowFrame, previous) as i32);
+            self.b.ins().store(flags, bank, shadow, offset_of!(NativeShadowFrame, registers) as i32);
+            let function_id = self.b.ins().iconst(types::I32, level.callee as i64);
+            self.b.ins().store(flags, function_id, shadow, offset_of!(NativeShadowFrame, function) as i32);
+            let root_map = self.b.ins().iconst(types::I32, level.root_map as i64);
+            self.b.ins().store(flags, root_map, shadow, offset_of!(NativeShadowFrame, root_map) as i32);
+            let register_count = self.b.ins().iconst(types::I16, level.reg_count as i64);
+            self.b.ins().store(flags, register_count, shadow, offset_of!(NativeShadowFrame, reg_count) as i32);
+            self.b.ins().store(flags, shadow, self.vm, offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+            banks.push(bank);
+        }
+        (first_previous, banks)
+    }
+
+    fn unpublish_shadow_frames(&mut self, first_previous: Option<ClValue>) {
+        if let Some(previous) = first_previous {
+            self.b.ins().store(MemFlagsData::trusted(), previous, self.vm,
+                offset_of!(Interpreter<'static>, native_shadow_top) as i32);
+        }
+    }
+
+    /// Allocation inside an inlined body: the allocation path reads its
+    /// operands from the innermost published bank, whose GC map it keeps
+    /// current (see `lower_inlined_safepoint`).
+    fn lower_inlined_alloc(&mut self, result: WfValue, op_index: u32, kind: WfAllocKind, state: WfDeopt, function: u32) -> ClValue {
+        let ir = self.ir;
+        let site = ir.alloc_sites.iter().find(|(key, _)| *key == (function, op_index)).map(|(_, site)| site.clone());
+        let value = self.lower_inlined_safepoint(state, |lowering, bank, innermost_map, abort| {
+            let h = &lowering.helpers;
+            let (profiled_small_map, commit, bind, small_map_regs) =
+                (h.profiled_small_map, h.profiled_small_map_commit, h.bind_factory_contract, h.small_map_literal_regs);
+            match (kind, site) {
+                (_, Some(WfAllocSite::Object(Some(site)))) => emit_profiled_small_map_alloc(lowering.b,
+                    profiled_small_map, commit, bind, lowering.vm, bank, innermost_map, function, op_index as usize,
+                    &site, lowering.fast_alloc, abort),
+                (WfAllocKind::SmallMapLiteral, _) =>
+                    call_native_value_helper(lowering.b, small_map_regs, lowering.vm, function, op_index, bank, abort),
+                // The builder admits nothing else into inlined bodies.
+                _ => {
+                    lowering.b.ins().jump(abort, &[]);
+                    let unreachable = lowering.b.create_block();
+                    lowering.b.switch_to_block(unreachable);
+                    lowering.b.ins().iconst(types::I64, 0)
+                }
+            }
+        });
+        self.local_objects.push(result);
+        value
+    }
+
+    /// A safepoint (allocation) inside an inlined body. The root frame stands
+    /// at its outermost call op (live GPRs published, GC map and PC of that
+    /// op) and the inlined frames are shadow frames while `emit` runs; it gets
+    /// the innermost bank, its GC map and the abort block (deoptimization at
+    /// `state` with rebuilt frames). Both edges reload the published roots.
+    fn lower_inlined_safepoint(
+        &mut self,
+        state: WfDeopt,
+        emit: impl FnOnce(&mut Self, ClValue, u32, cranelift::prelude::Block) -> ClValue,
+    ) -> ClValue {
+        let flags = MemFlagsData::trusted();
+        let ir = self.ir;
+        let snapshot = &ir.deopts[state.0 as usize];
+        let frame = self.b.use_var(self.frame);
+        self.materialize(frame, &snapshot.registers);
+        let hot_frame = self.b.ins().load(types::I64, flags, self.vm,
+            offset_of!(Interpreter<'static>, hot_frame) as i32);
+        let root_map = self.b.ins().iconst(types::I32, ir.frame.gc_map_by_op[snapshot.op_index as usize] as i64);
+        self.b.ins().store(flags, root_map, hot_frame, offset_of!(Frame, root_map) as i32);
+        let pc = self.b.ins().iconst(types::I32, snapshot.op_index as i64);
+        self.b.ins().store(flags, pc, self.vm, offset_of!(Interpreter<'static>, hot_pc) as i32);
+        let (first_previous, banks) = self.publish_shadow_frames(state);
+        let bank = *banks.last().expect("an inlined safepoint has inlined frames");
+        let innermost_map = snapshot.frames.last().expect("inlined frames").root_map;
+        let abort = self.b.create_block();
+        self.b.set_cold_block(abort);
+        let value = emit(self, bank, innermost_map, abort);
+        let resume = self.b.current_block().expect("the safepoint continues in a block");
+        // Both edges are after a safepoint: withdraw the shadow frames, then
+        // take every reference the frames hold from their banks again.
+        let reload = |lowering: &mut Self| {
+            lowering.unpublish_shadow_frames(first_previous);
+            lowering.refresh_frame_after_safepoint();
+            retain_gc_independent(&lowering.gc_independent, &mut lowering.bank_known);
+            let current = lowering.b.use_var(lowering.frame);
+            lowering.reload_roots_after_safepoint(current, &snapshot.registers, None);
+            for (level, &bank) in snapshot.frames.iter().zip(&banks) {
+                lowering.reload_roots_after_safepoint(bank, &level.registers, None);
+            }
+            current
+        };
+        self.b.switch_to_block(abort);
+        let current = reload(self);
+        let target = self.deopt_block(state);
+        let args = self.deopt_args(state, current);
+        self.b.ins().jump(target, &args);
+        self.b.switch_to_block(resume);
+        reload(self);
+        value
+    }
+
     /// A safepoint may replace the interpreter-owned top-level GPR buffer.
     /// Nested shadow frames, by contrast, live in native stack storage.
     fn refresh_frame_after_safepoint(&mut self) {
@@ -315,9 +461,19 @@ impl Lowering<'_, '_> {
     fn guard(&mut self, condition: ClValue, deopt: WfDeopt) {
         let target = self.deopt_block(deopt);
         let next = self.b.create_block();
-        let frame = self.frame_arg();
-        self.b.ins().brif(condition, next, &[], target, &frame);
+        let args = self.deopt_args_here(deopt);
+        self.b.ins().brif(condition, next, &[], target, &args);
         self.b.switch_to_block(next);
+    }
+
+    /// Arguments of a jump to a deopt block: the bank pointer.
+    fn deopt_args(&mut self, _deopt: WfDeopt, frame: ClValue) -> [BlockArg; 1] {
+        [BlockArg::Value(frame)]
+    }
+
+    fn deopt_args_here(&mut self, deopt: WfDeopt) -> [BlockArg; 1] {
+        let frame = self.b.use_var(self.frame);
+        self.deopt_args(deopt, frame)
     }
 
     fn tagged(&mut self, value: WfValue) -> ClValue {
@@ -435,7 +591,7 @@ impl Lowering<'_, '_> {
                 self.b.switch_to_block(heap);
                 let resolve = self.b.create_block();
                 let is_heap = self.is_heap(lhs);
-                let frame = self.frame_arg();
+                let frame = self.deopt_args_here(*deopt);
                 self.b.ins().brif(is_heap, resolve, &[], target, &frame);
                 self.b.switch_to_block(resolve);
                 let entry = self.heap_entry(lhs);
@@ -446,7 +602,7 @@ impl Lowering<'_, '_> {
                     let matches = self.b.ins().icmp_imm(IntCC::Equal, class, expected as i64);
                     accepted = self.b.ins().bor(accepted, matches);
                 }
-                let frame = self.frame_arg();
+                let frame = self.deopt_args_here(*deopt);
                 self.b.ins().brif(accepted, calculate, &[], target, &frame);
                 self.b.switch_to_block(calculate);
                 let cc = if *negate { IntCC::NotEqual } else { IntCC::Equal };
@@ -476,7 +632,7 @@ impl Lowering<'_, '_> {
                     let last = position + 1 == entries.len();
                     let miss = if last { target } else { self.b.create_block() };
                     let matches = self.b.ins().icmp_imm(IntCC::Equal, shape, expected_shape as i64);
-                    let miss_args = self.frame_arg();
+                    let miss_args = self.deopt_args_here(*deopt);
                     let miss_args = if last { &miss_args[..] } else { &[] };
                     self.b.ins().brif(matches, hit, &[], miss, miss_args);
                     self.b.switch_to_block(hit);
@@ -640,6 +796,33 @@ impl Lowering<'_, '_> {
                 }
                 self.b.ins().iconst(types::I8, 0)
             }
+            WfInst::StringConcat { left, right, state } => {
+                self.field_written.clear();
+                self.local_objects.clear();
+                let (left, right) = (self.value(*left), self.value(*right));
+                let concat = self.helpers.string_concat;
+                self.lower_inlined_safepoint(*state, |lowering, _, _, abort| {
+                    let call = lowering.b.ins().call(concat, &[lowering.vm, left, right]);
+                    let value = lowering.b.inst_results(call)[0];
+                    let failed = lowering.b.ins().icmp_imm(IntCC::Equal, value, WFJIT_BAILOUT as i64);
+                    let ok = lowering.b.create_block();
+                    lowering.b.ins().brif(failed, abort, &[], ok, &[]);
+                    lowering.b.switch_to_block(ok);
+                    value
+                })
+            }
+            WfInst::InstanceFieldStoreChecked { object, value, slot, deopt } => {
+                // Any receiver may be stored to: drop every forwarded field.
+                self.field_written.clear();
+                let object = self.value(*object);
+                let stored = self.value(*value);
+                let slot = self.b.ins().iconst(types::I32, *slot as i64);
+                let call = self.b.ins().call(self.helpers.store_field_checked, &[self.vm, object, stored, slot]);
+                let status = self.b.inst_results(call)[0];
+                let stored_ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
+                self.guard(stored_ok, *deopt);
+                self.b.ins().iconst(types::I8, 0)
+            }
             WfInst::GuardClass { value, class, deopt } => {
                 let value = self.value(*value);
                 let is_heap = self.is_heap(value);
@@ -672,7 +855,8 @@ impl Lowering<'_, '_> {
                     let target = self.deopt_block(*state);
                     let top = self.b.create_block();
                     let is_top = self.is_top(frame);
-                    self.b.ins().brif(is_top, top, &[], target, &[BlockArg::Value(frame)]);
+                    let args = self.deopt_args(*state, frame);
+                    self.b.ins().brif(is_top, top, &[], target, &args);
                     self.b.switch_to_block(top);
                 }
                 let registers = &self.ir.deopts[state.0 as usize].registers;
@@ -730,7 +914,12 @@ impl Lowering<'_, '_> {
                     None => self.b.ins().iconst(types::I8, 0),
                 }
             }
-            WfInst::AllocObject { op_index, kind, state } => {
+            WfInst::AllocObject { op_index, kind, state, function } if !self.ir.deopts[state.0 as usize].frames.is_empty() => {
+                self.field_written.clear();
+                self.local_objects.clear();
+                self.lower_inlined_alloc(result, *op_index, *kind, *state, *function)
+            }
+            WfInst::AllocObject { op_index, kind, state, function } => {
                 self.field_written.clear();
                 self.local_objects.clear();
                 // Operands and every live reference go to this frame's bank
@@ -747,7 +936,7 @@ impl Lowering<'_, '_> {
                 let (profiled_small_map, commit, bind, small_map_regs, factory, reserved) = (
                     h.profiled_small_map, h.profiled_small_map_commit, h.bind_factory_contract,
                     h.small_map_literal_regs, h.specialized_factory, h.reserved_typed_array);
-                let site = self.ir.alloc_sites.iter().find(|(op, _)| op == op_index).map(|(_, site)| site.clone());
+                let site = self.ir.alloc_sites.iter().find(|(key, _)| *key == (*function, *op_index)).map(|(_, site)| site.clone());
                 let root_map = self.ir.frame.gc_map_by_op[index];
                 let value = match (kind, site) {
                     (WfAllocKind::TypedArray, Some(WfAllocSite::TypedArray(site))) => emit_native_typed_array_alloc(
@@ -772,7 +961,8 @@ impl Lowering<'_, '_> {
                 retain_gc_independent(&self.gc_independent, &mut self.bank_known);
                 self.reload_roots_after_safepoint(current, registers, None);
                 let target = self.deopt_block(*state);
-                self.b.ins().jump(target, &[BlockArg::Value(current)]);
+                let args = self.deopt_args(*state, current);
+                self.b.ins().jump(target, &args);
                 self.b.switch_to_block(resume);
                 self.refresh_frame_after_safepoint();
                 retain_gc_independent(&self.gc_independent, &mut self.bank_known);
@@ -781,7 +971,7 @@ impl Lowering<'_, '_> {
                 self.local_objects.push(result);
                 value
             }
-            WfInst::CallExplicit { target, receiver, args, state } => {
+            WfInst::CallExplicit { target, receiver, args, state, scratch } => {
                 self.field_written.clear();
                 self.local_objects.clear();
                 let snapshot = &self.ir.deopts[state.0 as usize];
@@ -791,37 +981,7 @@ impl Lowering<'_, '_> {
                 self.materialize(frame, &snapshot.registers);
                 // Every inlined frame becomes a GC shadow frame on the native
                 // stack for the duration of the call.
-                let mut first_previous = None;
-                for level in &snapshot.frames {
-                    let count = u32::from(level.reg_count.max(1));
-                    let bank_slot = self.b.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot, count * 8, 3));
-                    let bank = self.b.ins().stack_addr(types::I64, bank_slot, 0);
-                    // Slots not tracked by the IR must not hold stale words.
-                    let null = self.b.ins().iconst(types::I64, TAG_NULL as i64);
-                    for reg in 0..level.reg_count {
-                        self.b.ins().store(flags, null, bank, i32::from(reg) * 8);
-                    }
-                    for &(reg, value) in &level.registers {
-                        let word = self.tagged(value);
-                        self.b.ins().store(flags, word, bank, reg as i32 * 8);
-                    }
-                    let shadow_slot = self.b.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot, std::mem::size_of::<NativeShadowFrame>() as u32, 3));
-                    let shadow = self.b.ins().stack_addr(types::I64, shadow_slot, 0);
-                    let previous = self.b.ins().load(types::I64, flags, self.vm,
-                        offset_of!(Interpreter<'static>, native_shadow_top) as i32);
-                    first_previous.get_or_insert(previous);
-                    self.b.ins().store(flags, previous, shadow, offset_of!(NativeShadowFrame, previous) as i32);
-                    self.b.ins().store(flags, bank, shadow, offset_of!(NativeShadowFrame, registers) as i32);
-                    let function_id = self.b.ins().iconst(types::I32, level.callee as i64);
-                    self.b.ins().store(flags, function_id, shadow, offset_of!(NativeShadowFrame, function) as i32);
-                    let root_map = self.b.ins().iconst(types::I32, level.root_map as i64);
-                    self.b.ins().store(flags, root_map, shadow, offset_of!(NativeShadowFrame, root_map) as i32);
-                    let register_count = self.b.ins().iconst(types::I16, level.reg_count as i64);
-                    self.b.ins().store(flags, register_count, shadow, offset_of!(NativeShadowFrame, reg_count) as i32);
-                    self.b.ins().store(flags, shadow, self.vm, offset_of!(Interpreter<'static>, native_shadow_top) as i32);
-                }
+                let (first_previous, _) = self.publish_shadow_frames(*state);
                 let args_slot = self.b.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot, (args.len().max(1) * 8) as u32, 3));
                 let args_ptr = self.b.ins().stack_addr(types::I64, args_slot, 0);
@@ -832,15 +992,25 @@ impl Lowering<'_, '_> {
                 let out_slot = self.b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
                 let out = self.b.ins().stack_addr(types::I64, out_slot, 0);
                 let root_op = self.b.ins().iconst(types::I32, snapshot.op_index as i64);
-                let callee = self.b.ins().iconst(types::I32, *target as i64);
                 let receiver_word = match receiver {
                     Some(value) => self.tagged(*value),
                     None => self.b.ins().iconst(types::I64, 0),
                 };
-                let has_receiver = self.b.ins().iconst(types::I32, receiver.is_some() as i64);
                 let argc = self.b.ins().iconst(types::I32, args.len() as i64);
-                let call = self.b.ins().call(self.helpers.call_explicit,
-                    &[self.vm, root_op, callee, receiver_word, has_receiver, args_ptr, argc, out]);
+                let call = match *target {
+                    WfCallTarget::Static(callee) => {
+                        let callee = self.b.ins().iconst(types::I32, callee as i64);
+                        let has_receiver = self.b.ins().iconst(types::I32, receiver.is_some() as i64);
+                        self.b.ins().call(self.helpers.call_explicit,
+                            &[self.vm, root_op, callee, receiver_word, has_receiver, args_ptr, argc, out])
+                    }
+                    WfCallTarget::Dynamic { function, ic_slot } => {
+                        let function = self.b.ins().iconst(types::I32, function as i64);
+                        let ic_slot = self.b.ins().iconst(types::I32, ic_slot as i64);
+                        self.b.ins().call(self.helpers.invoke_explicit,
+                            &[self.vm, root_op, function, ic_slot, receiver_word, args_ptr, argc, out])
+                    }
+                };
                 let status = self.b.inst_results(call)[0];
                 if let Some(previous) = first_previous {
                     self.b.ins().store(flags, previous, self.vm,
@@ -852,18 +1022,23 @@ impl Lowering<'_, '_> {
                 let declined = self.b.ins().icmp_imm(IntCC::Equal, status, 2);
                 let deopt_target = self.deopt_block(*state);
                 let decided = self.b.create_block();
-                self.b.ins().brif(declined, deopt_target, &[BlockArg::Value(frame)], decided, &[]);
+                let args = self.deopt_args(*state, frame);
+                self.b.ins().brif(declined, deopt_target, &args, decided, &[]);
                 self.b.switch_to_block(decided);
                 let ok = self.b.ins().icmp_imm(IntCC::Equal, status, 0);
                 let bail = self.bail_block();
                 let done = self.b.create_block();
                 self.b.ins().brif(ok, done, &[], bail, &[]);
                 self.b.switch_to_block(done);
-                // Entering the callee may have grown (moved) the register stack.
+                // Entering the callee may have grown (moved) the register stack,
+                // but a completed call wrote nothing in the root frame except
+                // its call op's destination (the scratch result slot). As after
+                // any safepoint, only GC-independent words keep their facts.
                 let hot = self.b.ins().load(types::I64, flags, self.vm,
                     offset_of!(Interpreter<'static>, hot_registers) as i32);
                 self.b.def_var(self.frame, hot);
-                self.bank_known.fill(None);
+                retain_gc_independent(&self.gc_independent, &mut self.bank_known);
+                self.bank_known[*scratch as usize] = None;
                 self.b.ins().load(types::I64, flags, out, 0)
             }
             WfInst::FrameLoad(reg) => {
@@ -1204,6 +1379,8 @@ pub(super) fn lower_body(
         (*ty == WfTy::Tagged && !gc_independent[index])
             .then(|| b.declare_var(types::I64))
     }).collect();
+    let may_nest = ir.blocks.iter().any(|block| block.insts.iter()
+        .any(|(_, inst)| matches!(inst, WfInst::SelfCall { .. })));
     let mut lowering = Lowering {
         b,
         ir,
@@ -1223,8 +1400,7 @@ pub(super) fn lower_body(
         field_written: SmallVec::new(),
         local_objects: SmallVec::new(),
         deopt_known: vec![None; ir.deopts.len()],
-        may_nest: ir.blocks.iter().any(|block| block.insts.iter()
-            .any(|(_, inst)| matches!(inst, WfInst::SelfCall { .. }))),
+        may_nest,
         bail: None,
         tails: [None, None],
         nested_spec_bail: None,

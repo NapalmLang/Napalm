@@ -166,6 +166,19 @@ fn napalm_instances_compare_with_null_and_by_reference_like_javascript() {
 }
 
 #[test]
+fn napalm_instances_without_operator_plus_concatenate_with_strings() {
+    // `instance + String` falls back to `instance.toString() + String` when
+    // the class defines no `operator +` (a defined one still wins).
+    run_napalm(r#"
+        class Q { constructor(v) { this.v = v; } toString() { return `Q(${this.v})`; } }
+        class V { constructor(v) { this.v = v; } operator +(other) { return this.v + 100; } }
+        function join(a, b) { return a + b; }
+        const q: any = new Q(1);
+        const result = [q + '!', join(new Q(2), '?'), join(new V(1), 'x'), join(1, 'n'), join('s', 2)];
+    "#, "[Q(1)!, Q(2)?, 101, 1n, s2]");
+}
+
+#[test]
 fn napalm_subclass_instances_satisfy_their_ancestors_class_types() {
     // Class annotations are nominal: locals, parameters, unions, typed fields
     // and typed lists of `Node` accept every descendant, inherited methods see

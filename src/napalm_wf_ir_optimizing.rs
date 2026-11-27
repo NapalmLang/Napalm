@@ -338,7 +338,7 @@ impl WfOptimization for Values {
                         }
                         // CallExplicit runs code and writes the root's call
                         // destination slot in the bank.
-                        WfInst::SelfCall { .. } | WfInst::AllocObject { .. } | WfInst::CallExplicit { .. } => {
+                        WfInst::SelfCall { .. } | WfInst::AllocObject { .. } | WfInst::StringConcat { .. } | WfInst::CallExplicit { .. } => {
                             bank.clear();
                             guards.clear();
                             globals.clear();
@@ -861,6 +861,8 @@ impl WfOptimization for HeapForward {
                     }
                     WfInst::RuntimeOp { .. }
                     | WfInst::SelfCall { .. }
+                    | WfInst::InstanceFieldStoreChecked { .. }
+                    | WfInst::StringConcat { .. }
                     | WfInst::CallExplicit { .. } => state.kill_effects(),
                     _ => {}
                 }
@@ -1581,7 +1583,7 @@ mod wf_opt_tests {
             &[Tagged, Tagged, Bool, Tagged, Tagged], &[], Tagged,
             vec![block(&[], vec![
                 (0, AllocObject { op_index: 0, kind: WfAllocKind::SpecializedObject,
-                    state: WfDeopt(0) }),
+                    state: WfDeopt(0), function: 0 }),
                 (1, ConstTagged(TAG_TRUE)),
                 (2, InstanceFieldSet { object:v(0), value:v(1), slot:4,
                     class_key:8, value_immediate:true, deopt:WfDeopt(0) }),
@@ -1883,6 +1885,7 @@ mod wf_opt_tests {
             registers: vec![(1, v(1))],
             reg_count: 4,
             root_map: 0,
+            gc_refs: vec![],
         });
         optimize(&mut f).unwrap();
         assert_eq!(f.deopts.len(), 1);
@@ -2048,6 +2051,7 @@ mod wf_opt_tests {
             registers: vec![],
             reg_count: 4,
             root_map: 0,
+            gc_refs: vec![],
         });
         // Equal register values with different GC layouts must stay distinct.
         let mut other_map = f.deopts[4].clone();

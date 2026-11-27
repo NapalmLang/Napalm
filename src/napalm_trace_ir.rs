@@ -58,6 +58,69 @@ pub enum TraceHeapObjectKind {
     Class,
     Foreign,
 }
+/// Layout of an object allocated by the trace itself (`TraceInst::NewObject`),
+/// or kept virtual by allocation sinking (`TraceVirtualObject`).
+///
+/// Ids are recording-time metadata: native code relocates them through the
+/// VM-binding table (`ShapeId` / `ClassKey`), never as immediates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TraceObjectKind {
+    /// Shaped Map with `len` (<= 4) inline dense value slots.
+    ShapedMap { shape: u32, len: u8 },
+    /// Class instance (receiver-class key) with `fields` fields, all stored
+    /// inline (<= 4).
+    Instance { class: u64, fields: u8 },
+}
+
+impl TraceObjectKind {
+    /// Number of dense value slots (`NewObject::fields` has exactly this many).
+    pub fn slots(self) -> usize {
+        match self {
+            Self::ShapedMap { len, .. } => len as usize,
+            Self::Instance { fields, .. } => fields as usize,
+        }
+    }
+
+    pub fn heap_kind(self) -> TraceHeapObjectKind {
+        match self {
+            Self::ShapedMap { .. } => TraceHeapObjectKind::Map,
+            Self::Instance { .. } => TraceHeapObjectKind::Instance,
+        }
+    }
+}
+
+/// Inline capacity shared by shaped Maps and class instances.
+pub const TRACE_OBJECT_MAX_SLOTS: usize = 4;
+
+/// An allocation removed by allocation sinking that a side exit still needs.
+/// The exit materializes it (with these field values) before resuming the
+/// interpreter. A field may reference another virtual object of the same exit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceVirtualObject {
+    pub kind: TraceObjectKind,
+    pub fields: Vec<SnapshotValue>,
+    /// Loop-carried objects only: `(flag, object)`. While `flag` is true (the
+    /// first iteration) the carried value is still the real object the loop was
+    /// entered with, so the exit writes `object` itself instead of a copy.
+    pub initial: Option<(SnapshotValue, SnapshotValue)>,
+}
+
+impl TraceVirtualObject {
+    /// Snapshot values read by this object: fields, then flag and initial object.
+    pub fn values(&self) -> impl Iterator<Item = &SnapshotValue> {
+        self.fields.iter().chain(self.initial.iter().flat_map(|(flag, object)| [flag, object]))
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut SnapshotValue> {
+        self.fields.iter_mut().chain(self.initial.iter_mut().flat_map(|(flag, object)| [flag, object]))
+    }
+
+    /// Words this object takes in a side exit's materialization buffer.
+    pub fn words(&self) -> usize {
+        1 + self.kind.slots() + if self.initial.is_some() { 2 } else { 0 }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TraceConstant {
     Null,
@@ -276,6 +339,12 @@ pub enum TraceInst {
     /// Pending/rejected/non-Promise values side-exit to the original Await opcode.
     HeapAwaitFulfilled { promise: TraceValueId, exit: SideExitId },
     ReadBarrier { value: TraceValueId },
+    /// Allocate a complete, unpublished object without a runtime boundary:
+    /// `fields` are its dense slot values (`kind.slots()` of them). Native code
+    /// only uses the TLAB fast path, so this never collects; when the TLAB is
+    /// exhausted (or the VM refuses) `exit` replays the allocating bytecode.
+    /// Allocation sinking removes the node when the object does not escape.
+    NewObject { kind: TraceObjectKind, fields: Vec<TraceValueId>, exit: SideExitId },
 }
 impl TraceInst {
     pub fn visit_operands(&mut self, mut f: impl FnMut(&mut TraceValueId)) {
@@ -284,6 +353,9 @@ impl TraceInst {
             Runtime { direct_call: Some(call), .. } => {
                 f(&mut call.receiver);
                 for arg in &mut call.args { f(arg); }
+            }
+            NewObject { fields, .. } => {
+                for field in fields { f(field); }
             }
             Nop | LoadFrameSlot { .. } | Runtime { direct_call: None, .. } | RuntimeCall { .. }
             | LoadAbsoluteValue { .. } | IncrementProfileCounter { .. }
@@ -360,7 +432,8 @@ impl TraceInst {
             | HeapMapSetShaped { exit, .. } | HeapStringLen { exit, .. }
             | HeapStringAsciiCodePointAt { exit, .. }
             | HeapStringCodePointAt { exit, .. }
-            | HeapAwaitFulfilled { exit, .. } | IsInstanceObserved { exit, .. } => Some(*exit),
+            | HeapAwaitFulfilled { exit, .. } | IsInstanceObserved { exit, .. }
+            | NewObject { exit, .. } => Some(*exit),
             _ => None,
         }
     }
@@ -405,7 +478,7 @@ impl TraceInst {
             | HeapMapLen { exit, .. } | HeapMapGetShaped { exit, .. } | HeapMapGetPic { exit, .. }
             | HeapStringLen { exit, .. } | HeapStringAsciiCodePointAt { exit, .. }
             | HeapStringCodePointAt { exit, .. } | F64ToInt32 { exit, .. }
-            | IntBinaryChecked { exit, .. } => *exit = new,
+            | IntBinaryChecked { exit, .. } | NewObject { exit, .. } => *exit = new,
             _ => panic!("instruction does not support entry exit replacement"),
         }
     }
@@ -417,7 +490,12 @@ pub enum ExitReason { GuardTruthy, GuardFalsey, GuardValue, GuardNotNull, GuardI
 #[derive(Clone, Copy, Debug)]
 pub enum ExitTarget { Interpreter(TraceLocation), Trace(TraceId), Return }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SnapshotValue { Constant(TraceConstant), Value(TraceValueId) }
+pub enum SnapshotValue {
+    Constant(TraceConstant),
+    Value(TraceValueId),
+    /// Index into the exit's `virtuals`: an object materialized on exit.
+    Virtual(u32),
+}
 #[derive(Clone, Debug)]
 pub struct SnapshotWrite {
     pub slot: FrameSlot,
@@ -436,7 +514,44 @@ pub enum FrameDisposition { Existing { depth_from_top: u32 } }
 #[derive(Clone, Debug)]
 pub struct FrameSnapshot { pub disposition: FrameDisposition, pub writes: Vec<SnapshotWrite> }
 #[derive(Clone, Debug)]
-pub struct SideExit { pub id: SideExitId, pub target: ExitTarget, pub frames: Vec<FrameSnapshot>, pub linked_trace: Option<TraceId> }
+pub struct SideExit {
+    pub id: SideExitId,
+    pub target: ExitTarget,
+    pub frames: Vec<FrameSnapshot>,
+    pub linked_trace: Option<TraceId>,
+    /// Sunk allocations referenced (through `SnapshotValue::Virtual`) by this
+    /// exit's writes. Empty for almost every exit.
+    pub virtuals: Vec<TraceVirtualObject>,
+}
+
+impl SideExit {
+    /// Every SSA value the exit reads: frame writes and virtual-object fields.
+    pub fn for_each_value(&self, mut f: impl FnMut(TraceValueId)) {
+        for frame in &self.frames {
+            for write in &frame.writes {
+                if let SnapshotValue::Value(value) = write.value { f(value); }
+            }
+        }
+        for object in &self.virtuals {
+            for field in object.values() {
+                if let SnapshotValue::Value(value) = *field { f(value); }
+            }
+        }
+    }
+
+    pub fn for_each_value_mut(&mut self, mut f: impl FnMut(&mut TraceValueId)) {
+        for frame in &mut self.frames {
+            for write in &mut frame.writes {
+                if let SnapshotValue::Value(value) = &mut write.value { f(value); }
+            }
+        }
+        for object in &mut self.virtuals {
+            for field in object.values_mut() {
+                if let SnapshotValue::Value(value) = field { f(value); }
+            }
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct LoopPhi {
     pub value: TraceValueId,
@@ -480,6 +595,8 @@ pub struct TraceStats {
     pub loop_loads_reused: usize,
     pub inlined_calls: usize,
     pub devirtualized_calls: usize,
+    /// Trace allocations removed by allocation sinking (`AllocationSinking`).
+    pub sunk_allocations: usize,
     /// InvokeSpread sites specialized to an observed argument-list arity and
     /// successfully inlined as ordinary bytecode calls.
     pub spread_inlined_calls: usize,
@@ -739,7 +856,8 @@ impl TraceBuilder {
         }).collect();
         let id = SideExitId(self.trace.exits.len() as u32);
         self.trace.exits.push(SideExit { id, target: ExitTarget::Interpreter(TraceLocation::new(self.source.function, pc)),
-            frames: vec![FrameSnapshot { disposition: FrameDisposition::Existing { depth_from_top: 0 }, writes }], linked_trace: None }); id
+            frames: vec![FrameSnapshot { disposition: FrameDisposition::Existing { depth_from_top: 0 }, writes }], linked_trace: None,
+            virtuals: Vec::new() }); id
     }
     /// Install a watchdog exit at the logical loop header. The snapshot is taken
     /// after recording the iteration, so it contains exactly the values that a
@@ -770,6 +888,7 @@ impl TraceBuilder {
                 writes,
             }],
             linked_trace: None,
+            virtuals: Vec::new(),
         });
         self.trace.native_budget_exit = Some(id);
         id
@@ -1056,6 +1175,16 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
                     errors.push("structural map PIC slot exceeds runtime slot width".into());
                 }
             }
+            TraceInst::NewObject { kind, fields, .. } => {
+                if fields.len() != kind.slots() || kind.slots() > TRACE_OBJECT_MAX_SLOTS {
+                    errors.push("NewObject field count does not match its layout".into());
+                }
+                if fields.iter().any(|field| {
+                    t.value(t.canonical_value(*field)).is_some_and(|value| value.rep != TraceRep::Tagged)
+                }) {
+                    errors.push("NewObject fields must be tagged values".into());
+                }
+            }
             TraceInst::HeapMapGetShaped { expected_key, slot, .. }
             | TraceInst::HeapMapSetShaped { expected_key, slot, .. } => {
                 if expected_key.len() > 64 {
@@ -1107,11 +1236,25 @@ pub fn verify_trace(t: &Trace) -> Result<(), Vec<String>> {
     };
     let check_exit = |id: SideExitId, available: &[bool], errors: &mut Vec<String>| {
         if let Some(exit) = t.exits.get(id.0 as usize) {
-            for frame in &exit.frames { for write in &frame.writes {
-                if let SnapshotValue::Value(v) = write.value {
-                    if !is_available(v, available) { errors.push(format!("exit {id:?} uses unavailable value {v:?}")); }
-                }
-            }}
+            exit.for_each_value(|v| {
+                if !is_available(v, available) { errors.push(format!("exit {id:?} uses unavailable value {v:?}")); }
+            });
+            let virtual_ok = |value: &SnapshotValue| match *value {
+                SnapshotValue::Virtual(index) => (index as usize) < exit.virtuals.len(),
+                _ => true,
+            };
+            let writes_ok = exit.frames.iter().flat_map(|frame| &frame.writes).all(|write| virtual_ok(&write.value));
+            let objects_ok = exit.virtuals.iter().all(|object| {
+                object.fields.len() == object.kind.slots()
+                    && object.kind.slots() <= TRACE_OBJECT_MAX_SLOTS
+                    && object.values().all(virtual_ok)
+                    && object.initial.is_none_or(|(flag, initial)| {
+                        !matches!(flag, SnapshotValue::Virtual(_)) && !matches!(initial, SnapshotValue::Virtual(_))
+                    })
+            });
+            if !writes_ok || !objects_ok {
+                errors.push(format!("exit {id:?} has an invalid virtual object"));
+            }
         } else { errors.push(format!("unknown exit {id:?}")); }
     };
     // Entry guards and snapshots cannot depend on loop-body values or phis.

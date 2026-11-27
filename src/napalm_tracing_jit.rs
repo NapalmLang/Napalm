@@ -78,7 +78,7 @@ use crate::napalm_trace_ir::{
     SnapshotValue, SideExit, SideExitId, Trace, TraceAnchor, TraceClass,
     TraceConstant, TraceHeapObjectKind, TraceId, TraceInst, TraceKind, TraceLocation, TraceShapeSlot,
     TraceRep, TraceSwitchGuard, TraceMathOp, TraceTerminator, TraceType, TraceValueId,
-    TraceValueOrigin,
+    TraceValueOrigin, TraceObjectKind, TraceVirtualObject, TRACE_OBJECT_MAX_SLOTS,
 };
 
 // =============================================================================
@@ -456,7 +456,21 @@ pub struct TraceActivation {
     /// Returns 0 once pushed; nonzero, with nothing changed, when the push needs
     /// the baseline Invoke (not a plain List, contract violation, shared list).
     pub list_push: NativeListPushFn,
+    /// `TraceInst::NewObject`: allocate from the TLAB without a safepoint.
+    /// Arguments: runtime, kind tag (0 shaped Map, 1 instance), relocated
+    /// shape id / class key, slot count, pointer to the tagged slot values.
+    /// Returns the new tagged object, or 0 (nothing allocated) to side-exit.
+    pub new_object: NativeNewObjectFn,
+    /// `TRACE_EXIT_VIRTUAL_WORDS` words, written only by native side exits that
+    /// materialize sunk objects (see `ExitVirtualWord`). Owned by the manager,
+    /// so entering a trace never initializes them. Not a GC root: Rust consumes
+    /// them before any safepoint. (`NewObject` stages its slot values in
+    /// `direct_call_args`: the allocation helper cannot collect.)
+    pub exit_virtual_words: *mut u64,
 }
+
+/// Fallback `new_object` helper: always side-exits to the interpreter.
+unsafe extern "C" fn unavailable_new_object(_: *mut c_void, _: u32, _: u64, _: u32, _: *const u64) -> u64 { 0 }
 
 /// Default `tier_up_pending` target when no upgraded tier exists.
 static NO_TIER_UP_PENDING: AtomicU32 = AtomicU32::new(0);
@@ -498,6 +512,8 @@ impl TraceActivation {
             factory_probe: inputs.factory_probe,
             factory_commit: inputs.factory_commit,
             list_push: inputs.list_push,
+            new_object: unavailable_new_object,
+            exit_virtual_words: std::ptr::null_mut(),
         }
     }
 
@@ -535,6 +551,41 @@ pub type NativeFactoryProbeFn = unsafe extern "C" fn(*mut TraceActivation, u32, 
 pub type NativeFactoryCommitFn = unsafe extern "C" fn(*mut TraceActivation, u32, u32, u32, u64) -> u32;
 /// `(runtime, list word, value word) -> status`, see `TraceActivation::list_push`.
 pub type NativeListPushFn = unsafe extern "C" fn(*mut c_void, u64, u64) -> u32;
+pub type NativeNewObjectFn = unsafe extern "C" fn(*mut c_void, u32, u64, u32, *const u64) -> u64;
+
+/// `TraceActivation::new_object` kind tags.
+pub const TRACE_NEW_OBJECT_SHAPED_MAP: u32 = 0;
+pub const TRACE_NEW_OBJECT_INSTANCE: u32 = 1;
+
+/// What the trace may allocate for one allocating bytecode.
+#[derive(Clone, Debug)]
+pub struct TraceObjectLayout {
+    pub kind: TraceObjectKind,
+    /// Dense slot of each operand value, in bytecode operand order. Empty for
+    /// objects created with all-null slots (instance shells, empty objects,
+    /// NewObjectShape).
+    pub operand_slots: smallvec::SmallVec<[u8; TRACE_OBJECT_MAX_SLOTS]>,
+}
+
+/// One field of an object materialized on a side exit.
+#[derive(Clone, Copy, Debug)]
+pub enum TraceMaterializedField {
+    Word(RegisterWord),
+    /// Another object of the same exit (index into the request).
+    Object(u32),
+}
+
+/// A sunk object to allocate on a side exit. `id` is the VM-local shape id or
+/// class key read back from the exit's relocated binding.
+#[derive(Clone, Debug)]
+pub struct TraceMaterializedObject {
+    pub kind: TraceObjectKind,
+    pub id: u64,
+    pub fields: smallvec::SmallVec<[TraceMaterializedField; TRACE_OBJECT_MAX_SLOTS]>,
+    /// Already-existing object to return instead of allocating (a carried
+    /// object in its first iteration).
+    pub existing: Option<RegisterWord>,
+}
 
 /// For executables: call once at startup. Background LLVM compiler workers are
 /// then detached (not joined) when a VM is dropped, so program exit never waits
@@ -718,6 +769,27 @@ pub trait TraceRuntime {
     fn trace_value_satisfies_pure_type(&self, _value: RegisterWord, _ty: &Type) -> bool { false }
 
     fn trace_method_epoch(&self) -> u64 { 0 }
+
+    /// Native helper behind `TraceInst::NewObject` (see `TraceActivation::new_object`).
+    /// `None` keeps the fallback, which always side-exits.
+    fn trace_new_object_helper(&self) -> Option<NativeNewObjectFn> { None }
+
+    /// Layout of the object an allocating bytecode at `location` creates, when
+    /// the trace may allocate it itself (`TraceInst::NewObject`): a small
+    /// literal with stable keys, an empty object, or a class instance shell.
+    /// The returned slots map each operand (in bytecode order) to its dense slot.
+    fn trace_object_layout(&self, _location: TraceLocation) -> Option<TraceObjectLayout> { None }
+
+    /// Allocate the sunk objects of one side exit, in order, and return their
+    /// tagged words. Every frame write of the exit has already happened, so the
+    /// frame is a precise root set; the field words must be rooted by the
+    /// implementation across its own allocations.
+    fn trace_materialize_objects(
+        &mut self,
+        _objects: &[TraceMaterializedObject],
+    ) -> Result<Vec<RegisterWord>, Self::RuntimeError> {
+        Err(self.trace_unsupported_constant_error(TraceConstant::Null))
+    }
 
     /// Observe a prepared AllocMap + MapSet small-literal superinstruction.
     /// The recorder still validates the baseline bytecodes individually, while
@@ -1117,6 +1189,10 @@ pub struct TracingJitOptions {
     /// the synchronous path. Off in unit tests for determinism
     /// (`NAPALM_CRANELIFT_ASYNC` forces it on, `NAPALM_CRANELIFT_SYNC` off).
     pub cranelift_background_compile: bool,
+    /// Record allocating bytecodes as `TraceInst::NewObject` (TLAB fast path,
+    /// sinkable) instead of factory runtime boundaries. `NAPALM_TRACE_ALLOC=0`
+    /// disables it (A/B measurements).
+    pub trace_allocation: bool,
 }
 
 /// LLVM pass pipeline tuned for traces. A trace is one call-free function whose
@@ -1198,6 +1274,7 @@ impl Default for TracingJitOptions {
             llvm_dump_ir: std::env::var_os("NAPALM_LLVM_DUMP").is_some(),
             cranelift_background_compile: std::env::var_os("NAPALM_CRANELIFT_SYNC").is_none()
                 && (!cfg!(test) || std::env::var_os("NAPALM_CRANELIFT_ASYNC").is_some()),
+            trace_allocation: std::env::var("NAPALM_TRACE_ALLOC").ok().as_deref() != Some("0"),
         }
     }
 }
@@ -1205,6 +1282,8 @@ impl Default for TracingJitOptions {
 #[derive(Clone, Debug, Default)]
 pub struct TracingJitStats {
     pub inlined_calls: u64,
+    /// Trace allocations removed by allocation sinking.
+    pub sunk_allocations: u64,
     pub devirtualized_calls: u64,
     pub spread_inlined_calls: u64,
     pub spread_direct_calls: u64,
@@ -1229,6 +1308,8 @@ pub struct TracingJitStats {
     pub traces_compiled: u64,
     pub native_entries: u64,
     pub side_exits: u64,
+    /// Sunk allocations materialized by side exits.
+    pub materialized_objects: u64,
     pub native_budget_exits: u64,
     /// Total complete loop iterations executed inside native traces.
     pub native_iterations: u64,
@@ -1477,6 +1558,8 @@ fn decode_at(
             | Opcode::CallForeign
             | Opcode::InvokeMethodDirect
             | Opcode::NewClassInstance
+            | Opcode::NewInterfaceOrTypeObject
+            | Opcode::NewObjectWithProperties
     ) {
         let count = first.c() as usize;
         args.reserve(count);
@@ -2189,6 +2272,53 @@ impl<'a> TraceRecorder<'a> {
         Ok(ExpectedStep::Runtime { terminal: false })
     }
 
+    /// Allocate the object of a literal/instance-shell bytecode inside the
+    /// trace (`TraceInst::NewObject`): no runtime boundary, so surrounding SSA
+    /// and loop phis survive, and allocation sinking can remove it entirely.
+    /// Returns the allocated value; `None` when the runtime cannot describe the
+    /// object's layout (the caller keeps the factory/runtime path).
+    fn emit_new_object<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        exit: Option<SideExitId>,
+    ) -> Result<Option<TraceValueId>, RecordingAbort> {
+        let Some(layout) = runtime.trace_object_layout(op.location) else { return Ok(None) };
+        if !layout.operand_slots.is_empty() && layout.operand_slots.len() != op.args.len() {
+            return Ok(None);
+        }
+        let null = builder.constant(TraceConstant::Null);
+        let mut fields = vec![null; layout.kind.slots()];
+        // Source order: a duplicate key keeps its last value.
+        for (&slot, reg) in layout.operand_slots.iter().zip(&op.args) {
+            let value = self.read_gpr(builder, reg.0, TraceType::Any, TraceRep::Tagged)?;
+            *fields.get_mut(slot as usize).ok_or(RecordingAbort::UnsupportedOpcode(op.opcode))? = value;
+        }
+        let exit = exit.unwrap_or_else(|| builder.add_side_exit(ExitReason::GuardValue, op.location.pc));
+        let object = builder.emit1(
+            TraceInst::NewObject { kind: layout.kind, fields, exit },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        Ok(Some(object))
+    }
+
+    /// Literal factories (`{a, b}`, empty and shape objects) as `NewObject`.
+    fn record_new_object<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        op: &RecordedOp,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+    ) -> Result<Option<ExpectedStep>, RecordingAbort> {
+        if !self.options.trace_allocation || op.next_pc.0 & TRACE_RUNTIME_MODE_MASK != 0 {
+            return Ok(None);
+        }
+        let Some(object) = self.emit_new_object(runtime, op, builder, None)? else { return Ok(None) };
+        self.write_gpr(builder, op.a, object);
+        Ok(Some(ExpectedStep::Exact(TraceLocation::new(op.location.function, op.next_pc))))
+    }
+
     /// NewClassInstance as *allocation + inlined constructor*. The descriptor
     /// fixes the exact class, hence its complete (relocated) field layout and
     /// field contracts. The allocation is one native-factory runtime leaf that
@@ -2220,25 +2350,45 @@ impl<'a> TraceRecorder<'a> {
         {
             return Ok(None);
         }
-        let used = builder.trace().nodes.iter()
-            .filter(|node| matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }))
-            .count();
-        if used >= MAX_RUNTIME_GC_LEAF_OPS_PER_TRACE {
-            return Ok(None);
+        let checkpoint = builder.clone();
+        // Trace-allocated shell (sinkable, no runtime boundary): any failure,
+        // including the allocation's own TLAB exit, replays this PC.
+        let native = if self.options.trace_allocation {
+            self.emit_new_object(runtime, op, builder, None)?
+        } else {
+            None
+        };
+        if native.is_none() {
+            let used = builder.trace().nodes.iter()
+                .filter(|node| matches!(node.kind, TraceInst::Runtime { .. } | TraceInst::RuntimeCall { .. }))
+                .count();
+            if used >= MAX_RUNTIME_GC_LEAF_OPS_PER_TRACE {
+                return Ok(None);
+            }
         }
 
         let Some(constructor) = *constructor else {
+            if let Some(instance) = native {
+                self.write_gpr(builder, op.a, instance);
+                return Ok(Some(ExpectedStep::Exact(TraceLocation::new(op.location.function, op.next_pc))));
+            }
             // No constructor: the factory leaf completes the opcode.
             builder.runtime_gc_leaf(op.location, BytecodePc(op.next_pc.0 | TRACE_RUNTIME_MODE_OBJECT_FACTORY));
             builder.reload_slot_after_runtime(FrameSlot::General(Reg(op.a)), TraceType::Any, TraceRep::Tagged);
             return Ok(Some(ExpectedStep::Runtime { terminal: false }));
         };
 
-        let checkpoint = builder.clone();
-        // Allocate-only: continuation == this PC (the VM does not advance).
-        builder.runtime_gc_leaf(op.location, BytecodePc(op.location.pc.0 | TRACE_RUNTIME_MODE_OBJECT_FACTORY));
-        let instance = builder.reload_slot_after_runtime(
-            FrameSlot::General(Reg(op.a)), TraceType::Any, TraceRep::Tagged);
+        let instance = match native {
+            Some(instance) => {
+                self.write_gpr(builder, op.a, instance);
+                instance
+            }
+            None => {
+                // Allocate-only: continuation == this PC (the VM does not advance).
+                builder.runtime_gc_leaf(op.location, BytecodePc(op.location.pc.0 | TRACE_RUNTIME_MODE_OBJECT_FACTORY));
+                builder.reload_slot_after_runtime(FrameSlot::General(Reg(op.a)), TraceType::Any, TraceRep::Tagged)
+            }
+        };
 
         let mut call = op.clone();
         call.opcode = Opcode::CallDirect;
@@ -6507,16 +6657,22 @@ impl<'a> TraceRecorder<'a> {
                 op, builder, TRACE_RUNTIME_MODE_OBJECT_FACTORY,
                 &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
             ),
-            // An empty Map gains nothing from the probe + TLAB + commit protocol
-            // (two helper calls): keep AllocMap's single runtime leaf.
-            NewObjectEmpty => self.runtime_gc_leaf(
-                op, builder, &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
-            ),
+            NewObjectEmpty => match self.record_new_object(runtime, op, builder)? {
+                Some(step) => Ok(step),
+                // An empty Map gains nothing from the probe + TLAB + commit
+                // protocol (two helper calls): keep AllocMap's runtime leaf.
+                None => self.runtime_gc_leaf(
+                    op, builder, &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                ),
+            },
             NewInterfaceOrTypeObject | NewObjectShape
-            | NewObjectWithProperties => self.runtime_gc_specialized(
-                op, builder, TRACE_RUNTIME_MODE_OBJECT_FACTORY,
-                &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
-            ),
+            | NewObjectWithProperties => match self.record_new_object(runtime, op, builder)? {
+                Some(step) => Ok(step),
+                None => self.runtime_gc_specialized(
+                    op, builder, TRACE_RUNTIME_MODE_OBJECT_FACTORY,
+                    &[(Reg(op.a), TraceType::Any, TraceRep::Tagged)],
+                ),
+            },
             NewClassInstance => {
                 if let Some(step) = self.record_new_class_instance(runtime, program, function, op, builder)? {
                     return Ok(step);
@@ -7163,6 +7319,46 @@ fn cmp_from_opcode(opcode: Opcode) -> CmpKind {
 enum ExitWriteSource {
     Constant(TraceConstant),
     Dynamic(u16),
+    /// A sunk object (index into the exit's `virtuals`), written by Rust after
+    /// materialization.
+    Virtual(u32),
+}
+
+/// One word a native exit stores into `TraceActivation::exit_virtual_words`
+/// for Rust to materialize sunk objects from.
+#[derive(Clone, Copy, Debug)]
+enum ExitVirtualWord {
+    /// The VM-local shape id / class key of the object (relocated binding).
+    Kind(TraceObjectKind),
+    /// A field value, materialized as a tagged word (`dynamic_values` index).
+    Dynamic(u16),
+}
+
+/// Words per side exit available for sunk-object materialization.
+pub const TRACE_EXIT_VIRTUAL_WORDS: usize = 64;
+
+/// Binding that relocates the layout id of a trace-allocated object.
+fn object_kind_binding(kind: TraceObjectKind) -> (VmBindingKind, u64) {
+    match kind {
+        TraceObjectKind::ShapedMap { shape, .. } => (VmBindingKind::ShapeId, shape as u64),
+        TraceObjectKind::Instance { class, .. } => (VmBindingKind::ClassKey, class),
+    }
+}
+
+/// Start of each sunk object's words in `exit_virtual_words`: the relocated
+/// kind id, then one word per field (unused for Constant/Virtual fields).
+pub(crate) fn virtual_word_bases(virtuals: &[TraceVirtualObject]) -> smallvec::SmallVec<[usize; 4]> {
+    let mut next = 0usize;
+    virtuals.iter().map(|object| {
+        let base = next;
+        next += object.words();
+        base
+    }).collect()
+}
+
+/// Total `exit_virtual_words` an exit with these sunk objects needs.
+pub(crate) fn virtual_word_count(virtuals: &[TraceVirtualObject]) -> usize {
+    virtuals.iter().map(TraceVirtualObject::words).sum()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7185,8 +7381,12 @@ struct CompiledExitPlan {
     target: ExitTarget,
     writes: Vec<CompiledExitWrite>,
     dynamic_values: Vec<CompiledExitValue>,
+    /// Words stored for sunk-object materialization: (index into
+    /// `TraceActivation::exit_virtual_words`, source).
+    virtual_words: Vec<(u16, ExitVirtualWord)>,
     /// Runtime-owned String/BuiltinClass constants cannot be reconstructed by
     /// generated code, so exits containing them keep manager-level stitching.
+    /// Neither can sunk objects: allocating them needs the VM.
     native_linkable: bool,
 }
 
@@ -7216,32 +7416,29 @@ impl CompiledExitPlan {
         let mut dynamic_values = Vec::<CompiledExitValue>::new();
         let mut dynamic_index = HashMap::<(TraceValueId, TraceRep), u16>::default();
         let mut writes = Vec::with_capacity(frame.writes.len());
+        let mut dynamic = |value: TraceValueId, target_rep: TraceRep| -> Result<u16, TracingJitError> {
+            let value = trace.canonical_value(value);
+            let key = (value, target_rep);
+            if let Some(index) = dynamic_index.get(&key).copied() {
+                return Ok(index);
+            }
+            if dynamic_values.len() >= MAX_TRACE_EXIT_VALUES {
+                return Err(TracingJitError::CraneliftLowering {
+                    trace: trace.id,
+                    message: "side exit exceeds TraceActivation exit buffer".to_owned(),
+                });
+            }
+            let index = dynamic_values.len() as u16;
+            dynamic_values.push(CompiledExitValue { value, target_rep });
+            dynamic_index.insert(key, index);
+            Ok(index)
+        };
 
         for write in &frame.writes {
             let source = match write.value {
                 SnapshotValue::Constant(constant) => ExitWriteSource::Constant(constant),
-                SnapshotValue::Value(value) => {
-                    let value = trace.canonical_value(value);
-                    let key = (value, write.target_rep);
-                    let index = if let Some(index) = dynamic_index.get(&key).copied() {
-                        index
-                    } else {
-                        if dynamic_values.len() >= MAX_TRACE_EXIT_VALUES {
-                            return Err(TracingJitError::CraneliftLowering {
-                                trace: trace.id,
-                                message: "side exit exceeds TraceActivation exit buffer".to_owned(),
-                            });
-                        }
-                        let index = dynamic_values.len() as u16;
-                        dynamic_values.push(CompiledExitValue {
-                            value,
-                            target_rep: write.target_rep,
-                        });
-                        dynamic_index.insert(key, index);
-                        index
-                    };
-                    ExitWriteSource::Dynamic(index)
-                }
+                SnapshotValue::Value(value) => ExitWriteSource::Dynamic(dynamic(value, write.target_rep)?),
+                SnapshotValue::Virtual(index) => ExitWriteSource::Virtual(index),
             };
 
             writes.push(CompiledExitWrite {
@@ -7252,7 +7449,26 @@ impl CompiledExitPlan {
             });
         }
 
-        let native_linkable = writes.iter().all(|write| {
+        if virtual_word_count(&exit.virtuals) > TRACE_EXIT_VIRTUAL_WORDS {
+            return Err(TracingJitError::CraneliftLowering {
+                trace: trace.id,
+                message: "side exit exceeds the sunk-object materialization buffer".to_owned(),
+            });
+        }
+        let mut virtual_words = Vec::new();
+        for (object, base) in exit.virtuals.iter().zip(virtual_word_bases(&exit.virtuals)) {
+            virtual_words.push((base as u16, ExitVirtualWord::Kind(object.kind)));
+            // Fields, then (carried objects) the first-iteration flag and the
+            // object the loop was entered with.
+            for (word, value) in object.values().enumerate() {
+                if let SnapshotValue::Value(value) = *value {
+                    let index = dynamic(value, TraceRep::Tagged)?;
+                    virtual_words.push(((base + 1 + word) as u16, ExitVirtualWord::Dynamic(index)));
+                }
+            }
+        }
+
+        let native_linkable = exit.virtuals.is_empty() && writes.iter().all(|write| {
             !matches!(
                 write.source,
                 ExitWriteSource::Constant(TraceConstant::String(_) | TraceConstant::BuiltinClass(_))
@@ -7264,6 +7480,7 @@ impl CompiledExitPlan {
             target: exit.target,
             writes,
             dynamic_values,
+            virtual_words,
             native_linkable,
         })
     }
@@ -7814,6 +8031,8 @@ struct CraneliftLoweringState<'a, 'p> {
     heap_barrier_signature: codegen::ir::SigRef,
     /// `TraceActivation::list_push`: (runtime, list, value) -> status.
     list_push_signature: codegen::ir::SigRef,
+    /// `TraceActivation::new_object`: (runtime, tag, id, count, values) -> object.
+    new_object_signature: codegen::ir::SigRef,
     /// Direct CLIF references to JITModule-imported scalar helpers.
     scalar_helper_refs: SmallMap16<usize, codegen::ir::FuncRef>,
     values: &'p mut [Option<Value>],
@@ -7930,14 +8149,11 @@ fn trace_exit_available_in_preheader(
     preheader_nodes: &[bool],
 ) -> bool {
     let Some(exit) = trace.exits.get(exit.0 as usize) else { return false; };
-    exit.frames.iter().all(|frame| {
-        frame.writes.iter().all(|write| match write.value {
-            SnapshotValue::Constant(_) => true,
-            SnapshotValue::Value(value) => {
-                trace_value_available_in_preheader(trace, value, preheader_nodes)
-            }
-        })
-    })
+    let mut available = true;
+    exit.for_each_value(|value| {
+        available &= trace_value_available_in_preheader(trace, value, preheader_nodes);
+    });
+    available
 }
 
 fn push_vm_binding(
@@ -7987,11 +8203,19 @@ fn collect_vm_bindings(
                 }
             }
         }
+        for object in &exit.virtuals {
+            let (kind, raw) = object_kind_binding(object.kind);
+            add(kind, raw);
+        }
     }
 
     for node in &trace.nodes {
         use TraceInst::*;
         match &node.kind {
+            NewObject { kind, .. } => {
+                let (kind, raw) = object_kind_binding(*kind);
+                add(kind, raw);
+            }
             Runtime { direct_call: Some(call), .. } => {
                 add(VmBindingKind::PreparedFunctionIndex, call.function_index as u64)
             }
@@ -8257,6 +8481,7 @@ fn region_pass(trace: &Trace, plan: &CompiledExitPlan, slot: FrameSlot, rep: Tra
         return None;
     }
     match write.source {
+        ExitWriteSource::Virtual(_) => None,
         ExitWriteSource::Dynamic(index) => {
             let dynamic = plan.dynamic_values.get(index as usize)?;
             let mut value = trace.canonical_value(dynamic.value);
@@ -8368,6 +8593,14 @@ fn compile_trace_function(
     list_push_signature.params.push(AbiParam::new(types::I64));
     list_push_signature.returns.push(AbiParam::new(types::I32));
 
+    let mut new_object_signature = module.make_signature();
+    new_object_signature.params.push(AbiParam::new(pointer_type));
+    new_object_signature.params.push(AbiParam::new(types::I32));
+    new_object_signature.params.push(AbiParam::new(types::I64));
+    new_object_signature.params.push(AbiParam::new(types::I32));
+    new_object_signature.params.push(AbiParam::new(pointer_type));
+    new_object_signature.returns.push(AbiParam::new(types::I64));
+
     context.func.signature = signature;
     context.func.name = UserFuncName::user(0, function.as_u32());
     context.set_disasm(options.cranelift_dump_disassembly);
@@ -8386,6 +8619,7 @@ fn compile_trace_function(
         let factory_commit_signature = builder.import_signature(factory_commit_signature);
         let heap_barrier_signature = builder.import_signature(heap_barrier_signature);
         let list_push_signature = builder.import_signature(list_push_signature);
+        let new_object_signature = builder.import_signature(new_object_signature);
         let scalar_helper_refs: SmallMap16<usize, codegen::ir::FuncRef> = scalar_helpers
             .iter()
             .map(|(&address, &id)| (address, module.declare_func_in_func(id, builder.func)))
@@ -8497,6 +8731,7 @@ fn compile_trace_function(
             factory_commit_signature,
             heap_barrier_signature,
             list_push_signature,
+            new_object_signature,
             scalar_helper_refs,
         };
         let mut builder = Some(builder);
@@ -8604,6 +8839,7 @@ struct CraneliftFunctionShared {
     factory_commit_signature: codegen::ir::SigRef,
     heap_barrier_signature: codegen::ir::SigRef,
     list_push_signature: codegen::ir::SigRef,
+    new_object_signature: codegen::ir::SigRef,
     scalar_helper_refs: SmallMap16<usize, codegen::ir::FuncRef>,
 }
 
@@ -8628,6 +8864,7 @@ fn new_lowering_state<'a, 'p>(
         factory_commit_signature: shared.factory_commit_signature,
         heap_barrier_signature: shared.heap_barrier_signature,
         list_push_signature: shared.list_push_signature,
+        new_object_signature: shared.new_object_signature,
         scalar_helper_refs: shared.scalar_helper_refs.clone(),
         values: arena.alloc_slice_fill_copy(member.trace.values.len(), None),
         heap_addresses: arena.alloc_slice_fill_copy(member.trace.values.len(), None),
@@ -10032,10 +10269,67 @@ impl CraneliftLoweringState<'_, '_> {
                     let value = self.lower_constant(constant)?;
                     self.materialize_exit_word(value, source_rep, write.target_rep)?
                 }
+                ExitWriteSource::Virtual(_) => {
+                    return Err(self.error("sunk object reached a native trace link"));
+                }
             };
             self.store_frame_word(write.slot, word);
         }
         Ok(())
+    }
+
+    /// Stage the words Rust needs to materialize this exit's sunk objects.
+    /// Runs in a cold exit block, so nothing loaded here may enter a cache.
+    fn store_exit_virtual_words(&mut self, plan: &CompiledExitPlan) -> Result<(), TracingJitError> {
+        if plan.virtual_words.is_empty() {
+            return Ok(());
+        }
+        let buffer = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            self.activation,
+            offset_of!(TraceActivation, exit_virtual_words) as i32,
+        );
+        for &(index, word) in &plan.virtual_words {
+            let value = match word {
+                ExitVirtualWord::Kind(kind) => {
+                    let (binding, raw) = object_kind_binding(kind);
+                    self.vm_binding_word_uncached(binding, raw)?
+                }
+                ExitVirtualWord::Dynamic(dynamic) => {
+                    let dynamic = plan
+                        .dynamic_values
+                        .get(dynamic as usize)
+                        .copied()
+                        .ok_or_else(|| self.error("side-exit dynamic value index out of bounds"))?;
+                    let source_rep = self.value_rep(dynamic.value)?;
+                    let value = self.lower_value(dynamic.value)?;
+                    self.materialize_exit_word(value, source_rep, TraceRep::Tagged)?
+                }
+            };
+            self.builder.ins().store(
+                Self::trusted_mem(),
+                value,
+                buffer,
+                index as i32 * std::mem::size_of::<u64>() as i32,
+            );
+        }
+        Ok(())
+    }
+
+    /// `vm_binding_word` for code off the main path: no cached base or word.
+    fn vm_binding_word_uncached(&mut self, kind: VmBindingKind, raw: u64) -> Result<Value, TracingJitError> {
+        let slot = *self
+            .vm_binding_slots
+            .get(&VmBindingKey::new(kind, raw))
+            .ok_or_else(|| self.error(format!("missing VM binding {kind:?} for {raw:#x}")))?;
+        let table = self.builder.ins().load(
+            self.pointer_type,
+            Self::trusted_mem(),
+            self.activation,
+            offset_of!(TraceActivation, vm_bindings) as i32,
+        );
+        Ok(self.builder.ins().load(types::I64, Self::trusted_mem(), table, slot as i32 * 8))
     }
 
     /// A native link to another member of this region: materialize the child's
@@ -10176,6 +10470,7 @@ impl CraneliftLoweringState<'_, '_> {
             let word = self.materialize_exit_word(value, source_rep, dynamic.target_rep)?;
             self.store_frame_word(write.slot, word);
         }
+        self.store_exit_virtual_words(plan)?;
 
         let id = self
             .builder
@@ -12119,6 +12414,48 @@ impl CraneliftLoweringState<'_, '_> {
                 );
             }
 
+            NewObject { kind, fields, exit } => {
+                let result = one_result(node)?;
+                let values = offset_of!(TraceActivation, direct_call_args) as i32;
+                for (index, field) in fields.iter().enumerate() {
+                    let rep = self.value_rep(*field)?;
+                    let value = self.lower_value(*field)?;
+                    let word = self.normalize_to_word(value, rep);
+                    self.builder.ins().store(
+                        Self::trusted_mem(),
+                        word,
+                        self.activation,
+                        values + (index * std::mem::size_of::<u64>()) as i32,
+                    );
+                }
+                let (binding, raw) = object_kind_binding(*kind);
+                let id = self.vm_binding_word(binding, raw)?;
+                let tag = match kind {
+                    TraceObjectKind::ShapedMap { .. } => TRACE_NEW_OBJECT_SHAPED_MAP,
+                    TraceObjectKind::Instance { .. } => TRACE_NEW_OBJECT_INSTANCE,
+                };
+                let tag = self.builder.ins().iconst(types::I32, tag as i64);
+                let count = self.builder.ins().iconst(types::I32, fields.len() as i64);
+                let pointer = self.builder.ins().iadd_imm(self.activation, values as i64);
+                let callee = self.builder.ins().load(
+                    self.pointer_type,
+                    Self::trusted_mem(),
+                    self.activation,
+                    offset_of!(TraceActivation, new_object) as i32,
+                );
+                let runtime = self.runtime_context();
+                let call = self.builder.ins().call_indirect(
+                    self.new_object_signature,
+                    callee,
+                    &[runtime, tag, id, count, pointer],
+                );
+                let object = self.builder.inst_results(call)[0];
+                // Zero: nothing was allocated; the exit replays the bytecode.
+                let failed = self.builder.ins().icmp_imm(IntCC::Equal, object, 0);
+                self.emit_side_exit(*exit, failed)?;
+                self.cache_value(result, object);
+            }
+
             HeapListPush { list, value, exit } => {
                 let tagged_list = self.lower_value(*list)?;
                 let tagged_value = self.lower_value(*value)?;
@@ -13058,6 +13395,8 @@ pub struct TracingJit {
     /// dispatcher invocation, so pointers installed in TraceActivation stay valid.
     entry_table: Vec<usize>,
     link_table_ptrs: Vec<usize>,
+    /// Target of `TraceActivation::exit_virtual_words` (sunk-object exits).
+    exit_virtual_words: Box<[u64; TRACE_EXIT_VIRTUAL_WORDS]>,
     /// Parallel TraceId -> per-worker relocation table. Even when machine code is
     /// shared, every isolated worker keeps these VM-local addresses private.
     vm_binding_table_ptrs: Vec<usize>,
@@ -13139,11 +13478,18 @@ fn dump_trace(trace: &crate::napalm_trace_ir::Trace) {
                 for write in &frame.writes {
                     let rep = match write.value {
                         SnapshotValue::Value(value) => trace.value(trace.canonical_value(value)).map(|value| value.rep),
-                        SnapshotValue::Constant(_) => None,
+                        SnapshotValue::Constant(_) | SnapshotValue::Virtual(_) => None,
                     };
                     eprintln!("  exit write {:?} <- {:?} (source rep {:?}, target {:?})", write.slot, write.value, rep, write.target_rep);
                 }
             }
+        }
+    }
+    let virtual_exits: Vec<_> = trace.exits.iter().filter(|exit| !exit.virtuals.is_empty()).collect();
+    if !virtual_exits.is_empty() {
+        eprintln!("  {} exit(s) materialize sunk objects", virtual_exits.len());
+        for exit in virtual_exits.iter().take(3) {
+            eprintln!("  exit {:?} virtuals {:?}", exit.id, exit.virtuals);
         }
     }
 }
@@ -13189,6 +13535,7 @@ impl TracingJit {
             traces: Vec::new(),
             entry_table: Vec::new(),
             link_table_ptrs: Vec::new(),
+            exit_virtual_words: Box::new([0; TRACE_EXIT_VIRTUAL_WORDS]),
             vm_binding_table_ptrs: Vec::new(),
             next_trace_id: 0,
             stats: TracingJitStats::default(),
@@ -14308,6 +14655,7 @@ impl TracingJit {
                 self.stats.recordings_succeeded += 1;
                 self.stats.recorded_bytecodes += trace.stats.recorded_bytecodes as u64;
                 self.stats.inlined_calls += trace.stats.inlined_calls as u64;
+                self.stats.sunk_allocations += trace.stats.sunk_allocations as u64;
                 self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
                 self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
                 self.stats.spread_direct_calls += trace.stats.spread_direct_calls as u64;
@@ -14615,6 +14963,7 @@ impl TracingJit {
         self.stats.recordings_succeeded += 1;
         self.stats.recorded_bytecodes += trace.stats.recorded_bytecodes as u64;
         self.stats.inlined_calls += trace.stats.inlined_calls as u64;
+        self.stats.sunk_allocations += trace.stats.sunk_allocations as u64;
         self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
         self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
         self.stats.spread_direct_calls += trace.stats.spread_direct_calls as u64;
@@ -14843,6 +15192,10 @@ impl TracingJit {
             }
 
             let mut activation = TraceActivation::new(inputs);
+            if let Some(helper) = runtime.trace_new_object_helper() {
+                activation.new_object = helper;
+            }
+            activation.exit_virtual_words = self.exit_virtual_words.as_mut_ptr();
             activation.method_epoch = runtime.trace_method_epoch();
             activation.trace_entries = self.entry_table.as_ptr();
             activation.trace_link_tables = self.link_table_ptrs.as_ptr();
@@ -15001,6 +15354,7 @@ impl TracingJit {
 
         self.stats.recordings_succeeded = self.stats.recordings_succeeded.saturating_add(1);
         self.stats.inlined_calls += trace.stats.inlined_calls as u64;
+        self.stats.sunk_allocations += trace.stats.sunk_allocations as u64;
         self.stats.devirtualized_calls += trace.stats.devirtualized_calls as u64;
         self.stats.spread_inlined_calls += trace.stats.spread_inlined_calls as u64;
         self.stats.spread_direct_calls += trace.stats.spread_direct_calls as u64;
@@ -15279,6 +15633,65 @@ impl TracingJit {
                 runtime
                     .trace_write_slot(write.slot, value)
                     .map_err(runtime_error)?;
+            }
+
+            // Sunk allocations last: every other frame write is in place, so
+            // the frame is an exact root set while the objects are allocated.
+            let virtuals = compiled
+                .trace
+                .exits
+                .get(exit_index)
+                .map_or(&[][..], |exit| exit.virtuals.as_slice());
+            if !virtuals.is_empty() {
+                if activation.exit_virtual_words.is_null() {
+                    return Err(TracingJitError::InvalidSideExit { trace: trace_id, exit: activation.exit_id });
+                }
+                // SAFETY: the manager owns this buffer for the whole native call
+                // and generated code only wrote it.
+                let words = unsafe {
+                    std::slice::from_raw_parts(activation.exit_virtual_words, TRACE_EXIT_VIRTUAL_WORDS)
+                };
+                let mut objects = Vec::with_capacity(virtuals.len());
+                for (object, base) in virtuals.iter().zip(virtual_word_bases(virtuals)) {
+                    let mut fields = smallvec::SmallVec::new();
+                    let mut read = |index: usize, value: SnapshotValue| -> Result<TraceMaterializedField, TracingJitError> {
+                        Ok(match value {
+                            SnapshotValue::Value(_) => TraceMaterializedField::Word(RegisterWord(words[base + 1 + index])),
+                            SnapshotValue::Constant(constant) => TraceMaterializedField::Word(
+                                runtime.trace_materialize_constant(constant).map_err(runtime_error)?,
+                            ),
+                            SnapshotValue::Virtual(other) => TraceMaterializedField::Object(other),
+                        })
+                    };
+                    for (index, field) in object.fields.iter().enumerate() {
+                        fields.push(read(index, *field)?);
+                    }
+                    // A carried object still in its first iteration is the
+                    // real object the loop was entered with.
+                    let mut existing = None;
+                    if let Some((flag, initial)) = object.initial {
+                        let slots = object.kind.slots();
+                        if let (TraceMaterializedField::Word(flag), TraceMaterializedField::Word(initial)) =
+                            (read(slots, flag)?, read(slots + 1, initial)?)
+                        {
+                            if flag == bool_word(true) {
+                                existing = Some(initial);
+                            }
+                        }
+                    }
+                    objects.push(TraceMaterializedObject { kind: object.kind, id: words[base], fields, existing });
+                }
+                let materialized = runtime.trace_materialize_objects(&objects).map_err(runtime_error)?;
+                for write in &plan.writes {
+                    if let ExitWriteSource::Virtual(index) = write.source {
+                        let word = *materialized.get(index as usize).ok_or_else(|| TracingJitError::InvalidSideExit {
+                            trace: trace_id,
+                            exit: activation.exit_id,
+                        })?;
+                        runtime.trace_write_slot(write.slot, word).map_err(runtime_error)?;
+                    }
+                }
+                self.stats.materialized_objects = self.stats.materialized_objects.saturating_add(objects.len() as u64);
             }
         }
 

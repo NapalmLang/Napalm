@@ -1045,6 +1045,34 @@ impl Mutator {
         })
     }
 
+    /// Reserve a fixed-size object range like the TLAB fast path, refilling the
+    /// TLAB from the Immix space when needed, but never reaching a safepoint:
+    /// `None` when the space cannot satisfy it without a collection (or the
+    /// object is too large for the fixed path). Complete it with
+    /// `finish_fast_fixed_uninitialized`. Native code with unrooted live values
+    /// (JIT allocation slow paths) uses this before falling back to the VM.
+    pub fn reserve_fixed_without_safepoint<const PAYLOAD_BYTES: usize>(&mut self) -> Option<usize> {
+        use mmtk::util::alloc::{AllocationOptions, Allocator};
+        self.check_running();
+        let bytes = size_of::<Header>()
+            .checked_add(PAYLOAD_BYTES)?
+            .checked_add(WORD - 1)?
+            & !(WORD - 1);
+        if bytes > self.max_non_los {
+            return None;
+        }
+        let context = unsafe { self.pointer.as_mut() };
+        let allocator = unsafe {
+            context.allocator_impl_mut_for_semantic::<ImmixAllocator<Binding>>(AllocationSemantics::Default)
+        };
+        let address = allocator.alloc_with_options(bytes, MAX_ALIGNMENT, 0, AllocationOptions {
+            allow_overcommit: false,
+            at_safepoint: false,
+            allow_oom_call: false,
+        });
+        (!address.is_zero()).then(|| address.as_usize())
+    }
+
     /// Complete a fixed-size allocation whose raw address has already been
     /// reserved by generated code from this mutator's Immix TLAB. This function
     /// performs no allocation and no safepoint.
@@ -2012,8 +2040,15 @@ impl vm::Collection<Binding> for Collection {
                 let tls = VMWorkerThread(VMThread(OpaquePointer::from_address(Address::from_ptr(
                     &*token,
                 ))));
-                match context {
+                // A collection that loses a worker can never finish, and every
+                // mutator would wait for it forever: a worker panic is fatal for
+                // the whole process (the panic hook has already reported it).
+                let run = std::panic::AssertUnwindSafe(move || match context {
                     vm::GCThreadContext::Worker(worker) => worker.run(tls, gc().mmtk),
+                });
+                if std::panic::catch_unwind(run).is_err() {
+                    eprintln!("napalm: fatal error in a garbage collector worker; aborting");
+                    std::process::abort();
                 }
             })
             .expect("cannot start GC worker");

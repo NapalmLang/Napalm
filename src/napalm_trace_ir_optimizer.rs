@@ -119,13 +119,7 @@ fn apply_canonical_references(trace: &mut Trace, aliases: &[TraceValueId]) {
         }
     }
     for exit in &mut trace.exits {
-        for frame in &mut exit.frames {
-            for write in &mut frame.writes {
-                if let SnapshotValue::Value(v) = &mut write.value {
-                    resolve(v);
-                }
-            }
-        }
+        exit.for_each_value_mut(resolve);
     }
     for phi in &mut trace.loop_phis {
         resolve(&mut phi.initial);

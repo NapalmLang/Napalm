@@ -590,6 +590,55 @@ fn napalm_whole_function_v2_inlined_bodies_allocate_concatenate_and_store_checke
 }
 
 #[test]
+fn napalm_whole_function_v2_allocates_objects_and_inlines_constructors() {
+    // `new C(..)` and small literals allocate natively (with the constructor
+    // inlined), also inside inlined methods and natively recursive builders;
+    // the same program must work when every native allocation fails and the
+    // op is replayed by the interpreter instead.
+    let source = r#"
+        class V { constructor(x, y) { this.x = x; this.y = y; } add(o) { return new V(this.x + o.x, this.y + o.y); } }
+        function temps(a, b, c) { const t = a.add(b); const u = t.add(c); return u.x + t.y; }
+        function point(i) { const p = {x: i, y: i * 2}; return p.x + p.y; }
+        function tree(d) { if (d == 0) { return new V(1, 2); } const l = tree(d - 1); const r = tree(d - 1); return new V(l.x + r.x, l.y + r.y); }
+        function main() {
+            const a = new V(1, 2); const b = new V(3, 4); const c = new V(5, 6);
+            let total = 0;
+            for (let i = 0; i < 300; i++) {
+                total += temps(a, b, c) + point(i) + tree(4).x;
+                if (i % 50 == 0) System.gc();
+            }
+            return total;
+        }
+        const result = main();
+    "#;
+    let stats = whole_function_only_run(source);
+    assert!(stats.v2_inlined_calls >= 2, "{stats:?}");
+    FORCE_NEW_OBJECT_FAILURE.with(|flag| flag.set(true));
+    let replayed = std::panic::catch_unwind(|| whole_function_only_run(source));
+    FORCE_NEW_OBJECT_FAILURE.with(|flag| flag.set(false));
+    replayed.expect("replaying failed native allocations changed the result");
+}
+
+#[test]
+fn napalm_whole_function_v2_explicit_call_resumes_a_callee_that_bailed_midway() {
+    // `temps` inlined into the recursive `walk` calls `add` explicitly.
+    // Entering `add` already runs it natively; when that run deoptimizes
+    // half-way (its allocation fails after `this`'s register was reused), the
+    // interpreter must finish that frame instead of re-running the native body
+    // from the start on it.
+    let source = r#"
+        class V { constructor(x, y) { this.x = x; this.y = y; } add(o) { return new V(this.x + o.x, this.y + o.y); } }
+        function temps(a, b, c) { const v = a.add(b); return v.x + v.y; }
+        function walk(d, a, b, c) { if (d == 0) { return temps(a, b, c); } return walk(d - 1, a, b, c) + walk(d - 1, a, b, c); }
+        const result = walk(9, new V(1, 2), new V(3, 4), new V(5, 6));
+    "#;
+    FORCE_NEW_OBJECT_FAILURE.with(|flag| flag.set(true));
+    let replayed = std::panic::catch_unwind(|| whole_function_only_run(source));
+    FORCE_NEW_OBJECT_FAILURE.with(|flag| flag.set(false));
+    replayed.expect("an explicit call re-entered a callee frame that had already run");
+}
+
+#[test]
 fn napalm_whole_function_v2_compiles_closure_creation() {
     // Closures created in hot functions (and in their loops) capture values
     // and mutable cells; the captured state must be shared with the frame.

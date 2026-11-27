@@ -28,6 +28,7 @@ pub(super) fn optimize(f: &mut WfFunction) -> Result<(), String> {
             &Parameters,
             &LoopInvariants,
             &MergeBlocks,
+            &AllocationSinking,
             &DeadCode,
             &Snapshots,
         ],
@@ -859,6 +860,30 @@ impl WfOptimization for HeapForward {
                         state.kill_effects();
                         state.fresh_local.push(*result);
                     }
+                    // Runs no code and touches no existing object: nothing is
+                    // invalidated, and the new object's class (or shape) and
+                    // initial slot values are known.
+                    WfInst::NewObject { kind, fields, .. } => {
+                        state.fresh_local.push(*result);
+                        match *kind {
+                            crate::napalm_trace_ir::TraceObjectKind::Instance { class, .. } => {
+                                state.classes.insert(*result, class);
+                                for (slot, &field) in fields.iter().enumerate() {
+                                    let field = aliases[field.0 as usize];
+                                    state.fields.insert((*result, slot as u32), KnownField {
+                                        value: field,
+                                        nonnull: nonnull[field.0 as usize],
+                                    });
+                                }
+                            }
+                            crate::napalm_trace_ir::TraceObjectKind::ShapedMap { shape, .. } => {
+                                state.map_shapes.insert(*result, shape);
+                                for (slot, &field) in fields.iter().enumerate() {
+                                    state.map_slots.insert((*result, shape, slot as u32), aliases[field.0 as usize]);
+                                }
+                            }
+                        }
+                    }
                     WfInst::RuntimeOp { .. }
                     | WfInst::SelfCall { .. }
                     | WfInst::InstanceFieldStoreChecked { .. }
@@ -1469,6 +1494,139 @@ impl WfOptimization for Snapshots {
             *d = remap[d.0 as usize];
         }
         true
+    }
+}
+
+/// Allocation sinking (escape analysis + scalar replacement) of `NewObject`.
+///
+/// An object stays virtual when every use follows its allocation in the same
+/// block and is a field read (`InstanceFieldGet`, `MapPropertyGet`), a store
+/// into one of its own fields (`InstanceFieldSet`) or a class guard that holds
+/// by construction. Reads become the tracked field value; stores and guards
+/// disappear with the allocation. Any other use, including a deoptimization
+/// state that names the object (materialization is not modelled), keeps it.
+/// Temporaries of inlined bodies (`a.add(b).dot(c)`) qualify: their guards
+/// replay the outermost call, whose state predates the object.
+struct AllocationSinking;
+impl WfOptimization for AllocationSinking {
+    fn run(&self, f: &mut WfFunction, _analyses: &mut Analyses) -> bool {
+        use crate::napalm_trace_ir::TraceObjectKind;
+        let count = f.value_types.len();
+        let mut pinned = vec![false; count];
+        for state in &f.deopts {
+            for &(_, value) in state.registers.iter().chain(state.frames.iter().flat_map(|frame| frame.registers.iter())) {
+                pinned[value.0 as usize] = true;
+            }
+        }
+        // Every operand occurrence, to tell handled uses from escapes.
+        let mut uses_count = vec![0usize; count];
+        for block in &f.blocks {
+            for (_, inst) in &block.insts {
+                uses(inst, |v| uses_count[v.0 as usize] += 1);
+            }
+            let terminator = block.terminator.as_ref().unwrap();
+            if let Some(v) = control(terminator) { uses_count[v.0 as usize] += 1; }
+            for edge in edges(terminator) {
+                for v in &edge.args { uses_count[v.0 as usize] += 1; }
+            }
+        }
+        // Values known not to be null (a non-nullable read may forward them).
+        let mut nonnull = vec![false; count];
+        for block in &f.blocks {
+            for (result, inst) in &block.insts {
+                nonnull[result.0 as usize] = match inst {
+                    WfInst::BoxF64(_) | WfInst::BoxBool(_) | WfInst::NewObject { .. } => true,
+                    WfInst::ConstTagged(word) => *word != TAG_NULL,
+                    _ => false,
+                };
+            }
+        }
+        let mut aliases: Vec<WfValue> = (0..count).map(|v| WfValue(v as u32)).collect();
+        let mut sunk: Vec<WfValue> = Vec::new();
+        let mut changed = false;
+        for b in 0..f.blocks.len() {
+            let mut position = 0;
+            while position < f.blocks[b].insts.len() {
+                let (object, WfInst::NewObject { kind, fields, .. }) = f.blocks[b].insts[position].clone() else {
+                    position += 1;
+                    continue;
+                };
+                position += 1;
+                if pinned[object.0 as usize] { continue; }
+                let mut state: Vec<WfValue> = fields.iter().map(|v| aliases[v.0 as usize]).collect();
+                let mut handled = 0usize;
+                let mut loads: Vec<(usize, WfValue)> = Vec::new();
+                let mut dropped: Vec<usize> = Vec::new();
+                let mut escaped = false;
+                for index in position..f.blocks[b].insts.len() {
+                    let (_, inst) = &f.blocks[b].insts[index];
+                    let mut mentions = 0usize;
+                    uses(inst, |v| if *v == object { mentions += 1; });
+                    if mentions == 0 { continue; }
+                    let ok = match (inst, kind) {
+                        (WfInst::InstanceFieldGet { object: o, slot, nullable, .. }, TraceObjectKind::Instance { fields, .. })
+                            if *o == object && (*slot as usize) < fields as usize =>
+                        {
+                            let value = state[*slot as usize];
+                            if *nullable || nonnull[value.0 as usize] { loads.push((index, value)); true } else { false }
+                        }
+                        (WfInst::MapPropertyGet { object: o, entries, .. }, TraceObjectKind::ShapedMap { shape, len }) if *o == object => {
+                            match entries.iter().find(|(s, _)| *s == shape) {
+                                Some(&(_, slot)) if (slot as usize) < len as usize => {
+                                    loads.push((index, state[slot as usize]));
+                                    true
+                                }
+                                _ => false,
+                            }
+                        }
+                        (WfInst::InstanceFieldSet { object: o, value, slot, class_key, .. }, TraceObjectKind::Instance { class, fields })
+                            if *o == object && *value != object && *class_key == class && (*slot as usize) < fields as usize =>
+                        {
+                            state[*slot as usize] = aliases[value.0 as usize];
+                            dropped.push(index);
+                            true
+                        }
+                        (WfInst::GuardClass { value, class: guarded, .. }, TraceObjectKind::Instance { class, .. })
+                            if *value == object && *guarded == class =>
+                        {
+                            dropped.push(index);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !ok { escaped = true; break; }
+                    handled += mentions;
+                }
+                if escaped || handled != uses_count[object.0 as usize] { continue; }
+                // Virtual: forward the reads, drop the rest with the allocation.
+                for &(index, value) in &loads {
+                    let result = f.blocks[b].insts[index].0;
+                    aliases[result.0 as usize] = value;
+                    f.blocks[b].insts[index].1 = WfInst::ConstBool(false);
+                }
+                for &index in &dropped {
+                    f.blocks[b].insts[index].1 = WfInst::ConstBool(false);
+                }
+                sunk.push(object);
+                changed = true;
+            }
+        }
+        if changed {
+            // Forwarded loads: their results now name the field values. Their
+            // placeholder instructions (and the dropped ones) are dead.
+            for v in 0..count {
+                let mut target = aliases[v];
+                while aliases[target.0 as usize] != target { target = aliases[target.0 as usize]; }
+                aliases[v] = target;
+            }
+            let mut removed: Vec<WfValue> = (0..count).filter(|&v| aliases[v] != WfValue(v as u32)).map(|v| WfValue(v as u32)).collect();
+            removed.extend_from_slice(&sunk);
+            rewrite(f, &aliases);
+            for block in &mut f.blocks {
+                block.insts.retain(|(result, _)| !removed.contains(result));
+            }
+        }
+        changed
     }
 }
 

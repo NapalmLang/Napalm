@@ -347,6 +347,14 @@ of helper calls, `NAPALM_WFJIT_OPT=0` skips the IR optimizer and
   backward liveness iterated to a fixpoint. Cranelift lowers it in
   `src/napalm_wfjit_lower.rs`; the IR is designed so that an LLVM lowering can
   consume it as well.
+- **Object allocation and sinking.**
+  - **`NewObject` from SSA operands.** Small literals (`NewObjectWithProperties`, `NewObjectEmpty`, `NewObjectShape`, `NewInterfaceOrTypeObject` without a contract) and `new C()` allocate through `WfInst::NewObject`, using the layout the VM described when the IR was built.
+  - **Constructors are inlined.** Stores into a fresh object of the same build are not effects for the replay rule (an op replay simply allocates again). This lets constructors run inside natively recursive functions too. A constructor frame is never rebuilt, because the interpreter cannot re-enter it through its `new C()` op, so inlining declines when that would be needed. If the constructor cannot be inlined, the root runs the whole op through the generic call path.
+  - **No safepoint.** The helper bumps the TLAB, refills it from the space with MMTk's `at_safepoint: false` option, and deoptimizes (replaying the op) only when a collection is needed.
+  - **`AllocationSinking` pass.** It removes a `NewObject` whose uses all follow it in its block and are field reads, stores into its own fields or class guards that hold by construction. Reads become the tracked field values. Temporaries of inlined calls such as `a.add(b).add(c).dot(a)` qualify.
+  - **Not handled yet.** An object named by a deoptimization state stays allocated: materializing it on deopt is not implemented.
+  - `NAPALM_WFJIT_NEW_OBJECT=0` disables native allocation (A/B measurements).
+- **Dispatch profile from inline caches.** An `Invoke` that was never quickened (for example run by a trace first) uses its runtime inline cache when that cache saw exactly one bytecode target. It is then inlined behind the usual class and method-epoch guards, instead of dispatching at run time.
 - **No register bank.** Napalm GPRs are SSA values. Numbers stay unboxed `f64`,
   `true`/`false` stay unboxed Booleans. NaN is canonicalized only when a value
   becomes a tagged word again.
@@ -506,6 +514,29 @@ The current Trace optimizer includes a broad set of loop/speculation passes, inc
 - dead box/copy cleanup.
 
 The optimizer is careful not to move assumptions across full runtime synchronization boundaries where heap/register state may have changed.
+
+### Trace allocation and allocation sinking
+
+The object-creating super-instructions (`NewObjectWithProperties`, `NewObjectEmpty`, `NewObjectShape`, `NewInterfaceOrTypeObject` without a structural contract) and the `NewClassInstance` shell are recorded as `TraceInst::NewObject`. Literals and `new C()` inside inlined bodies are recorded the same way; their constructor is inlined against the fresh instance. There is no runtime boundary, so surrounding SSA values and loop phis survive. The supported objects are shaped Maps and class instances with at most 4 inline slots.
+
+Native code allocates only through the TLAB fast path, via the non-safepointing `TraceActivation::new_object` helper. When the TLAB is exhausted, the node's side exit replays the allocating bytecode in the interpreter.
+
+`AllocationSinking` (escape analysis plus scalar replacement over the linear trace body) removes every `NewObject` whose uses are limited to:
+
+- proofs that hold by construction: `GuardHeapObject`, `GuardClass`, `GuardNotNull`, `GuardNoContract` and write barriers;
+- field reads and writes: `HeapLoadField`/`HeapStoreField`, `HeapMapGetShaped`/`HeapMapGetPic`/`HeapMapSetShaped` with constant keys;
+- side-exit snapshots;
+- the backedge of one loop phi (see below).
+
+Reads become the current SSA value of the field and writes only update the tracked state.
+
+Exits that still need a sunk object list it in `SideExit::virtuals`, with its field values at that point. The native exit stores those words in a manager-owned buffer (`TraceActivation::exit_virtual_words`) and returns to Rust. Rust allocates the objects after every other frame write, with the field words pinned as GC roots, and writes them to their registers. Such exits are never linked natively.
+
+A loop-carried instance (`acc = acc.add(v)`) becomes one phi per field. The initial field values are loaded once in the preheader, after a class guard on the entry object. This requires that the body writes no other instance fields and makes no runtime calls. A flag phi marks the first iteration, and exits taken during it hand back the entry object itself instead of a copy, so identity is preserved.
+
+Not sunk yet: objects stored into other objects, objects written to module variables (`StoreAbsoluteValue`), and nested sunk objects.
+
+`NAPALM_TRACE_ALLOC=0` disables trace allocation (A/B measurements). `NAPALM_JIT_STATS` reports `sunk_allocations` and `materialized_objects`.
 
 ### Direct native heap fast paths
 

@@ -862,6 +862,10 @@ impl TraceRecorder<'_> {
                     self.inline_numeric_invoke(program, callee, &inst, &frame.registers, builder, exit)?
                 }
                 Invoke | CallDirect => self.inline_nested_call(runtime, program, builder, fx, &frame, &inst)?,
+                NewObjectWithProperties | NewObjectEmpty | NewObjectShape | NewInterfaceOrTypeObject
+                | NewClassInstance if self.options.trace_allocation => {
+                    self.inline_new_object(runtime, program, builder, fx, &frame, &inst)?
+                }
                 Return => return scalar(&frame, builder, inst.a, TraceRep::Tagged),
                 _ => {
                     if jit_events_enabled() {
@@ -877,6 +881,91 @@ impl TraceRecorder<'_> {
             frame.words[inst.a as usize] = word;
             pc = inst.next_pc;
         }
+    }
+
+    /// An allocation inside an inlined frame: a `NewObject` whose exit replays
+    /// the outermost call (nothing is published before it), plus, for a class
+    /// instance, its constructor inlined against the fresh object.
+    fn inline_new_object<R: TraceRuntime>(
+        &self,
+        runtime: &R,
+        program: &BytecodeProgram,
+        builder: &mut crate::napalm_trace_ir::TraceBuilder,
+        fx: &mut InlineEffects,
+        caller: &InlineFrame<'_>,
+        inst: &RecordedOp,
+    ) -> Result<TraceValueId, RecordingAbort> {
+        let unsupported = |why: &str| {
+            if jit_events_enabled() {
+                eprintln!("[napalm-jit] inline {:?} stops at {:?} (pc {}): {why}", caller.target, inst.opcode, inst.location.pc.0);
+            }
+            RecordingAbort::UnsupportedCall
+        };
+        let layout = runtime.trace_object_layout(inst.location).ok_or_else(|| unsupported("no inline layout"))?;
+        if !layout.operand_slots.is_empty() && layout.operand_slots.len() != inst.args.len() {
+            return Err(unsupported("operand count"));
+        }
+        let null = builder.constant(TraceConstant::Null);
+        let mut fields = vec![null; layout.kind.slots()];
+        for (&slot, reg) in layout.operand_slots.iter().zip(&inst.args) {
+            let value = caller.registers[reg.0 as usize].ok_or_else(|| unsupported("undefined operand"))?;
+            if builder.trace().value(value).map(|value| value.rep) != Some(TraceRep::Tagged) {
+                return Err(unsupported("untagged operand"));
+            }
+            *fields.get_mut(slot as usize).ok_or_else(|| unsupported("slot"))? = value;
+        }
+        let object = builder.emit1(
+            TraceInst::NewObject { kind: layout.kind, fields, exit: fx.exit },
+            TraceType::Any,
+            TraceRep::Tagged,
+        );
+        let crate::napalm_trace_ir::TraceObjectKind::Instance { class, .. } = layout.kind else {
+            return Ok(object);
+        };
+        let base = identity_base(builder, object);
+        fx.class_guarded.push(base);
+        fx.fresh.push((base, class));
+        let Some(crate::napalm_bytecode::SpecializedDescriptor::Instance { constructor, .. }) =
+            caller.callee.chunk.specializations.get(inst.x as usize)
+        else {
+            return Err(unsupported("instance descriptor"));
+        };
+        let Some(constructor) = *constructor else { return Ok(object) };
+        // The constructor's result is discarded: the expression is the object.
+        if fx.active.len() > MAX_INLINE_DEPTH + 1
+            || builder.trace().stats.inlined_calls + fx.frames >= MAX_INLINED_FRAMES_PER_TRACE
+        {
+            return Err(unsupported("inline depth"));
+        }
+        let callee = program.function(constructor).ok_or_else(|| unsupported("constructor"))?;
+        if fx.active.contains(&constructor) || !inlinable(callee, false) {
+            return Err(unsupported("constructor not inlinable"));
+        }
+        let mut args = Vec::with_capacity(inst.args.len());
+        let mut arg_words = Vec::with_capacity(inst.args.len());
+        for reg in &inst.args {
+            args.push(caller.registers[reg.0 as usize].ok_or_else(|| unsupported("undefined argument"))?);
+            arg_words.push(caller.words[reg.0 as usize]);
+        }
+        if args.len() != callee.arity as usize {
+            return Err(unsupported("constructor arity"));
+        }
+        let mut frame = InlineFrame {
+            target: constructor,
+            callee,
+            registers: vec![None; 256],
+            words: vec![None; 256],
+            args,
+            arg_words,
+            receiver: Some(object),
+            receiver_word: None,
+        };
+        Self::bind_parameters(&mut frame)?;
+        fx.active.push(constructor);
+        let result = self.inline_frame(runtime, program, builder, fx, frame);
+        fx.active.pop();
+        result?;
+        Ok(object)
     }
 
     /// Inline a call made from inside an inlined frame: a closure call or method

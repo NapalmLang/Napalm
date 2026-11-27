@@ -264,6 +264,12 @@ pub(super) enum WfInst {
     /// or when the heap entered shared mode (byte at offset `shared_flag`
     /// of the Interpreter).
     LoopBackedge { counter: usize, trace_slot: usize, shared_flag: usize, deopt: WfDeopt },
+    /// Tagged: a complete new object (small literal or class-instance shell)
+    /// with SSA slot values (`kind.slots()` of them, Tagged), allocated by the
+    /// TLAB-only helper: it never reaches a safepoint, so no GC can happen.
+    /// When the TLAB is exhausted it deoptimizes at `deopt`, which replays
+    /// the op in the interpreter. Allocation sinking may remove it.
+    NewObject { kind: crate::napalm_trace_ir::TraceObjectKind, fields: Vec<WfValue>, deopt: WfDeopt },
 }
 
 #[derive(Clone, Debug)]
@@ -424,6 +430,12 @@ pub(super) struct WfFunctionData<'a> {
     pub(super) identity_sites: Vec<Option<NativeIdentitySite>>,
     /// SetFieldClass sites with a native-safe exact receiver class.
     pub(super) plain_store_classes: crate::napalm_collections::HashMap<usize, u64>,
+    /// Object-creating ops the body may allocate itself (`WfInst::NewObject`).
+    pub(super) object_layouts: crate::napalm_collections::HashMap<usize, crate::napalm_tracing_jit::TraceObjectLayout>,
+    /// Invoke ops whose runtime inline cache saw exactly one bytecode target:
+    /// (receiver class, target), the dispatch profile when the op was never
+    /// quickened.
+    pub(super) cached_invokes: crate::napalm_collections::HashMap<usize, (u64, u32)>,
 }
 
 /// Inputs of one v2 compilation.
@@ -531,6 +543,10 @@ enum OpKind {
     FieldStoreChecked { object: u8, value: u8, slot: u32 },
     /// Native allocation; operands are read from the bank (all GPRs).
     Alloc { dst: u8, kind: WfAllocKind, reads: RegList },
+    /// An object allocated from SSA operands (`WfInst::NewObject`): `fields`
+    /// maps each operand register to its dense slot. A class instance may run
+    /// its constructor (inlined, or the whole op through the generic path).
+    NewObject { dst: u8, kind: crate::napalm_trace_ir::TraceObjectKind, fields: SmallVec<[(u8, u8); 4]>, constructor: Option<u32>, args: RegList },
     /// Monomorphic builtin method lowered natively.
     Primitive { dst: u8, receiver: u8, arg: Option<u8>, class: u64, kind: WfPrimitive },
     /// Executed by a host helper unless `inline` is set and inlining succeeds.
@@ -561,6 +577,7 @@ impl OpKind {
             OpKind::FieldGet { object, .. } => visit(*object),
             OpKind::FieldSet { object, value, .. } | OpKind::FieldStoreChecked { object, value, .. } => { visit(*object); visit(*value); }
             OpKind::Runtime { reads, .. } | OpKind::Alloc { reads, .. } => reads.iter().copied().for_each(visit),
+            OpKind::NewObject { fields, args, .. } => fields.iter().map(|(_, reg)| *reg).chain(args.iter().copied()).for_each(visit),
             OpKind::Primitive { receiver, arg, .. } => std::iter::once(*receiver).chain(*arg).for_each(visit),
             _ => {}
         }
@@ -574,7 +591,7 @@ impl OpKind {
             | OpKind::LoadAbsolute { dst, .. }
             | OpKind::Numeric { dst, .. } | OpKind::Identity { dst, .. } | OpKind::MapGet { dst, .. }
             | OpKind::SelfCall { dst, .. } | OpKind::FieldGet { dst, .. }
-            | OpKind::Alloc { dst, .. } | OpKind::Primitive { dst, .. } => Some(*dst),
+            | OpKind::Alloc { dst, .. } | OpKind::Primitive { dst, .. } | OpKind::NewObject { dst, .. } => Some(*dst),
             OpKind::Runtime { write, .. } => *write,
             _ => None,
         }
@@ -614,6 +631,33 @@ fn precise_operands(opcode: Opcode, op: &PreparedOp) -> Option<(Option<u8>, RegL
         AllocList => (Some(op.a), SmallVec::new()),
         _ => return None,
     })
+}
+
+/// `OpKind::NewObject` for an object-creating op whose layout the VM
+/// described (see `WfFunctionData::object_layouts`).
+fn native_new_object(data: &WfFunctionData<'_>, index: usize, opcode: Opcode, prepared: &PreparedOp) -> Option<OpKind> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var("NAPALM_WFJIT_NEW_OBJECT").ok().as_deref() != Some("0")) {
+        return None;
+    }
+    let layout = data.object_layouts.get(&index)?;
+    let operands = match opcode {
+        Opcode::NewObjectEmpty | Opcode::NewObjectShape => RegList::new(),
+        _ => call_args(data.function, prepared).ok()?,
+    };
+    if opcode == Opcode::NewClassInstance {
+        let constructor = (prepared.cache != NO_INDEX).then_some(prepared.cache);
+        // The object is written before the constructor reads its arguments.
+        if constructor.is_some() && operands.contains(&prepared.a) {
+            return None;
+        }
+        return Some(OpKind::NewObject { dst: prepared.a, kind: layout.kind, fields: SmallVec::new(), constructor, args: operands });
+    }
+    if layout.operand_slots.len() != operands.len() {
+        return None;
+    }
+    let fields = layout.operand_slots.iter().copied().zip(operands).collect();
+    Some(OpKind::NewObject { dst: prepared.a, kind: layout.kind, fields, constructor: None, args: RegList::new() })
 }
 
 /// Every GPR of the frame (the operand set of a generic runtime op).
@@ -668,7 +712,11 @@ fn classify_ops(
         let fused_map = opcode == Opcode::AllocMap && prepared.c > 0 && prepared.c <= 4
             && prepared.next > index as u32 + 1;
         let next = if fused_map { prepared.next as usize } else { op.next as usize };
+        let new_object = native_new_object(data, index, opcode, &prepared);
         let kind = match opcode {
+            Opcode::NewObjectEmpty | Opcode::NewObjectShape | Opcode::NewObjectWithProperties
+            | Opcode::NewInterfaceOrTypeObject | Opcode::NewClassInstance if new_object.is_some() =>
+                new_object.expect("checked above"),
             Opcode::Nop => OpKind::Nop,
             Opcode::Move => OpKind::Move { dst: op.a, src: op.b },
             Opcode::Swap => OpKind::Swap { a: op.a, b: op.b },
@@ -711,9 +759,14 @@ fn classify_ops(
                 } else if let Some((class, kind)) = native_primitive_site(function, index, source) {
                     let arg = if kind.arity() == 1 { Some(call_args(function, &prepared)?[0]) } else { None };
                     OpKind::Primitive { dst: op.a, receiver: op.b, arg, class, kind }
-                } else if let Some((class, target)) = profiled_direct_invoke_site(function, index) {
+                } else if let Some((class, target)) = profiled_direct_invoke_site(function, index)
+                    .map(|(class, target)| (class.0, target))
+                    // Never quickened (e.g. run by a trace first): the runtime
+                    // inline cache is the profile.
+                    .or_else(|| data.cached_invokes.get(&index).copied())
+                {
                     if native_self_calls && target == data.function_index {
-                        method_self_call(index, &prepared, op.b, class.0)?
+                        method_self_call(index, &prepared, op.b, class)?
                     } else {
                         // Monomorphic profiled call: inline it behind a receiver
                         // class guard, or call the target behind the same guard.
@@ -721,8 +774,8 @@ fn classify_ops(
                         let reads = std::iter::once(op.b).chain(args.iter().copied()).collect();
                         OpKind::Runtime {
                             helper: WfRuntimeHelper::ProfiledMethod(target), reads, write: Some(op.a),
-                            inline: Some(InlineTarget { callee: target, receiver: Some(op.b), args, class_guard: Some(class.0) }),
-                            guard: Some((op.b, class.0)), generic: false,
+                            inline: Some(InlineTarget { callee: target, receiver: Some(op.b), args, class_guard: Some(class) }),
+                            guard: Some((op.b, class)), generic: false,
                         }
                     }
                 } else {
@@ -1053,6 +1106,10 @@ struct Builder<'a> {
     epoch_dirty: bool,
     /// Dispatched calls (`WfCallTarget::Dynamic`) emitted in inlined bodies.
     dispatched_calls: u32,
+    /// `NewObject` results of this build. Until one escapes, a store into it
+    /// is invisible (an op replay simply allocates a new object), so it is no
+    /// effect for the inliner's replay rule.
+    fresh_objects: Vec<WfValue>,
 }
 
 /// `build_with` failure that asks for a rebuild with `loop_retry` applied.
@@ -1072,6 +1129,7 @@ struct InlineCheckpoint {
     epoch_dirty: bool,
     dispatched_calls: u32,
     effect_done: bool,
+    fresh_objects: usize,
 }
 
 impl InlineCheckpoint {
@@ -1090,6 +1148,7 @@ impl InlineCheckpoint {
             epoch_dirty: builder.epoch_dirty,
             dispatched_calls: builder.dispatched_calls,
             effect_done: builder.inline.as_ref().is_some_and(|frame| frame.effect_done),
+            fresh_objects: builder.fresh_objects.len(),
         }
     }
 
@@ -1107,6 +1166,7 @@ impl InlineCheckpoint {
         builder.epoch_dirty = self.epoch_dirty;
         builder.dispatched_calls = self.dispatched_calls;
         if let Some(frame) = &mut builder.inline { frame.effect_done = self.effect_done; }
+        builder.fresh_objects.truncate(self.fresh_objects);
     }
 }
 
@@ -1168,6 +1228,16 @@ impl Builder<'_> {
         let chain = &self.inline_chain;
         let mut frames = Vec::with_capacity(chain.len());
         for (level, (callee, call_op, _, _)) in chain.iter().enumerate() {
+            // The interpreter cannot re-enter a constructor frame through its
+            // `new C()` op (that op allocates): such a body must stay replayable.
+            let parent = if level == 0 { Some(self.source.root) } else { self.source.callees.get(&chain[level - 1].0) };
+            let parent_opcode = parent.and_then(|parent| {
+                let raw_pc = *parent.function.raw_pcs.get(*call_op)?;
+                parent.bytecode.chunk.code.get(raw_pc as usize)?.opcode()
+            });
+            if parent_opcode == Some(Opcode::NewClassInstance) {
+                return Err(format!("op {op_index}: an inlined constructor frame cannot be rebuilt"));
+            }
             let (resume_op, registers) = match chain.get(level + 1) {
                 Some((_, inner_call, parent_state, parent_live)) =>
                     (*inner_call as u32, registers_of(parent_state, parent_live)),
@@ -1385,6 +1455,12 @@ pub(super) fn build(source: &WfSource<'_>) -> Result<WfFunction, String> {
             for (value, inst) in &block.insts {
                 eprintln!("    v{} = {inst:?}", value.0);
             }
+            eprintln!("    {:?}", block.terminator);
+        }
+        for (index, deopt) in ir.deopts.iter().enumerate() {
+            eprintln!("  deopt{index}: op {} spec={} regs={:?} frames={:?}",
+                deopt.op_index, deopt.speculative, deopt.registers,
+                deopt.frames.iter().map(|frame| (frame.callee, frame.call_op, frame.resume_op, &frame.registers)).collect::<Vec<_>>());
         }
     }
     ir.frame = WfFrameInfo::of(root.function);
@@ -1603,6 +1679,7 @@ fn build_with(
         loop_retry: Vec::new(),
         epoch_dirty: false,
         dispatched_calls: 0,
+        fresh_objects: Vec::new(),
     };
     let unsupported = BuildError::Unsupported;
 
@@ -1949,7 +2026,9 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 builder.state[dst as usize] = Some(value);
             }
             OpKind::FieldStoreChecked { object, value, slot } => {
-                if builder.root_self_calls {
+                // A store into an unpublished object of this build is replay-safe.
+                let fresh = builder.fresh_objects.contains(&builder.read(object, index)?);
+                if builder.root_self_calls && !fresh {
                     return Err(format!("op {index}: field store in a natively recursive function"));
                 }
                 // A rejected store is an error the interpreter reports, not a
@@ -1960,13 +2039,16 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 let stored = builder.read(value, index)?;
                 let stored = builder.tagged(stored)?;
                 builder.emit(WfTy::Bool, WfInst::InstanceFieldStoreChecked { object, value: stored, slot, deopt });
-                if let Some(frame) = builder.inline.as_mut() { frame.effect_done = true; }
+                if !fresh {
+                    if let Some(frame) = builder.inline.as_mut() { frame.effect_done = true; }
+                }
             }
             OpKind::FieldSet { object, value, slot, class_key } => {
-                if builder.inline.is_some() && builder.root_self_calls {
+                let fresh = builder.fresh_objects.contains(&builder.read(object, index)?);
+                if builder.inline.is_some() && builder.root_self_calls && !fresh {
                     return Err(format!("op {index}: store inlined into a natively recursive function"));
                 }
-                if builder.inline.is_none() && builder.root_self_calls {
+                if builder.inline.is_none() && builder.root_self_calls && !fresh {
                     return Err(format!("op {index}: field store in a natively recursive function"));
                 }
                 let deopt = builder.deopt(index, true, &live)?;
@@ -1979,7 +2061,9 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                 builder.emit(WfTy::Bool, WfInst::InstanceFieldSet {
                     object, value: stored, slot, class_key, value_immediate, deopt,
                 });
-                if let Some(frame) = builder.inline.as_mut() { frame.effect_done = true; }
+                if !fresh {
+                    if let Some(frame) = builder.inline.as_mut() { frame.effect_done = true; }
+                }
             }
             OpKind::Primitive { dst, receiver, arg, class, kind } => {
                 builder.ensure_epoch(index, &live)?;
@@ -2030,6 +2114,62 @@ fn translate(builder: &mut Builder<'_>, data: &WfFunctionData<'_>, kinds: &[Opti
                     op_index: index as u32, kind, state, function: data.function_index,
                 });
                 builder.state[dst as usize] = Some(value);
+            }
+            OpKind::NewObject { dst, kind, fields, constructor, args } => {
+                // An inlined constructor relies on the method epoch.
+                if constructor.is_some() { builder.ensure_epoch(index, &live)?; }
+                let checkpoint = constructor.map(|_| InlineCheckpoint::save(builder));
+                // Nothing is published before the object is complete: an
+                // exhausted TLAB replays the whole op in the interpreter.
+                let deopt = builder.deopt(index, false, &live)?;
+                let null = builder.emit(WfTy::Tagged, WfInst::ConstTagged(TAG_NULL));
+                let mut values = vec![null; kind.slots()];
+                for &(slot, reg) in &fields {
+                    let value = builder.read(reg, index)?;
+                    *values.get_mut(slot as usize).ok_or_else(|| format!("op {index}: object slot out of range"))? = builder.tagged(value)?;
+                }
+                let object = builder.emit(WfTy::Tagged, WfInst::NewObject { kind, fields: values, deopt });
+                builder.fresh_objects.push(object);
+                builder.state[dst as usize] = Some(object);
+                if let Some(callee) = constructor {
+                    let target = InlineTarget { callee, receiver: Some(dst), args: args.clone(), class_guard: None };
+                    match builder.inline_call(&target, index, &live) {
+                        Ok(_) => {
+                            // The constructor's result is discarded.
+                            builder.out.inlined_calls += 1;
+                            builder.state[dst as usize] = Some(object);
+                            if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
+                                eprintln!("[napalm-wfjit] v2 inlined constructor {:?} at op {index} of {:?}",
+                                    builder.source.callees.get(&callee).map(|data| data.function.id), data.function.id);
+                            }
+                        }
+                        Err(reason) => {
+                            if std::env::var_os("NAPALM_JIT_EVENTS").is_some() {
+                                eprintln!("[napalm-wfjit] v2 constructor inline declined at op {index} of {:?}: {reason}", data.function.id);
+                            }
+                            checkpoint.expect("constructor checkpoint").restore(builder);
+                            if builder.inline.is_some() || builder.root_self_calls {
+                                return Err(format!("op {index}: constructor call needs the interpreter"));
+                            }
+                            // The whole op (allocation and constructor) through
+                            // the generic call path.
+                            let state = builder.deopt(index, false, &live)?;
+                            builder.emit(WfTy::Bool, WfInst::RuntimeOp {
+                                helper: WfRuntimeHelper::CallToReturn, op_index: index as u32, next_op: next as u32,
+                                state, dest: None, clobbers: true,
+                            });
+                            let live_next = live_in[next];
+                            let mut reloaded = vec![None; 256];
+                            for reg in all_registers(data.function) {
+                                if set_has(&live_next, reg) {
+                                    reloaded[reg as usize] = Some(builder.emit(WfTy::Tagged, WfInst::FrameLoad(reg)));
+                                }
+                            }
+                            builder.state = reloaded;
+                            builder.epoch_dirty = true;
+                        }
+                    }
+                }
             }
             OpKind::Runtime { helper, write, inline, guard, generic, reads } => {
                 // Inlined bodies and guarded direct calls rely on the epoch.

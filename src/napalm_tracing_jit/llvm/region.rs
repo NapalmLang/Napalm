@@ -221,6 +221,7 @@ fn pass_source(trace: &Trace, plan: &CompiledExitPlan, slot: FrameSlot, rep: Tra
         return None;
     }
     match write.source {
+        ExitWriteSource::Virtual(_) => None,
         ExitWriteSource::Dynamic(index) => {
             let dynamic = plan.dynamic_values.get(index as usize)?;
             let value = unboxed_operand(trace, dynamic.value);

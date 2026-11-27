@@ -4535,11 +4535,29 @@ fn fiber_state_external_bytes(state: &FiberState) -> usize {
 /// MMTk reads it only after the stop-the-world rendezvous.
 struct AllocationRootBuffer {
     handles: std::cell::UnsafeCell<Vec<u32>>,
+    /// Roots that must survive a *sequence* of allocations (e.g. the field
+    /// values of every sunk object a trace side exit materializes). Unlike
+    /// `handles`, individual allocations never clear it.
+    pinned: std::cell::UnsafeCell<Vec<u32>>,
 }
 
 impl AllocationRootBuffer {
     fn new() -> Self {
-        Self { handles: std::cell::UnsafeCell::new(Vec::with_capacity(32)) }
+        Self {
+            handles: std::cell::UnsafeCell::new(Vec::with_capacity(32)),
+            pinned: std::cell::UnsafeCell::new(Vec::new()),
+        }
+    }
+
+    #[inline]
+    fn pin(&self, value: Value) {
+        // Same stop-the-world ownership protocol as prepare().
+        push_value_handle(value, unsafe { &mut *self.pinned.get() });
+    }
+
+    #[inline]
+    fn clear_pinned(&self) {
+        unsafe { &mut *self.pinned.get() }.clear();
     }
 
     #[inline]
@@ -4618,7 +4636,8 @@ unsafe impl GcRootProvider for AllocationRootBuffer {
         // SAFETY: collection only calls providers after the owning mutator has
         // parked, so the Vec cannot be concurrently mutated here.
         let roots = unsafe { &*self.handles.get() };
-        for &handle in roots {
+        let pinned = unsafe { &*self.pinned.get() };
+        for &handle in roots.iter().chain(pinned) {
             if let Some(slot) = handles().gc_slot(handle) {
                 visitor.slot(slot);
             }
@@ -4970,6 +4989,12 @@ impl Heap {
         // the barrier established at the last VM/GC boundary.
         self.remember_stack_owner();
         value
+    }
+
+    /// Reserve one `ManagedObject` range (TLAB refill included) without a
+    /// safepoint; `None` when only a collection could satisfy it.
+    fn reserve_object_without_safepoint(&mut self) -> Option<usize> {
+        self.mutator.reserve_fixed_without_safepoint::<{ std::mem::size_of::<ManagedObject>() }>()
     }
 
     /// Publish a small shaped Map into an Immix TLAB range already reserved by
@@ -20758,6 +20783,131 @@ impl TraceRuntime for Interpreter<'_> {
 
     fn trace_method_epoch(&self) -> u64 { self.method_epoch }
 
+    fn trace_new_object_helper(&self) -> Option<crate::napalm_tracing_jit::NativeNewObjectFn> {
+        Some(trace_new_object)
+    }
+
+    fn trace_object_layout(&self, location: TraceLocation) -> Option<crate::napalm_tracing_jit::TraceObjectLayout> {
+        use crate::napalm_trace_ir::TraceObjectKind;
+        use crate::napalm_tracing_jit::TraceObjectLayout;
+        let index = *self.prepared.function_by_id.get(&location.function)? as usize;
+        let prepared = self.prepared.functions.get(index)?;
+        let op_index = *prepared.word_to_op.get(location.pc.0 as usize)?;
+        if op_index == NO_INDEX {
+            return None;
+        }
+        let op = prepared.ops.get(op_index as usize)?;
+        let bytecode = self.program.functions.get(index)?;
+        let opcode = bytecode.chunk.code.get(location.pc.0 as usize)?.opcode()?;
+        match opcode {
+            Opcode::NewObjectEmpty => Some(TraceObjectLayout {
+                kind: TraceObjectKind::ShapedMap { shape: 0, len: 0 },
+                operand_slots: smallvec::SmallVec::new(),
+            }),
+            Opcode::NewObjectWithProperties | Opcode::NewInterfaceOrTypeObject | Opcode::NewObjectShape => {
+                // A structural contract must be bound at creation: keep those
+                // on the factory path, which installs it.
+                if opcode != Opcode::NewObjectWithProperties && matches!(
+                    bytecode.chunk.specializations.get(op.x as usize),
+                    Some(crate::napalm_bytecode::SpecializedDescriptor::ObjectShape { contract: Some(_), .. })
+                ) {
+                    return None;
+                }
+                let site = prepared.small_map_literal_sites.get(op.cache as usize)?;
+                let count = if opcode == Opcode::NewObjectShape { site.field_count as usize } else { op.c as usize };
+                let usable = count <= SMALL_MAP_INLINE_FIELDS
+                    && site.initialized && !site.disabled && site.stable_program_keys
+                    && site.field_count as usize == count
+                    && site.value_count as usize <= SMALL_MAP_INLINE_FIELDS
+                    && site.slots[..count].iter().all(|&slot| slot < site.value_count as u16);
+                if !usable {
+                    return None;
+                }
+                let operand_slots = if opcode == Opcode::NewObjectShape {
+                    smallvec::SmallVec::new()
+                } else {
+                    site.slots[..count].iter().map(|&slot| slot as u8).collect()
+                };
+                Some(TraceObjectLayout {
+                    kind: TraceObjectKind::ShapedMap { shape: site.shape, len: site.value_count },
+                    operand_slots,
+                })
+            }
+            Opcode::NewClassInstance => {
+                let layout = self.classes.get(op.y as usize)?;
+                let count = layout.total_instance_field_count as usize;
+                let class = CLASS_KIND_INSTANCE | op.y as u64;
+                trace_inline_instance_slot(self, class, count)?;
+                Some(TraceObjectLayout {
+                    kind: TraceObjectKind::Instance { class, fields: count as u8 },
+                    operand_slots: smallvec::SmallVec::new(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn trace_materialize_objects(
+        &mut self,
+        objects: &[crate::napalm_tracing_jit::TraceMaterializedObject],
+    ) -> Result<Vec<RegisterWord>, RuntimeError> {
+        use crate::napalm_trace_ir::TraceObjectKind;
+        use crate::napalm_tracing_jit::TraceMaterializedField;
+        // Every field word stays rooted across all of these allocations, and
+        // so does each object as soon as it exists.
+        for object in objects {
+            for field in &object.fields {
+                if let TraceMaterializedField::Word(word) = *field {
+                    self.heap.allocation_roots.pin(Value::from_word(word));
+                }
+            }
+        }
+        let result = (|| {
+            let mut materialized = Vec::with_capacity(objects.len());
+            for object in objects {
+                if let Some(existing) = object.existing {
+                    self.heap.allocation_roots.pin(Value::from_word(existing));
+                    materialized.push(existing);
+                    continue;
+                }
+                let word = |field: &TraceMaterializedField| match *field {
+                    TraceMaterializedField::Word(word) => Ok(Value::from_word(word)),
+                    TraceMaterializedField::Object(_) => Err(RuntimeError::new(
+                        "nested sunk objects are not materialized by this runtime",
+                    )),
+                };
+                let value = match object.kind {
+                    TraceObjectKind::ShapedMap { len, .. } => {
+                        if object.fields.len() != len as usize || len as usize > SMALL_MAP_INLINE_FIELDS {
+                            return Err(RuntimeError::new("invalid sunk Map layout"));
+                        }
+                        let mut values = InlineMapValues::new();
+                        values.resize(len as usize, Value::NULL);
+                        for (slot, field) in values.storage_mut().iter_mut().zip(&object.fields) {
+                            *slot = word(field)?;
+                        }
+                        self.heap.alloc_inline_map(object.id as u32, values)
+                    }
+                    TraceObjectKind::Instance { fields, .. } => {
+                        let slot = trace_inline_instance_slot(self, object.id, fields as usize)
+                            .filter(|_| object.fields.len() == fields as usize)
+                            .ok_or_else(|| RuntimeError::new("invalid sunk instance layout"))?;
+                        let mut instance = InstanceObject::nulls(slot, fields as usize);
+                        for (slot, field) in instance.fields_mut().iter_mut().zip(&object.fields) {
+                            *slot = word(field)?;
+                        }
+                        self.heap.alloc(HeapObject::Instance(instance))
+                    }
+                };
+                self.heap.allocation_roots.pin(value);
+                materialized.push(value.word());
+            }
+            Ok(materialized)
+        })();
+        self.heap.allocation_roots.clear_pinned();
+        result
+    }
+
     fn trace_small_map_literal(
         &self,
         function: FuncId,
@@ -22190,6 +22340,105 @@ impl Interpreter<'_> {
 /// allocate managed memory or permit work that can fail before the reserved
 /// object has been initialized and published. A zero result selects the normal
 /// GC-safe bytecode factory without reserving a raw TLAB range.
+/// Payload of an instance receiver-class key: the dense class slot.
+const RECEIVER_CLASS_PAYLOAD_MASK: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// Class slot of an instance receiver-class key whose layout a trace may
+/// allocate inline: finalized, non-foreign, exactly `count` inline fields.
+fn trace_inline_instance_slot(vm: &Interpreter<'_>, class: u64, count: usize) -> Option<u32> {
+    if class & !RECEIVER_CLASS_PAYLOAD_MASK != CLASS_KIND_INSTANCE {
+        return None;
+    }
+    let slot = (class & RECEIVER_CLASS_PAYLOAD_MASK) as u32;
+    let layout = vm.classes.get(slot as usize)?;
+    (layout.layout_finalized
+        && !layout.is_foreign
+        && layout.total_instance_field_count as usize == count
+        && count <= INSTANCE_INLINE_FIELDS)
+        .then_some(slot)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: make every JIT `NewObject` allocation fail (exercising the
+    /// replaying side exits and deoptimizations) on this thread.
+    static FORCE_NEW_OBJECT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `TraceActivation::new_object` (see `TraceInst::NewObject`): allocate one
+/// fully initialized object from the current TLAB. Never reaches a safepoint:
+/// anything but the bump fast path returns 0 and the trace side-exits, replaying
+/// the allocating bytecode in the interpreter.
+unsafe extern "C" fn trace_new_object(
+    runtime: *mut std::ffi::c_void,
+    tag: u32,
+    id: u64,
+    count: u32,
+    values: *const u64,
+) -> u64 {
+    let vm = unsafe { &mut *(runtime as *mut Interpreter<'_>) };
+    let count = count as usize;
+    #[cfg(test)]
+    if FORCE_NEW_OBJECT_FAILURE.with(std::cell::Cell::get) {
+        return 0;
+    }
+    if vm.run_state != RunState::Running || count > SMALL_MAP_INLINE_FIELDS || (count != 0 && values.is_null()) {
+        return 0;
+    }
+    let words = if count == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(values, count) } };
+    // Validate before reserving: a reservation must always become an object.
+    let instance_slot = match tag {
+        crate::napalm_tracing_jit::TRACE_NEW_OBJECT_SHAPED_MAP => None,
+        crate::napalm_tracing_jit::TRACE_NEW_OBJECT_INSTANCE => match trace_inline_instance_slot(vm, id, count) {
+            Some(slot) => Some(slot),
+            None => return 0,
+        },
+        _ => return 0,
+    };
+    let Some(fast) = vm.heap.inline_map_fast_allocation_info() else { return 0 };
+    if fast.cursor.is_null() || fast.limit.is_null() || !fast.alignment.is_power_of_two() {
+        return 0;
+    }
+    let cursor = unsafe { *fast.cursor };
+    let limit = unsafe { *fast.limit };
+    let bumped = cursor.checked_add(fast.alignment - 1).and_then(|biased| {
+        let address = biased & !(fast.alignment - 1);
+        let end = address.checked_add(fast.bytes)?;
+        (cursor != 0 && end <= limit).then_some((address, end))
+    });
+    let address = match bumped {
+        Some((address, end)) => {
+            unsafe { *fast.cursor = end };
+            address
+        }
+        // The TLAB is exhausted: refill it from the space, still without a
+        // safepoint. Only a heap that needs a collection makes the caller
+        // fall back to the VM (once per GC cycle rather than per TLAB).
+        None => match vm.heap.reserve_object_without_safepoint() {
+            Some(address) => address,
+            None => return 0,
+        },
+    };
+    let object = match instance_slot {
+        None => {
+            let mut inline = InlineMapValues::new();
+            inline.resize(count, Value::NULL);
+            for (slot, &word) in inline.storage_mut().iter_mut().zip(words) {
+                *slot = Value::from_word(RegisterWord(word));
+            }
+            unsafe { vm.heap.alloc_inline_map_reserved(address, id as u32, inline) }
+        }
+        Some(slot) => {
+            let mut instance = InstanceObject::nulls(slot, count);
+            for (field, &word) in instance.fields_mut().iter_mut().zip(words) {
+                *field = Value::from_word(RegisterWord(word));
+            }
+            unsafe { vm.heap.alloc_reserved_managed(address, HeapObject::Instance(instance)) }
+        }
+    };
+    object.raw_bits()
+}
+
 unsafe extern "C" fn trace_native_factory_probe(
     activation: *mut TraceActivation,
     function: u32,
@@ -23956,6 +24205,7 @@ let result = r1 + r2 + r3 + r4 + r5;
     include!("tests/napalm_wfjit_this_tests.rs");
     include!("tests/napalm_jit_binding_tests.rs");
     include!("tests/napalm_collections_tests.rs");
+    include!("tests/napalm_allocation_sinking_tests.rs");
     include!("tests/napalm_contract_tests.rs");
     include!("tests/napalm_pubsub_tests.rs");
     include!("tests/napalm_string_tests.rs");

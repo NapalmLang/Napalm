@@ -2290,6 +2290,9 @@ impl LlvmLowering<'_> {
                     let value = self.lower_constant(constant)?;
                     self.materialize_exit_word(&value, source, write.target_rep)?
                 }
+                ExitWriteSource::Virtual(_) => {
+                    return Err(self.error("sunk object reached a native trace link"));
+                }
             };
             self.store_frame_word(write.slot, &word);
         }
@@ -2311,6 +2314,32 @@ impl LlvmLowering<'_> {
             self.store_frame_word(write.slot, &word);
         }
         let activation = Self::activation();
+        // Words Rust needs to materialize sunk objects (see ExitVirtualWord).
+        let virtual_buffer = if plan.virtual_words.is_empty() {
+            None
+        } else {
+            Some(self.load_at(Ty::Ptr, &activation, offset_of!(TraceActivation, exit_virtual_words) as i64, Mem::Act))
+        };
+        for &(index, word) in &plan.virtual_words {
+            let value = match word {
+                ExitVirtualWord::Kind(kind) => {
+                    let (binding, raw) = object_kind_binding(kind);
+                    self.vm_binding_word(binding, raw)?
+                }
+                ExitVirtualWord::Dynamic(dynamic) => {
+                    let dynamic = plan
+                        .dynamic_values
+                        .get(dynamic as usize)
+                        .copied()
+                        .ok_or_else(|| self.error("side-exit dynamic value index out of bounds"))?;
+                    let source = self.value_rep(dynamic.value)?;
+                    let value = self.lower_value(dynamic.value)?;
+                    self.materialize_exit_word(&value, source, TraceRep::Tagged)?
+                }
+            };
+            let buffer = virtual_buffer.clone().expect("virtual words imply a buffer");
+            self.store_at(&value, &buffer, index as i64 * 8, Mem::Act);
+        }
         self.store_at(&V::i32(plan.id.0 as i32), &activation, offset_of!(TraceActivation, exit_id) as i64, Mem::Act);
         self.ret(TRACE_RESULT_SIDE_EXIT);
         Ok(())
@@ -3591,6 +3620,35 @@ impl LlvmLowering<'_> {
                 self.emit_heap_write_barrier(&owner, *value, &tagged)?;
                 self.store_owned(&tagged, &address, Mem::List.tag(), *list);
                 self.publish_heap_store(Fwd::Indexed { entry, index }, tagged);
+            }
+
+            NewObject { kind, fields, exit } => {
+                let result = self.one_result(node)?;
+                let activation = Self::activation();
+                let values = offset_of!(TraceActivation, direct_call_args) as i64;
+                for (index, field) in fields.iter().enumerate() {
+                    let value = self.lower_value(*field)?;
+                    self.store_at(&value, &activation, values + (index * 8) as i64, Mem::Act);
+                }
+                let (binding, raw) = object_kind_binding(*kind);
+                let id = self.vm_binding_word(binding, raw)?;
+                let tag = match kind {
+                    TraceObjectKind::ShapedMap { .. } => TRACE_NEW_OBJECT_SHAPED_MAP,
+                    TraceObjectKind::Instance { .. } => TRACE_NEW_OBJECT_INSTANCE,
+                };
+                let callee = self.entry_activation_load(Ty::Ptr, offset_of!(TraceActivation, new_object));
+                let runtime = self.runtime_context();
+                let pointer = self.gep8(&activation, values);
+                // Allocates from the TLAB and publishes a fresh sidecar entry;
+                // no existing object, shape or frame changes.
+                let object = self.def(Ty::I64, &format!(
+                    "call i64 {}(ptr {}, i32 {tag}, i64 {}, i32 {}, ptr {}) #3",
+                    callee.op, runtime.op, id.op, fields.len(), pointer.op
+                ));
+                // Zero: nothing was allocated; the exit replays the bytecode.
+                let failed = self.icmp("eq", &object, &V::i64(0));
+                self.emit_side_exit(*exit, &failed)?;
+                self.cache_value(result, object);
             }
 
             HeapListPush { list, value, exit } => {

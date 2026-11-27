@@ -18,6 +18,8 @@ pub(crate) type Optimize = TraceOptimize;
 use crate::napalm_collections::{HashMap, HashSet};
 
 mod advanced;
+mod allocation_sinking;
+pub use allocation_sinking::AllocationSinking;
 pub use advanced::*;
 mod boolean_optimizations;
 pub use boolean_optimizations::*;
@@ -50,6 +52,9 @@ fn passes(promote_loop_representations: bool) -> TraceOptimize {
         })
         .with_pass(SparseConditionalConstantPropagation)
         .with_pass(ConversionSimplification)
+        // Remove non-escaping trace allocations before the loop and memory
+        // passes, which then see their fields as plain SSA values.
+        .with_pass(AllocationSinking)
         // Integer IV speculation needs the folded + 1.0 step, so it runs after
         // constant propagation and before the induction/range passes.
         .with_pass(TraceCanonicalization {
@@ -647,6 +652,7 @@ impl TraceCanonicalization {
                         writes: Vec::new(),
                     }],
                     linked_trace: None,
+                    virtuals: Vec::new(),
                 });
                 let id = TraceValueId(trace.values.len() as u32);
                 trace.values.push(TraceValue {
@@ -791,6 +797,7 @@ impl TraceCanonicalization {
                     writes: Vec::new(),
                 }],
                 linked_trace: None,
+                virtuals: Vec::new(),
             });
 
             {
@@ -943,6 +950,7 @@ impl TraceCanonicalization {
                     writes: Vec::new(),
                 }],
                 linked_trace: None,
+                virtuals: Vec::new(),
             });
             exit
         }
@@ -1453,13 +1461,7 @@ impl TraceCanonicalization {
             kind.visit_operands(|value| mark(*value));
         }
         for exit in &trace.exits {
-            for frame in &exit.frames {
-                for write in &frame.writes {
-                    if let SnapshotValue::Value(value) = write.value {
-                        mark(value);
-                    }
-                }
-            }
+            exit.for_each_value(&mut mark);
         }
         for phi in &trace.loop_phis {
             mark(phi.initial);

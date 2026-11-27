@@ -53,6 +53,8 @@ pub(super) struct WfHelperRefs {
     pub(super) store_field_checked: FuncRef,
     /// `(vm, left, right) -> String word | BAILOUT` (allocates).
     pub(super) string_concat: FuncRef,
+    /// TLAB-only allocation `(vm, kind tag, shape/class key, slots, values) -> object | 0`.
+    pub(super) new_object: FuncRef,
 }
 
 /// Only heap-independent words can retain their *bank equality* fact after
@@ -810,6 +812,32 @@ impl Lowering<'_, '_> {
                     lowering.b.switch_to_block(ok);
                     value
                 })
+            }
+            WfInst::NewObject { kind, fields, deopt } => {
+                // Slot values staged in a native buffer; the helper copies them
+                // into the new object and cannot collect.
+                let buffer_slot = self.b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot, (fields.len().max(1) * 8) as u32, 3));
+                let buffer = self.b.ins().stack_addr(types::I64, buffer_slot, 0);
+                for (index, field) in fields.iter().enumerate() {
+                    let word = self.value(*field);
+                    self.b.ins().store(flags, word, buffer, (index * 8) as i32);
+                }
+                let (tag, id) = match kind {
+                    crate::napalm_trace_ir::TraceObjectKind::ShapedMap { shape, .. } =>
+                        (crate::napalm_tracing_jit::TRACE_NEW_OBJECT_SHAPED_MAP, *shape as u64),
+                    crate::napalm_trace_ir::TraceObjectKind::Instance { class, .. } =>
+                        (crate::napalm_tracing_jit::TRACE_NEW_OBJECT_INSTANCE, *class),
+                };
+                let tag = self.b.ins().iconst(types::I32, tag as i64);
+                let id = self.b.ins().iconst(types::I64, id as i64);
+                let count = self.b.ins().iconst(types::I32, fields.len() as i64);
+                let call = self.b.ins().call(self.helpers.new_object, &[self.vm, tag, id, count, buffer]);
+                let object = self.b.inst_results(call)[0];
+                // Zero: nothing allocated; the deopt replays the op.
+                let allocated = self.b.ins().icmp_imm(IntCC::NotEqual, object, 0);
+                self.guard(allocated, *deopt);
+                object
             }
             WfInst::InstanceFieldStoreChecked { object, value, slot, deopt } => {
                 // Any receiver may be stored to: drop every forwarded field.

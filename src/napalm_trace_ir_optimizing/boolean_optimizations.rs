@@ -17,14 +17,9 @@ fn tagged_bool(trace: &Trace, value: TraceValueId) -> Option<bool> {
 fn used_in_snapshot_or_phi(trace: &Trace, value: TraceValueId) -> bool {
     let value = trace.canonical_value(value);
     if trace.exits.iter().any(|exit| {
-        exit.frames.iter().any(|frame| {
-            frame.writes.iter().any(|write| {
-                matches!(
-                    write.value,
-                    SnapshotValue::Value(v) if trace.canonical_value(v) == value
-                )
-            })
-        })
+        let mut used = false;
+        exit.for_each_value(|v| used |= trace.canonical_value(v) == value);
+        used
     }) {
         return true;
     }

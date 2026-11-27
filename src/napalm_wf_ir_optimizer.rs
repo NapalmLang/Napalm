@@ -71,7 +71,7 @@ macro_rules! operands {
                 FloatBin {lhs,rhs,..} | FloatCmp {lhs,rhs,..} | IdentityCompare {lhs,rhs,..} |
                 InstanceFieldSet {object:lhs,value:rhs,..} | InstanceFieldStoreChecked {object:lhs,value:rhs,..} |
                 StringConcat {left:lhs,right:rhs,..} => { visit(lhs); visit(rhs); }
-                SelfCall {args,..} => args.into_iter().for_each(visit),
+                SelfCall {args,..} | NewObject {fields:args,..} => args.into_iter().for_each(visit),
                 Primitive {receiver, arg, ..} => { visit(receiver); if let Some(arg) = arg { visit(arg); } }
                 CallExplicit {receiver, args, ..} => {
                     if let Some(receiver) = receiver { visit(receiver); }
@@ -94,7 +94,8 @@ macro_rules! snapshots {
                 MapPropertyGet {deopt,..} | IdentityCompare {deopt,..} | InstanceFieldSet {deopt,..} | InstanceFieldStoreChecked {deopt,..} |
                 SelfCall {deopt,..} | GuardEpoch {deopt,..} | LoopBackedge {deopt,..} | Primitive {deopt,..} |
                 CallExplicit {state:deopt,..} |
-                AllocObject {state:deopt,..} | StringConcat {state:deopt,..} | RuntimeOp {state:deopt,..} => Some(deopt),
+                AllocObject {state:deopt,..} | StringConcat {state:deopt,..} | RuntimeOp {state:deopt,..} |
+                NewObject {deopt,..} => Some(deopt),
                 Param(_) | ConstTagged(_) | ConstF64(_) | ConstBool(_) | LoadAbsolute(_) |
                 AssumeNumber(_) | AssumeBool(_) | BoxF64(_) | BoxBool(_) | Truthy(_) |
                 FloatBin {..} | FloatCmp {..} | FloatNeg(_) | FrameLoad(_) => None,
@@ -354,6 +355,7 @@ fn verify_with_cfg(f: &WfFunction, cfg: &Cfg) -> Result<(), String> {
                     (Tagged, ty(object) == Tagged)
                 }
                 StringConcat { left, right, .. } => (Tagged, ty(left) == Tagged && ty(right) == Tagged),
+                NewObject { kind, fields, .. } => (Tagged, fields.len() == kind.slots() && fields.iter().all(|v| ty(v) == Tagged)),
                 SelfCall { args, .. } => (
                     Tagged,
                     args.len() == f.arity + usize::from(f.has_this)

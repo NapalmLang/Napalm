@@ -370,7 +370,8 @@ impl TraceOptimization for ClassTypePropagation {
 fn anchor_exit(trace: &mut Trace) -> SideExitId {
     let id = SideExitId(trace.exits.len() as u32);
     trace.exits.push(SideExit { id, target: ExitTarget::Interpreter(trace.anchor.location),
-        frames: vec![FrameSnapshot { disposition: FrameDisposition::Existing { depth_from_top: 0 }, writes: vec![] }], linked_trace: None });
+        frames: vec![FrameSnapshot { disposition: FrameDisposition::Existing { depth_from_top: 0 }, writes: vec![] }], linked_trace: None,
+        virtuals: Vec::new() });
     id
 }
 
@@ -2114,13 +2115,7 @@ impl TraceOptimization for DeadCodeElimination {
             if !referenced_exits.contains(&exit.id) {
                 continue;
             }
-            for frame in &exit.frames {
-                for write in &frame.writes {
-                    if let SnapshotValue::Value(value) = write.value {
-                        push(value, &mut live_values, &mut work);
-                    }
-                }
-            }
+            exit.for_each_value(|value| push(value, &mut live_values, &mut work));
         }
 
         while let Some(value) = work.pop() {

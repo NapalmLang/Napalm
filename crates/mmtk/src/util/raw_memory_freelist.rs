@@ -136,9 +136,11 @@ impl RawMemoryFreeList {
     }
 
     fn current_capacity(&self) -> i32 {
-        let list_blocks = conversions::bytes_to_pages_up(self.high_water - self.base) as i32
-            / self.pages_per_block;
-        self.units_in_first_block() + (list_blocks - 1) * self.units_per_block()
+        // Every mapped entry except the heads and the bottom sentinel. With
+        // whole blocks this is `units_in_first_block + (blocks - 1) *
+        // units_per_block`; unlike that formula it also counts the final,
+        // partial block that `raise_high_water` clamps to `limit`.
+        ((self.high_water - self.base) >> LOG_BYTES_IN_UNIT) as i32 - self.heads - 1
     }
 
     pub fn grow_freelist(&mut self, units: i32) -> bool {
@@ -216,7 +218,11 @@ impl RawMemoryFreeList {
             "Attempt to grow FreeList beyond limit"
         );
         if self.high_water + grow_extent > self.limit {
-            grow_extent = self.high_water - self.limit;
+            // Clamp the last growth to the space that is left. (This was
+            // `high_water - limit`, which underflows: the free list of a
+            // nearly exhausted contiguous space then tried to map ~2^64 bytes
+            // and killed the GC worker.)
+            grow_extent = self.limit - self.high_water;
         }
         self.mmap(self.high_water, grow_extent);
         self.high_water += grow_extent;
@@ -314,6 +320,40 @@ mod tests {
         let last_unit = list_size as i32 - grain;
         let bottom_sentinel = list_size as i32;
         (guard, l, list_size as _, last_unit, bottom_sentinel)
+    }
+
+    /// The last growth step is clamped to a limit that is not block-aligned.
+    /// It used to compute `high_water - limit` (an underflow, so a huge mmap
+    /// that killed the GC worker) and then fail the capacity check because
+    /// the clamped partial block was not counted.
+    #[test]
+    fn grows_up_to_a_limit_that_is_not_block_aligned() {
+        let _guard = match MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Away from the start of the shared test region: on Windows the other
+        // tests' partial unmaps leave their reservation in place.
+        let start = crate::util::test_util::RAW_MEMORY_FREELIST_TEST_REGION.start + (1usize << 20);
+        let units_per_page = (BYTES_IN_PAGE >> LOG_BYTES_IN_UNIT) as i32;
+        // One whole 16-page block (64 KiB, the Windows reservation granule)
+        // plus one page: one head, the bottom sentinel and the units.
+        let max_units = 17 * units_per_page - 2;
+        let mut l = RawMemoryFreeList::new(
+            start,
+            start + 17 * BYTES_IN_PAGE,
+            16,
+            max_units,
+            1,
+            1,
+            MmapStrategy::TEST,
+        );
+        assert!(l.grow_freelist(16 * units_per_page - 2));
+        assert!(l.grow_freelist(units_per_page));
+        assert_eq!(l.high_water, l.limit);
+        assert_eq!(l.current_units, max_units);
+        // Exhausted: refused, not a panic.
+        assert!(!l.grow_freelist(1));
     }
 
     #[test]

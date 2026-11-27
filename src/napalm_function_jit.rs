@@ -141,6 +141,7 @@ struct JitHelpers {
     write_barrier: cranelift::module::FuncId,
     store_field_checked: cranelift::module::FuncId,
     string_concat: cranelift::module::FuncId,
+    new_object: cranelift::module::FuncId,
 }
 
 /// A Cranelift module for whole-function code with every runtime helper
@@ -197,6 +198,7 @@ fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
         builder.symbol("napalm_wfjit_write_barrier", trace_heap_write_barrier as *const u8);
         builder.symbol("napalm_wfjit_store_field_checked", napalm_wfjit_store_field_checked as *const u8);
         builder.symbol("napalm_wfjit_string_concat", napalm_wfjit_string_concat as *const u8);
+        builder.symbol("napalm_wfjit_new_object", trace_new_object as *const u8);
         let mut module = JITModule::new(builder);
         if module.target_config().pointer_type() != types::I64 {
             return Err("Napalm whole-function JIT requires a 64-bit host".to_owned());
@@ -370,6 +372,12 @@ fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
         let concat_id = module
             .declare_function("napalm_wfjit_string_concat", Linkage::Import, &leaf_sig)
             .map_err(|e| format!("cannot declare string concatenation helper: {e}"))?;
+        let mut new_object_sig = module.make_signature();
+        new_object_sig.params.extend([AbiParam::new(pointer), AbiParam::new(types::I32), AbiParam::new(types::I64), AbiParam::new(types::I32), AbiParam::new(pointer)]);
+        new_object_sig.returns.push(AbiParam::new(types::I64));
+        let new_object_id = module
+            .declare_function("napalm_wfjit_new_object", Linkage::Import, &new_object_sig)
+            .map_err(|e| format!("cannot declare object allocation helper: {e}"))?;
 
         Ok((module, JitHelpers {
             runtime_op: runtime_id,
@@ -393,6 +401,7 @@ fn new_jit_module() -> Result<(JITModule, JitHelpers), String> {
             write_barrier: write_barrier_id,
             store_field_checked: store_field_checked_id,
             string_concat: concat_id,
+            new_object: new_object_id,
         }))
 }
 
@@ -511,6 +520,8 @@ impl WholeFunctionJit {
         native_direct_method_class_slots: &crate::napalm_collections::HashMap<ClassId, u32>,
         native_direct_method_targets: &crate::napalm_collections::HashMap<(ReceiverClass, MethodSymbol), CallTarget>,
         native_plain_store_classes: &crate::napalm_collections::HashMap<usize, u64>,
+        object_layouts: &crate::napalm_collections::HashMap<usize, crate::napalm_tracing_jit::TraceObjectLayout>,
+        cached_invokes: &crate::napalm_collections::HashMap<usize, (u64, u32)>,
         inline_callees: &crate::napalm_collections::HashMap<u32, wf_ir::WfFunctionData<'_>>,
         manifest: Option<&crate::napalm_builtin::BuiltinManifest>,
         reactive_enabled: bool,
@@ -579,6 +590,8 @@ impl WholeFunctionJit {
             reachable,
             identity_sites: identity_sites.to_vec(),
             plain_store_classes: native_plain_store_classes.clone(),
+            object_layouts: object_layouts.clone(),
+            cached_invokes: cached_invokes.clone(),
         };
         let source = wf_ir::WfSource {
             root: &root,
@@ -684,6 +697,7 @@ impl WfCodegen {
                 write_barrier: self.module.declare_func_in_func(self.helpers.write_barrier, func),
                 store_field_checked: self.module.declare_func_in_func(self.helpers.store_field_checked, func),
                 string_concat: self.module.declare_func_in_func(self.helpers.string_concat, func),
+                new_object: self.module.declare_func_in_func(self.helpers.new_object, func),
             };
             let mut b = FunctionBuilder::new(&mut self.context.func, &mut self.function_context);
             wf_lower::lower_body(&mut b, ir, fast_alloc, helpers);
@@ -1648,6 +1662,58 @@ fn plain_store_classes_for(vm: &Interpreter<'_>, target: u32) -> crate::napalm_c
     classes
 }
 
+/// Native layouts of the object-creating ops of `target` (op index -> what a
+/// `WfInst::NewObject` allocates), when the VM can describe them: small
+/// literals with stable keys, empty objects, class-instance shells.
+fn object_layouts_for(
+    vm: &Interpreter<'_>,
+    target: u32,
+) -> crate::napalm_collections::HashMap<usize, crate::napalm_tracing_jit::TraceObjectLayout> {
+    let mut layouts = crate::napalm_collections::HashMap::default();
+    let prepared = &vm.prepared.functions[target as usize];
+    let bytecode = &vm.program.functions[target as usize];
+    for index in 0..prepared.ops.len() {
+        let raw_pc = prepared.raw_pcs[index];
+        if !matches!(bytecode.chunk.code[raw_pc as usize].opcode(), Some(Opcode::NewObjectEmpty | Opcode::NewObjectShape
+            | Opcode::NewObjectWithProperties | Opcode::NewInterfaceOrTypeObject | Opcode::NewClassInstance))
+        {
+            continue;
+        }
+        let location = TraceLocation::new(prepared.id, BytecodePc(raw_pc));
+        if let Some(layout) = vm.trace_object_layout(location) {
+            layouts.insert(index, layout);
+        }
+    }
+    layouts
+}
+/// The single bytecode method the runtime inline cache of Invoke op `index`
+/// of `function` has seen, as (receiver class, target): a dispatch profile for
+/// sites the interpreter never quickened (e.g. run first by a trace).
+fn cached_invoke_target(vm: &Interpreter<'_>, function: u32, index: usize) -> Option<(u64, u32)> {
+    let slot = vm.prepared.functions.get(function as usize)?.original_ops.get(index)?.x;
+    let cache = vm.inline_caches.get(function as usize)?.get(slot as usize)?;
+    if cache.megamorphic || cache.len != 1 {
+        return None;
+    }
+    match cache.entries[0].target {
+        CallTarget::Bytecode(target) if cache.entries[0].class.0 != 0 => Some((cache.entries[0].class.0, target)),
+        _ => None,
+    }
+}
+
+/// `cached_invoke_target` for every Invoke op of `target`.
+fn cached_invokes_for(vm: &Interpreter<'_>, target: u32) -> crate::napalm_collections::HashMap<usize, (u64, u32)> {
+    let mut invokes = crate::napalm_collections::HashMap::default();
+    let prepared = &vm.prepared.functions[target as usize];
+    let bytecode = &vm.program.functions[target as usize];
+    for index in 0..prepared.ops.len() {
+        if bytecode.chunk.code[prepared.raw_pcs[index] as usize].opcode() != Some(Opcode::Invoke) { continue; }
+        if let Some(cached) = cached_invoke_target(vm, target, index) {
+            invokes.insert(index, cached);
+        }
+    }
+    invokes
+}
 /// Builder view of one function (borrowed from the VM for one compilation).
 ///
 /// # Safety
@@ -1665,6 +1731,8 @@ unsafe fn wf_function_data(vm: &Interpreter<'_>, index: u32) -> wf_ir::WfFunctio
         reachable: reachable_ops(function, bytecode),
         identity_sites: native_identity_sites(vm, index),
         plain_store_classes: plain_store_classes_for(vm, index),
+        object_layouts: object_layouts_for(vm, index),
+        cached_invokes: cached_invokes_for(vm, index),
     }
 }
 
@@ -1697,7 +1765,10 @@ unsafe fn collect_inline_callees(
                             }),
                         _ => None,
                     },
-                    Some(Opcode::Invoke) => profiled_direct_invoke_site(prepared, index).map(|(_, callee)| callee),
+                    Some(Opcode::Invoke) => profiled_direct_invoke_site(prepared, index).map(|(_, callee)| callee)
+                        .or_else(|| cached_invoke_target(vm, function_index, index).map(|(_, callee)| callee)),
+                    // The constructor of a trace-style allocated instance.
+                    Some(Opcode::NewClassInstance) => (op.cache != NO_INDEX).then_some(op.cache),
                     _ => None,
                 };
                 let Some(callee) = candidate else { continue; };
@@ -1751,6 +1822,8 @@ unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeF
             }
         }
         let native_plain_store_classes = plain_store_classes_for(vm, target);
+        let object_layouts = object_layouts_for(vm, target);
+        let cached_invokes = cached_invokes_for(vm, target);
         let small_map_fast_alloc = vm.heap.inline_map_fast_allocation_info();
         let identity_sites = native_identity_sites(vm, target);
         let inline_callees = unsafe { collect_inline_callees(vm, target,
@@ -1771,6 +1844,8 @@ unsafe fn compiled_entry(vm: &mut Interpreter<'_>, target: u32) -> Option<WholeF
                 &native_direct_method_class_slots,
                 &native_direct_method_targets,
                 &native_plain_store_classes,
+                &object_layouts,
+                &cached_invokes,
                 &inline_callees,
                 manifest.map(|manifest| unsafe { &*manifest }),
                 vm.reactive_enabled,
@@ -2575,7 +2650,12 @@ unsafe fn finish_explicit_call(
     let in_callee = |vm: &Interpreter<'static>| vm.run_state == RunState::Running
         && vm.current_fiber == caller_fiber
         && vm.fiber(caller_fiber).frames.len() > caller_depth;
-    if let Some(target) = entered.filter(|&target| in_callee(vm) && vm.hot_function_index == target) {
+    // Enter natively only a frame that is still at its entry: entering it may
+    // already have run (part of) the body natively and bailed out mid-way
+    // (`enter_method_bytecode_call` tries the native entry itself). Running
+    // the body again from the start would read parameters from registers the
+    // first run already reused.
+    if let Some(target) = entered.filter(|&target| in_callee(vm) && vm.hot_function_index == target && vm.hot_pc == 0) {
         match unsafe { compiled_entry(vm, target) } {
             Some(entry) => {
                 if let Some(jit) = vm.whole_function_jit.as_mut() {

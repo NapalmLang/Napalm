@@ -43,6 +43,8 @@
         "py::bench::fib": "python bench/fib.py",
         "py::bench::trees": "python bench/trees.py",
         "cargo::build": "cargo build --release",
+        "cargo::build::pgo": "node tools/pgo.ts",
+        "cargo::build::pgo::compare": "node tools/pgo.ts --compare",
         "test::scripts": "node tools/run-scripts.ts",
         "test::rust": "cargo test --release -- --test-threads=1"
     },

@@ -258,3 +258,40 @@ encoding, metadata semantics or builtin identities must bump `FORMAT_VERSION`.
 Postcard encodes fields by position, so any change to a serialized struct or
 enum (adding, removing or reordering fields or variants) is also a format break
 and must bump it. Cross-version runtime compatibility is not implied.
+
+
+## Optimized runtime builds (PGO)
+
+`node tools/pgo.ts` (`npm run cargo::build::pgo`) builds a profile-guided
+optimized Napalm. Because `--compile` copies the running runtime, executables
+compiled with this `napalm.exe` inherit the optimization.
+
+1. Builds an instrumented Napalm (`-Cprofile-generate`, in `target/pgo-gen`).
+2. Trains it on every script in `scripts/` and `lsp/scripts/` (with the JIT
+   and with `NAPALM_NO_JIT=1`), the LSP test suite (live LSP sessions through
+   `NAPALM_BIN`) and the Rust integration tests.
+3. Merges the profiles with the toolchain's `llvm-profdata` (`rustup component
+   add llvm-tools`).
+4. Rebuilds with `-Cprofile-use` into `target/pgo/<host>/release/`, with
+   `LLVM-C.dll` beside it.
+
+Flags go through `cargo --config target.<host>.rustflags=[...]`, which cargo
+appends to `.cargo/config.toml` (static CRT, AES). A `RUSTFLAGS` variable would
+replace them instead. Passing `--target` keeps the instrumentation off build
+scripts and proc-macros. The profile (`target/pgo-data`) is regenerated on
+every run and never committed, because it goes stale as soon as the code
+changes. The whole run takes about 6–15 minutes.
+
+`--compare` times the result against `target/release` (interleaved runs,
+medians). It optimizes the Rust side (interpreter, runtime helpers, compiler,
+GC), not code the JITs generate. Measured on 2026-11-28:
+
+| Benchmark | Change |
+| --- | --- |
+| LSP (`parser_bench`, `parser_selfhost`, `intelligence_smoke`) | 10–13% faster |
+| `reactive_bench` | 17% faster |
+| JIT-hot scripts (fib, trees, jit) | 0–4% faster |
+
+Other options: `--quick`, `--no-lsp`, `--no-rust-tests`, `--unit-tests` (off
+by default: unit tests skew the profile towards rare paths), `--extra <dir>`,
+`--jobs <n>`, `--copy-to <dir>`.

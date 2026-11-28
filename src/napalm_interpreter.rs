@@ -3585,10 +3585,9 @@ impl HandleTable {
     }
 
     /// Whether any recycled handle is waiting on the free stack.
-    /// Deferred handles count: most of them are dead and a refill reuses them.
     #[inline]
     fn has_recycled(&self) -> bool {
-        self.free_count.load(Ordering::Relaxed) != 0 || DEFERRED_HANDLES.pending.load(Ordering::Relaxed) != 0
+        self.free_count.load(Ordering::Relaxed) != 0
     }
 
     /// Push free (unpublished, cleared) handles onto the free stack.
@@ -3672,21 +3671,14 @@ impl HandleTable {
         unsafe { &*chunk.add((handle & HANDLE_CHUNK_MASK) as usize) }
     }
 
-    /// The generation of a live handle, `None` for a free or dead one. A
-    /// handle whose deferred sweep is pending still holds its dead object's
-    /// address, so the last collection's mark bits decide.
+    /// The generation of a live handle, `None` for a free one.
     #[inline(always)]
     fn generation(&self, handle: u32) -> Option<u64> {
         let entry = self.existing_entry(handle)?;
-        let address = entry.address.load(Ordering::Relaxed);
-        if address == 0 {
+        if entry.address.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        let word = self.generation_entry(handle).load(Ordering::Relaxed);
-        if unlikely(word & GENERATION_PENDING != 0) && !crate::napalm_gc::survived_last_collection(address) {
-            return None;
-        }
-        Some(word & !GENERATION_PENDING)
+        Some(self.generation_entry(handle).load(Ordering::Relaxed))
     }
 
     #[inline(always)]
@@ -3755,8 +3747,7 @@ impl HandleTable {
             // Popping made this handle exclusively ours, so a plain load+store
             // is enough; concurrent readers only load.
             let generation = self.generation_entry(handle);
-            debug_assert_eq!(generation.load(Ordering::Relaxed) & GENERATION_PENDING, 0);
-            generation.store((generation.load(Ordering::Relaxed) & !GENERATION_PENDING) + 1, Ordering::Relaxed);
+            generation.store(generation.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
             out.push(handle);
         }
         count
@@ -4398,185 +4389,6 @@ fn release_swept_handles(dead: &[u32]) {
     handles().release_batch(dead);
 }
 
-/// Generation-word flag of a handle waiting in [`DEFERRED_HANDLES`]: whether it
-/// is alive is then decided by the last collection's mark bits (see
-/// `HandleTable::generation`). Cleared when the handle is swept.
-const GENERATION_PENDING: u64 = 1 << 63;
-
-/// Handles of cleanup-free young objects (see `sweep_deferrable`) whose sweep
-/// the last collection deferred. Background sweeper threads release them while
-/// mutators run (measured: sweeping them on the mutator itself cost more
-/// throughput than the parallel in-pause sweep), and the next collection sweeps
-/// whatever is left before it marks anything.
-struct DeferredHandles {
-    ids: Mutex<Vec<u32>>,
-    /// `ids.len()`, readable without the lock.
-    pending: AtomicUsize,
-    /// Chunks claimed from `ids` and still being swept.
-    in_flight: AtomicUsize,
-    /// Wakes the background sweepers when a collection queues handles.
-    wake: parking_lot::Condvar,
-}
-
-static DEFERRED_HANDLES: DeferredHandles = DeferredHandles {
-    ids: Mutex::new(Vec::new()),
-    pending: AtomicUsize::new(0),
-    in_flight: AtomicUsize::new(0),
-    wake: parking_lot::Condvar::new(),
-};
-
-/// Deferred handles one sweeper claims at a time.
-const DEFERRED_SWEEP_CHUNK: usize = 1024;
-
-/// Background threads sweeping deferred handles: as many as the in-pause
-/// sweep (measured: half as many fell behind, so mutators helped serially).
-fn deferred_sweeper_threads() -> usize {
-    crate::napalm_gc::sweep_threads(usize::MAX).max(1)
-}
-
-static DEFERRED_SWEEPERS: OnceLock<()> = OnceLock::new();
-
-/// Start the background sweepers once.
-fn ensure_deferred_sweepers() {
-    DEFERRED_SWEEPERS.get_or_init(|| {
-        for index in 0..deferred_sweeper_threads() {
-            std::thread::Builder::new()
-                .name(format!("napalm-gc-sweep-{index}"))
-                .spawn(deferred_sweeper_loop)
-                .expect("cannot start a GC sweeper thread");
-        }
-    });
-}
-
-fn deferred_sweeper_loop() {
-    loop {
-        let chunk = {
-            let mut queue = DEFERRED_HANDLES.ids.lock();
-            while queue.is_empty() {
-                DEFERRED_HANDLES.wake.wait(&mut queue);
-            }
-            claim_deferred_chunk(&mut queue)
-        };
-        sweep_deferred_part(&chunk);
-        DEFERRED_HANDLES.in_flight.fetch_sub(1, Ordering::Release);
-    }
-}
-
-/// Take a chunk off the queue (lock held), counting it as in flight.
-fn claim_deferred_chunk(queue: &mut Vec<u32>) -> Vec<u32> {
-    let start = queue.len().saturating_sub(DEFERRED_SWEEP_CHUNK);
-    let chunk = queue.split_off(start);
-    DEFERRED_HANDLES.pending.store(queue.len(), Ordering::Relaxed);
-    DEFERRED_HANDLES.in_flight.fetch_add(1, Ordering::Relaxed);
-    chunk
-}
-
-/// Whether an object's cleanup is a no-op for its whole life, so its young
-/// handle may be swept after the pause (`Mutator::defer_logged_id`): inline
-/// Instances (their field count never changes) and plain-value objects.
-/// Shaped Maps are excluded: they can spill into owned storage later.
-#[inline(always)]
-fn sweep_deferrable(object: &HeapObject) -> bool {
-    match object {
-        HeapObject::Instance(instance) => instance.is_inline(),
-        HeapObject::Range { .. } | HeapObject::Date { .. } | HeapObject::MapEntry { .. } => true,
-        _ => false,
-    }
-}
-
-/// `IdSweeper::defer` (called by each in-pause sweep thread for its share):
-/// flag the handles, so identity checks consult the mark bits until each one
-/// is swept, queue them, and wake the background sweepers.
-fn defer_swept_handles(ids: Vec<u32>) {
-    let table = handles();
-    for &id in &ids {
-        let generation = table.generation_entry(id);
-        generation.store(generation.load(Ordering::Relaxed) | GENERATION_PENDING, Ordering::Relaxed);
-    }
-    ensure_deferred_sweepers();
-    let mut queue = DEFERRED_HANDLES.ids.lock();
-    if queue.is_empty() {
-        *queue = ids;
-    } else {
-        queue.extend_from_slice(&ids);
-    }
-    DEFERRED_HANDLES.pending.store(queue.len(), Ordering::Relaxed);
-    DEFERRED_HANDLES.wake.notify_all();
-}
-
-/// Sweep one deferred handle: a survivor only loses its pending flag; a dead
-/// one has its (cleanup-free) entry cleared. Returns whether it was dead.
-#[inline]
-fn sweep_deferred_handle(table: &HandleTable, id: u32) -> bool {
-    let entry = table.entry(id);
-    let address = entry.address.load(Ordering::Relaxed);
-    debug_assert_ne!(address, 0, "deferred handles are tagged after publication");
-    let generation = table.generation_entry(id);
-    let word = generation.load(Ordering::Relaxed) & !GENERATION_PENDING;
-    if crate::napalm_gc::survived_last_collection(address) {
-        generation.store(word, Ordering::Relaxed);
-        return false;
-    }
-    unsafe { HandleTable::drop_contracts(entry) };
-    entry.clear_jit_view();
-    entry.next_free.store(FREE_HANDLE_NONE, Ordering::Relaxed);
-    entry.address.store(0, Ordering::Relaxed);
-    generation.store(word, Ordering::Relaxed);
-    true
-}
-
-/// Sweep deferred handles into the free stack (dead) and the mature id list
-/// (survivors). Returns how many were dead.
-fn sweep_deferred_part(ids: &[u32]) -> usize {
-    let table = handles();
-    let mut dead = Vec::with_capacity(crate::napalm_gc::ID_RELEASE_CHUNK);
-    let mut survivors = Vec::new();
-    let mut released = 0;
-    for &id in ids {
-        if sweep_deferred_handle(table, id) {
-            dead.push(id);
-            if dead.len() == crate::napalm_gc::ID_RELEASE_CHUNK {
-                table.push_free(&dead);
-                released += dead.len();
-                dead.clear();
-            }
-        } else {
-            survivors.push(id);
-        }
-    }
-    table.push_free(&dead);
-    crate::napalm_gc::add_mature_ids(&survivors);
-    released + dead.len()
-}
-
-/// `IdSweeper::finish_deferred`: sweep every pending deferred handle (split
-/// across the sweep threads when there are many) and wait for the chunks the
-/// background sweepers are still on, so none outlives the old mark bits.
-fn finish_deferred_handles() {
-    let ids = {
-        let mut queue = DEFERRED_HANDLES.ids.lock();
-        DEFERRED_HANDLES.pending.store(0, Ordering::Relaxed);
-        std::mem::take(&mut *queue)
-    };
-    let threads = crate::napalm_gc::sweep_threads(ids.len());
-    if threads <= 1 {
-        sweep_deferred_part(&ids);
-    } else {
-        let chunk = ids.len().div_ceil(threads);
-        std::thread::scope(|scope| {
-            for part in ids.chunks(chunk) {
-                scope.spawn(move || sweep_deferred_part(part));
-            }
-        });
-    }
-    // A claimed chunk is a bounded amount of work that never blocks.
-    while DEFERRED_HANDLES.in_flight.load(Ordering::Acquire) != 0 {
-        std::hint::spin_loop();
-        std::thread::yield_now();
-    }
-}
-
-
 macro_rules! gc_descriptor {
     ($name:ident, $label:literal, $trace:expr) => {
         static $name: GcDescriptor = GcDescriptor {
@@ -5071,11 +4883,6 @@ struct Heap {
     /// A handle-pressure collection freed nothing (every handle is live), so
     /// further ones are pointless until some handle is recycled again.
     handle_gc_futile: bool,
-    /// Tag cleanup-free objects for the deferred (background) sweep. Opt-in with
-    /// `NAPALM_GC_DEFER=1`: it shortens nursery pauses (~45% on Instance-heavy
-    /// code) but measured 9-13% slower overall there, and neutral elsewhere, than
-    /// sweeping everything in the parallel pause. For latency-sensitive programs.
-    defer_sweeps: bool,
     /// Immutable slot-to-class identity for contracts checked by host primitives.
     contract_class_ids: Vec<ClassId>,
     /// Per class slot: its superclass slot, filled when the class layout is
@@ -5131,8 +4938,6 @@ impl Default for Heap {
         mutator.set_id_sweeper(crate::napalm_gc::IdSweeper {
             resolve: resolve_handle_address,
             release: release_swept_handles,
-            defer: defer_swept_handles,
-            finish_deferred: finish_deferred_handles,
         });
         let allocation_roots = Arc::new(AllocationRootBuffer::new());
         let provider: Arc<dyn GcRootProvider> = allocation_roots.clone();
@@ -5157,7 +4962,6 @@ impl Default for Heap {
             managed_fast_allocation,
             handle_gc_pending: false,
             handle_gc_futile: false,
-            defer_sweeps: std::env::var_os("NAPALM_GC_DEFER").is_some_and(|value| value == "1"),
             contract_class_ids: Vec::new(),
             contract_class_parents: Vec::new(),
             class_implements: Vec::new(),
@@ -5343,10 +5147,6 @@ impl Heap {
         entry.len.store(count, Ordering::Relaxed);
         entry.promise_value.store(0, Ordering::Relaxed);
         entry.kind.store(TraceHeapKind::Instance as u32, Ordering::Release);
-        // Inline fields never move out of the object: cleanup-free for life.
-        if self.defer_sweeps {
-            self.mutator.defer_logged_id(handle);
-        }
         let value = Value::from_heap(handle);
         #[cfg(test)]
         self.allocations.push(value);
@@ -5363,7 +5163,6 @@ impl Heap {
     unsafe fn alloc_reserved_managed(&mut self, address: usize, object: HeapObject) -> Value {
         let descriptor = descriptor_for(&object);
         let external = external_bytes_for(&object);
-        let deferrable = sweep_deferrable(&object);
         let handle = self.allocate_handle_fast();
         let gc_object = unsafe {
             self.mutator.finish_fast_fixed_uninitialized::<
@@ -5376,9 +5175,6 @@ impl Heap {
             });
         }
         self.handle_table.publish(handle, gc_object, unsafe { &managed_object(gc_object).object });
-        if deferrable && self.defer_sweeps {
-            self.mutator.defer_logged_id(handle);
-        }
         if external != 0 {
             unsafe { self.mutator.set_external_bytes(gc_object, external) };
         }
@@ -5401,21 +5197,11 @@ impl Heap {
     #[cold]
     fn refill_handle_cache(&mut self) -> u32 {
         debug_assert!(self.recycled_handles.is_empty());
-        let mut taken = self
+        if self
             .handle_table
-            .take_recycled_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
-        // Right after a collection the free stack can be empty while the
-        // background sweepers still hold this cycle's dead handles: help with a
-        // chunk rather than growing the handle space with cold fresh IDs.
-        while taken == 0 && DEFERRED_HANDLES.pending.load(Ordering::Relaxed) != 0 {
-            let chunk = claim_deferred_chunk(&mut DEFERRED_HANDLES.ids.lock());
-            sweep_deferred_part(&chunk);
-            DEFERRED_HANDLES.in_flight.fetch_sub(1, Ordering::Release);
-            taken = self
-                .handle_table
-                .take_recycled_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
-        }
-        if taken == 0 {
+            .take_recycled_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH)
+            == 0
+        {
             self.handle_table
                 .take_fresh_batch(&mut self.recycled_handles, HANDLE_RECYCLE_BATCH);
             // Large heaps can hold more small objects than there are handle
@@ -5440,7 +5226,6 @@ impl Heap {
         // returns the new MMTk object.
         self.allocation_roots.prepare(&object);
         self.collect_if_handles_pending();
-        let deferrable = sweep_deferrable(&object);
         let handle = self.allocate_handle_fast();
         let descriptor = descriptor_for(&object);
         let external = external_bytes_for(&object);
@@ -5460,9 +5245,6 @@ impl Heap {
             );
         }
         self.handle_table.publish(handle, gc_object, unsafe { &managed_object(gc_object).object });
-        if deferrable && self.defer_sweeps {
-            self.mutator.defer_logged_id(handle);
-        }
         self.allocation_roots.clear();
         if external != 0 {
             unsafe { self.mutator.set_external_bytes(gc_object, external) };
@@ -26718,65 +26500,6 @@ var result = CallLoop.run();
             assert!(matches!(vm.heap.get(child), Some(HeapObject::String(_))));
             vm.release_root(root);
         }
-    }
-
-    #[test]
-    fn deferred_handle_sweep_hides_dead_objects_and_keeps_survivors() {
-        let mut asm = Assembler::new();
-        asm.emit_a(Opcode::LoadNull, 0);
-        asm.emit_a(Opcode::Return, 0);
-        let program = simple_program(asm.finish().unwrap(), 1);
-        let mut vm = Interpreter::new(&program).unwrap();
-        // Inline Instances are cleanup-free for life: with deferral enabled their
-        // young handles are swept after the pause (see `sweep_deferrable`).
-        vm.heap.defer_sweeps = true;
-        let instance = |vm: &mut Interpreter| vm.heap.alloc(HeapObject::Instance(InstanceObject::nulls(0, 2)));
-        let identity = |value: Value| {
-            let handle = value.heap_handle().unwrap();
-            (handle, handles().generation(handle).unwrap())
-        };
-        let kept = instance(&mut vm);
-        let kept_root = vm.add_root(kept);
-        let kept_identity = identity(kept);
-        // Enough to take the parallel sweep paths in tests.
-        let dead: Vec<_> = (0..4096).map(|_| identity(instance(&mut vm))).collect();
-        vm.heap.mutator.collect();
-        // Until each handle is swept its entry still holds the dead address:
-        // identity checks (reactive graphs) must already see it as dead.
-        for &(handle, generation) in &dead {
-            assert!(!handles().identity_matches(handle, generation), "dead deferred handle {handle} looks alive");
-        }
-        assert!(handles().identity_matches(kept_identity.0, kept_identity.1));
-        assert!(matches!(vm.heap.get(kept), Some(HeapObject::Instance(_))));
-        // Background sweepers release deferred handles while we keep allocating.
-        let fresh: Vec<_> = (0..512)
-            .map(|_| {
-                let value = instance(&mut vm);
-                vm.add_root(value)
-            })
-            .collect();
-        for &(handle, generation) in &dead {
-            assert!(!handles().identity_matches(handle, generation));
-        }
-        // The next collection sweeps whatever is still pending first.
-        vm.heap.mutator.collect();
-        for &(handle, generation) in &dead {
-            let entry = handles().entry(handle);
-            let reused = handles().generation(handle).is_some_and(|current| current != generation);
-            assert!(entry.address.load(Ordering::Relaxed) == 0 || reused, "dead handle {handle} was never swept");
-        }
-        assert!(handles().identity_matches(kept_identity.0, kept_identity.1));
-        // The survivor moved to the mature list: full collections still keep
-        // it, and reclaim it once it dies.
-        vm.collect_garbage();
-        assert!(handles().identity_matches(kept_identity.0, kept_identity.1));
-        assert!(matches!(vm.heap.get(kept), Some(HeapObject::Instance(_))));
-        vm.release_root(kept_root);
-        for root in fresh {
-            vm.release_root(root);
-        }
-        vm.collect_garbage();
-        assert!(!handles().identity_matches(kept_identity.0, kept_identity.1), "dead mature handle was not reclaimed");
     }
 
     #[test]

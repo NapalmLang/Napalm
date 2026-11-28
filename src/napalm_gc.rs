@@ -789,42 +789,10 @@ pub struct IdSweeper {
     /// so it can recycle them with batched rather than per-object atomics.
     /// May be called from several sweep threads at once.
     pub release: fn(&[u32]),
-    /// Takes over this cycle's [`ID_DEFER_TAG`]ged ids (tag stripped) without
-    /// them being resolved in the pause, one share per sweep thread (so it may
-    /// run concurrently). The runtime sweeps them outside the pause with
-    /// [`survived_last_collection`], and must finish before the next
-    /// collection's marking (see `finish_deferred`). It must not touch the id
-    /// lists, whose locks are held meanwhile.
-    pub defer: fn(Vec<u32>),
-    /// Sweeps every deferred id still pending. Called at the start of each
-    /// collection, after mutators stop and before anything is marked, while
-    /// the previous cycle's mark bits are still the ones to consult.
-    pub finish_deferred: fn(),
-}
-
-/// Log tag set by [`Mutator::defer_logged_id`]: the object's cleanup is a
-/// no-op for its whole life, so a young one may be swept after the pause.
-/// Handle ids stay far below this bit.
-pub const ID_DEFER_TAG: u32 = 1 << 31;
-
-/// Whether the object at `address` survived the last collection: marked (or
-/// forwarded) by it. Valid from that collection's end until the next one
-/// starts marking, for objects allocated before it. A dead object's address
-/// may hold a newer object by then, which is unmarked and so reads as dead.
-pub fn survived_last_collection(address: usize) -> bool {
-    address != 0 && unsafe { Object::from_address(address) }.0.is_reachable()
-}
-
-/// Appends ids of objects found alive outside a pause (deferred sweeping) to
-/// the mature id list, which full collections sweep.
-pub fn add_mature_ids(ids: &[u32]) {
-    if !ids.is_empty() {
-        gc().mature_swept_ids.lock().extend_from_slice(ids);
-    }
 }
 
 /// Threads a sweep of `len` ids should use: one below the parallel threshold.
-pub fn sweep_threads(len: usize) -> usize {
+fn sweep_threads(len: usize) -> usize {
     if len < PARALLEL_SWEEP_MIN_IDS {
         1
     } else {
@@ -863,24 +831,16 @@ struct IdSweepPart {
     kept: Vec<u32>,
     /// Young survivors, which move to the mature list.
     survivors: Vec<u32>,
-    /// Young deferred ids (tag stripped), handed to `IdSweeper::defer`.
-    deferred: Vec<u32>,
     released_external: usize,
 }
 
 /// Sweeps `ids` on one thread, releasing dead ones in chunks as it goes.
-/// `young` lists keep unpublished ids, move survivors out, and honor
-/// [`ID_DEFER_TAG`]; the mature list keeps survivors in place.
+/// `young` lists keep unpublished ids and move survivors out; the mature
+/// list keeps survivors in place.
 fn sweep_id_part(ids: &[u32], young: bool, sweeper: &IdSweeper) -> IdSweepPart {
     let mut part = IdSweepPart::default();
     let mut dead = Vec::with_capacity(ID_RELEASE_CHUNK);
-    for &tagged in ids {
-        if young && tagged & ID_DEFER_TAG != 0 {
-            // Cleanup-free for life: the runtime sweeps it after the pause.
-            part.deferred.push(tagged & !ID_DEFER_TAG);
-            continue;
-        }
-        let id = tagged & !ID_DEFER_TAG;
+    for &id in ids {
         let resolved = (sweeper.resolve)(id);
         let address = resolved & !ID_SWEEP_TRIVIAL;
         if address == 0 {
@@ -910,17 +870,12 @@ fn sweep_id_part(ids: &[u32], young: bool, sweeper: &IdSweeper) -> IdSweepPart {
     if !dead.is_empty() {
         (sweeper.release)(&dead);
     }
-    // Hand this share over from its own thread: the runtime's per-handle
-    // bookkeeping then runs in parallel too.
-    if !part.deferred.is_empty() {
-        (sweeper.defer)(std::mem::take(&mut part.deferred));
-    }
     part
 }
 
 /// Reclaims dead id-swept objects. Unpublished ids (address 0) are kept for the
 /// next collection; survivors are appended to `survivors` when provided (the
-/// young list) and deferred ids go to `IdSweeper::defer`.
+/// young list).
 ///
 /// Large lists are split across `Config::sweep_threads` threads: per-object
 /// sweeping (resolve, liveness, cleanup, release) dominates nursery pauses
@@ -1559,23 +1514,6 @@ impl Mutator {
         Some(id)
     }
 
-    /// Mark the id just consumed by `take_logged_id` with [`ID_DEFER_TAG`],
-    /// once its object is published: the object's cleanup is a no-op for its
-    /// whole life, so the collector hands it to `IdSweeper::defer` instead of
-    /// sweeping it in the pause. A no-op when a collection has drained the
-    /// log since the id was taken (it is then swept the ordinary way).
-    #[inline(always)]
-    pub fn defer_logged_id(&mut self, id: u32) {
-        // SAFETY: only the owning Running mutator touches its id log.
-        let ids = unsafe { &mut *self.record.ids.get() };
-        let cursor = unsafe { *self.record.id_cursor.get() };
-        if let Some(slot) = cursor.checked_sub(1).and_then(|last| ids.get_mut(last))
-            && *slot == id
-        {
-            *slot = id | ID_DEFER_TAG;
-        }
-    }
-
     /// Appends ids to this thread's cache. Each must be exclusively owned by the
     /// caller and be consumed through `take_logged_id` by an `id_swept` object.
     pub fn log_ids(&mut self, ids: impl IntoIterator<Item = u32>) {
@@ -2072,7 +2010,6 @@ impl vm::Scanning<Binding> for Scanning {
         if let Some(sweeper) = gc().id_sweeper.get() {
             let started = Instant::now();
             let _account = ScopeTimer(started, &gc().counters.id_sweep_ns);
-            // `defer` must not touch the id lists: both locks are held here.
             let mut mature = gc().mature_swept_ids.lock();
             if !gc().mmtk.get_plan().generational().unwrap().is_current_gc_nursery() {
                 sweep_ids(&mut mature, None, sweeper);
@@ -2139,14 +2076,6 @@ impl vm::Collection<Binding> for Collection {
         for record in &records {
             drain_thread_tracked(gc, record);
             drain_thread_ids(gc, record);
-        }
-        // Ids deferred by the previous cycle are judged by its mark bits, so
-        // they must be swept before this collection prepares or marks anything
-        // (StopMutators runs in the Unconstrained bucket, ahead of Prepare).
-        if let Some(sweeper) = gc.id_sweeper.get() {
-            let started = Instant::now();
-            let _account = ScopeTimer(started, &gc.counters.id_sweep_ns);
-            (sweeper.finish_deferred)();
         }
         for record in records {
             let pointer = unsafe { record.context_ptr() };

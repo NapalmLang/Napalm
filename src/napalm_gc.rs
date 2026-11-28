@@ -283,6 +283,13 @@ pub struct Descriptor {
     pub id_swept: bool,
 }
 
+/// Per-object GC header. `forwarding` must stay at offset 0 (MMTk's in-header
+/// forwarding pointer).
+///
+/// Measured (2026-11-28): packing the sizes as `u32` (a 32-byte header, so
+/// 96-byte small objects instead of 112) sped up allocation-only runs ~7% but
+/// made steady-state GC pauses ~18% longer with the same collections and dead
+/// objects; padding the objects back to 112 bytes restored them exactly.
 #[repr(C, align(16))]
 struct Header {
     forwarding: AtomicUsize,
@@ -290,6 +297,18 @@ struct Header {
     payload_bytes: usize,
     descriptor: &'static Descriptor,
     external_bytes: AtomicUsize,
+}
+
+/// Header for a freshly allocated object of `bytes` total and `payload_bytes`.
+#[inline(always)]
+fn new_header(descriptor: &'static Descriptor, bytes: usize, payload_bytes: usize) -> Header {
+    Header {
+        forwarding: AtomicUsize::new(0),
+        bytes,
+        payload_bytes,
+        descriptor,
+        external_bytes: AtomicUsize::new(0),
+    }
 }
 
 fn trace<V: FnMut(Slot)>(object: Object, visitor: &mut V) {
@@ -324,6 +343,8 @@ pub struct Config {
     /// External-byte growth triggering a collection before the next allocation.
     /// Zero disables this trigger; byte accounting remains enabled.
     pub external_gc_threshold: usize,
+    /// Threads sweeping large id lists (handle logs) in parallel.
+    pub sweep_threads: usize,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -331,6 +352,8 @@ impl Default for Config {
             heap_bytes: 256 << 20,
             workers: 2,
             external_gc_threshold: 64 << 20,
+            // The sweep is memory-bound: a few threads take most of the gain.
+            sweep_threads: std::thread::available_parallelism().map_or(1, |n| n.get()).min(4),
         }
     }
 }
@@ -342,6 +365,9 @@ pub struct Statistics {
     pub full_collections: u64,
     pub pause_ns: u64,
     pub rendezvous_ns: u64,
+    /// Part of pause_ns spent sweeping id-swept objects (handle logs:
+    /// liveness checks, cleanup, handle release), as opposed to tracing.
+    pub id_sweep_ns: u64,
     pub external_bytes: usize,
     pub allocated_bytes: u64,
     pub barrier_slow_calls: u64,
@@ -360,6 +386,7 @@ struct Counters {
     full_collections: AtomicU64,
     pause_ns: AtomicU64,
     rendezvous_ns: AtomicU64,
+    id_sweep_ns: AtomicU64,
     external_bytes: AtomicUsize,
     allocated_bytes: AtomicU64,
     barrier_slow_calls: AtomicU64,
@@ -680,6 +707,7 @@ impl Collector {
             full_collections: c.full_collections.load(Ordering::Relaxed),
             pause_ns: c.pause_ns.load(Ordering::Relaxed),
             rendezvous_ns: c.rendezvous_ns.load(Ordering::Relaxed),
+            id_sweep_ns: c.id_sweep_ns.load(Ordering::Relaxed),
             external_bytes: c.external_bytes.load(Ordering::Relaxed),
             allocated_bytes: c.allocated_bytes.load(Ordering::Relaxed),
             barrier_slow_calls: c.barrier_slow_calls.load(Ordering::Relaxed),
@@ -752,45 +780,178 @@ fn drain_thread_ids(gc: &Collector, record: &ThreadRecord) {
 /// Runtime hooks for `Descriptor::id_swept` objects.
 pub struct IdSweeper {
     /// Current object address for a consumed id, or 0 while it is unpublished.
+    /// The runtime may set [`ID_SWEEP_TRIVIAL`] in the result when the object
+    /// owns nothing its cleanup would release and has no external bytes: a
+    /// dead one is then reclaimed without reading its header or payload.
     pub resolve: fn(u32) -> usize,
-    /// Returns the ids of objects whose cleanup already ran, once per sweep, so
-    /// the runtime can recycle them with batched rather than per-object atomics.
+    /// Returns the ids of objects whose cleanup already ran, in chunks of at
+    /// most [`ID_RELEASE_CHUNK`] while their runtime entries are still cached,
+    /// so it can recycle them with batched rather than per-object atomics.
+    /// May be called from several sweep threads at once.
     pub release: fn(&[u32]),
+    /// Takes over this cycle's [`ID_DEFER_TAG`]ged ids (tag stripped) without
+    /// them being resolved in the pause, one share per sweep thread (so it may
+    /// run concurrently). The runtime sweeps them outside the pause with
+    /// [`survived_last_collection`], and must finish before the next
+    /// collection's marking (see `finish_deferred`). It must not touch the id
+    /// lists, whose locks are held meanwhile.
+    pub defer: fn(Vec<u32>),
+    /// Sweeps every deferred id still pending. Called at the start of each
+    /// collection, after mutators stop and before anything is marked, while
+    /// the previous cycle's mark bits are still the ones to consult.
+    pub finish_deferred: fn(),
 }
 
-/// Reclaims dead id-swept objects. Unpublished ids (address 0) are kept for the
-/// next collection; survivors are appended to `survivors` when provided.
-fn sweep_ids(
-    ids: &mut Vec<u32>,
-    mut survivors: Option<&mut Vec<u32>>,
-    sweeper: &IdSweeper,
-    dead: &mut Vec<u32>,
-) {
-    let mut released_external = 0usize;
-    ids.retain(|&id| {
-        let address = (sweeper.resolve)(id);
+/// Log tag set by [`Mutator::defer_logged_id`]: the object's cleanup is a
+/// no-op for its whole life, so a young one may be swept after the pause.
+/// Handle ids stay far below this bit.
+pub const ID_DEFER_TAG: u32 = 1 << 31;
+
+/// Whether the object at `address` survived the last collection: marked (or
+/// forwarded) by it. Valid from that collection's end until the next one
+/// starts marking, for objects allocated before it. A dead object's address
+/// may hold a newer object by then, which is unmarked and so reads as dead.
+pub fn survived_last_collection(address: usize) -> bool {
+    address != 0 && unsafe { Object::from_address(address) }.0.is_reachable()
+}
+
+/// Appends ids of objects found alive outside a pause (deferred sweeping) to
+/// the mature id list, which full collections sweep.
+pub fn add_mature_ids(ids: &[u32]) {
+    if !ids.is_empty() {
+        gc().mature_swept_ids.lock().extend_from_slice(ids);
+    }
+}
+
+/// Threads a sweep of `len` ids should use: one below the parallel threshold.
+pub fn sweep_threads(len: usize) -> usize {
+    if len < PARALLEL_SWEEP_MIN_IDS {
+        1
+    } else {
+        GC.get().map_or(1, |gc| gc.config.sweep_threads.max(1)).min(len / (PARALLEL_SWEEP_MIN_IDS / 2))
+    }
+}
+
+/// Fewer ids than this are swept on one thread (thread startup would dominate).
+#[cfg(not(test))]
+const PARALLEL_SWEEP_MIN_IDS: usize = 32 * 1024;
+/// Tests exercise the parallel path with small heaps.
+#[cfg(test)]
+const PARALLEL_SWEEP_MIN_IDS: usize = 512;
+
+/// Adds the elapsed time to a counter when dropped.
+struct ScopeTimer<'a>(Instant, &'a AtomicU64);
+impl Drop for ScopeTimer<'_> {
+    fn drop(&mut self) {
+        self.1.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// `IdSweeper::resolve` tag: the object's cleanup is a no-op and it has no
+/// external bytes. Object addresses are `MAX_ALIGNMENT`-aligned, so bit 0 is free.
+pub const ID_SWEEP_TRIVIAL: usize = 1;
+const _: () = assert!(MAX_ALIGNMENT > ID_SWEEP_TRIVIAL);
+
+/// Dead ids handed to `IdSweeper::release` at a time. Small enough that the
+/// entries `resolve` just read are still in L1/L2 when they are released.
+pub const ID_RELEASE_CHUNK: usize = 256;
+
+/// What one sweep thread produced from its share of an id list.
+#[derive(Default)]
+struct IdSweepPart {
+    /// Ids that stay in the swept list (young unpublished ids; mature survivors).
+    kept: Vec<u32>,
+    /// Young survivors, which move to the mature list.
+    survivors: Vec<u32>,
+    /// Young deferred ids (tag stripped), handed to `IdSweeper::defer`.
+    deferred: Vec<u32>,
+    released_external: usize,
+}
+
+/// Sweeps `ids` on one thread, releasing dead ones in chunks as it goes.
+/// `young` lists keep unpublished ids, move survivors out, and honor
+/// [`ID_DEFER_TAG`]; the mature list keeps survivors in place.
+fn sweep_id_part(ids: &[u32], young: bool, sweeper: &IdSweeper) -> IdSweepPart {
+    let mut part = IdSweepPart::default();
+    let mut dead = Vec::with_capacity(ID_RELEASE_CHUNK);
+    for &tagged in ids {
+        if young && tagged & ID_DEFER_TAG != 0 {
+            // Cleanup-free for life: the runtime sweeps it after the pause.
+            part.deferred.push(tagged & !ID_DEFER_TAG);
+            continue;
+        }
+        let id = tagged & !ID_DEFER_TAG;
+        let resolved = (sweeper.resolve)(id);
+        let address = resolved & !ID_SWEEP_TRIVIAL;
         if address == 0 {
-            return survivors.is_some();
+            if young {
+                part.kept.push(id);
+            }
+            continue;
         }
         let object = unsafe { Object::from_address(address) };
         if object.0.is_reachable() {
-            match survivors.as_deref_mut() {
-                Some(survivors) => {
-                    survivors.push(id);
-                    false
-                }
-                None => true,
-            }
-        } else {
+            if young { part.survivors.push(id) } else { part.kept.push(id) }
+            continue;
+        }
+        if resolved & ID_SWEEP_TRIVIAL == 0 {
             let header = unsafe { object.header() };
-            released_external += header.external_bytes.load(Ordering::Relaxed);
+            part.released_external += header.external_bytes.load(Ordering::Relaxed);
             if let Some(cleanup) = header.descriptor.cleanup {
                 unsafe { cleanup(object) };
             }
-            dead.push(id);
-            false
         }
-    });
+        dead.push(id);
+        if dead.len() >= ID_RELEASE_CHUNK {
+            (sweeper.release)(&dead);
+            dead.clear();
+        }
+    }
+    if !dead.is_empty() {
+        (sweeper.release)(&dead);
+    }
+    // Hand this share over from its own thread: the runtime's per-handle
+    // bookkeeping then runs in parallel too.
+    if !part.deferred.is_empty() {
+        (sweeper.defer)(std::mem::take(&mut part.deferred));
+    }
+    part
+}
+
+/// Reclaims dead id-swept objects. Unpublished ids (address 0) are kept for the
+/// next collection; survivors are appended to `survivors` when provided (the
+/// young list) and deferred ids go to `IdSweeper::defer`.
+///
+/// Large lists are split across `Config::sweep_threads` threads: per-object
+/// sweeping (resolve, liveness, cleanup, release) dominates nursery pauses
+/// when most objects die, and the parts are independent. Cleanups may then run
+/// concurrently on different objects; payloads only share atomically counted
+/// state (`Arc`, string buffers), and `release` takes its own locks.
+fn sweep_ids(ids: &mut Vec<u32>, survivors: Option<&mut Vec<u32>>, sweeper: &IdSweeper) {
+    let young = survivors.is_some();
+    let threads = sweep_threads(ids.len());
+    let parts: Vec<IdSweepPart> = if threads <= 1 {
+        vec![sweep_id_part(ids, young, sweeper)]
+    } else {
+        let chunk = ids.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = ids
+                .chunks(chunk)
+                .map(|part| scope.spawn(move || sweep_id_part(part, young, sweeper)))
+                .collect();
+            handles.into_iter().map(|handle| handle.join().expect("GC sweep thread panicked")).collect()
+        })
+    };
+    ids.clear();
+    let mut released_external = 0usize;
+    let mut survivors = survivors;
+    for part in parts {
+        ids.extend_from_slice(&part.kept);
+        if let Some(survivors) = survivors.as_deref_mut() {
+            survivors.extend_from_slice(&part.survivors);
+        }
+        released_external += part.released_external;
+    }
     if released_external != 0 {
         gc().counters
             .external_bytes
@@ -1102,21 +1263,14 @@ impl Mutator {
         let object = Object(
             ObjectReference::from_raw_address(raw).expect("null fast-path allocation"),
         );
-        unsafe {
-            ptr::write(
-                raw.to_mut_ptr::<Header>(),
-                Header {
-                    forwarding: AtomicUsize::new(0),
-                    bytes,
-                    payload_bytes: PAYLOAD_BYTES,
-                    descriptor,
-                    external_bytes: AtomicUsize::new(0),
-                },
-            );
-        }
+        unsafe { ptr::write(raw.to_mut_ptr::<Header>(), new_header(descriptor, bytes, PAYLOAD_BYTES)) };
 
-        let context = unsafe { self.pointer.as_mut() };
-        mm::post_alloc(context, object.0, bytes, AllocationSemantics::Default);
+        // The fast path is the default (Immix) allocator's bump pointer, whose
+        // post-alloc hook is empty unless MMTk keeps valid-object bits.
+        if !mm::IMMIX_POST_ALLOC_IS_NOOP {
+            let context = unsafe { self.pointer.as_mut() };
+            mm::post_alloc(context, object.0, bytes, AllocationSemantics::Default);
+        }
         if (descriptor.cleanup.is_some() && !descriptor.id_swept) || descriptor.finalizer.is_some() {
             unsafe { &mut *self.record.tracked.get() }.push(Tracked {
                 object,
@@ -1216,24 +1370,10 @@ impl Mutator {
         };
         debug_assert!(!address.is_zero(), "MMTk returned a null allocation");
         let object = Object(ObjectReference::from_raw_address(address).unwrap());
-        unsafe {
-            ptr::write(
-                address.to_mut_ptr::<Header>(),
-                Header {
-                    forwarding: AtomicUsize::new(0),
-                    bytes,
-                    payload_bytes: PAYLOAD_BYTES,
-                    descriptor,
-                    external_bytes: AtomicUsize::new(0),
-                },
-            );
+        unsafe { ptr::write(address.to_mut_ptr::<Header>(), new_header(descriptor, bytes, PAYLOAD_BYTES)) };
+        if !mm::IMMIX_POST_ALLOC_IS_NOOP {
+            mm::post_alloc(context, object.0, bytes, AllocationSemantics::Default);
         }
-        mm::post_alloc(
-            context,
-            object.0,
-            bytes,
-            AllocationSemantics::Default,
-        );
         if (descriptor.cleanup.is_some() && !descriptor.id_swept) || descriptor.finalizer.is_some() {
             // SAFETY: only this thread mutates its record while Running. GC
             // drains the vector only after all Running mutators have parked.
@@ -1296,16 +1436,7 @@ impl Mutator {
         let object = Object(ObjectReference::from_raw_address(address).unwrap());
         unsafe {
             if ZERO { ptr::write_bytes(address.to_mut_ptr::<u8>(), 0, bytes); }
-            ptr::write(
-                address.to_mut_ptr::<Header>(),
-                Header {
-                    forwarding: AtomicUsize::new(0),
-                    bytes,
-                    payload_bytes,
-                    descriptor,
-                    external_bytes: AtomicUsize::new(0),
-                },
-            );
+            ptr::write(address.to_mut_ptr::<Header>(), new_header(descriptor, bytes, payload_bytes));
         }
         mm::post_alloc(context, object.0, bytes, semantics);
         if (descriptor.cleanup.is_some() && !descriptor.id_swept) || descriptor.finalizer.is_some() {
@@ -1426,6 +1557,23 @@ impl Mutator {
         let id = *ids.get(*cursor)?;
         *cursor += 1;
         Some(id)
+    }
+
+    /// Mark the id just consumed by `take_logged_id` with [`ID_DEFER_TAG`],
+    /// once its object is published: the object's cleanup is a no-op for its
+    /// whole life, so the collector hands it to `IdSweeper::defer` instead of
+    /// sweeping it in the pause. A no-op when a collection has drained the
+    /// log since the id was taken (it is then swept the ordinary way).
+    #[inline(always)]
+    pub fn defer_logged_id(&mut self, id: u32) {
+        // SAFETY: only the owning Running mutator touches its id log.
+        let ids = unsafe { &mut *self.record.ids.get() };
+        let cursor = unsafe { *self.record.id_cursor.get() };
+        if let Some(slot) = cursor.checked_sub(1).and_then(|last| ids.get_mut(last))
+            && *slot == id
+        {
+            *slot = id | ID_DEFER_TAG;
+        }
     }
 
     /// Appends ids to this thread's cache. Each must be exclusively owned by the
@@ -1922,15 +2070,14 @@ impl vm::Scanning<Binding> for Scanning {
         gc().mature_tracked.lock().append(&mut tracked);
         drop(tracked);
         if let Some(sweeper) = gc().id_sweeper.get() {
-            let mut dead = Vec::new();
+            let started = Instant::now();
+            let _account = ScopeTimer(started, &gc().counters.id_sweep_ns);
+            // `defer` must not touch the id lists: both locks are held here.
             let mut mature = gc().mature_swept_ids.lock();
             if !gc().mmtk.get_plan().generational().unwrap().is_current_gc_nursery() {
-                sweep_ids(&mut mature, None, sweeper, &mut dead);
+                sweep_ids(&mut mature, None, sweeper);
             }
-            sweep_ids(&mut gc().swept_ids.lock(), Some(&mut mature), sweeper, &mut dead);
-            if !dead.is_empty() {
-                (sweeper.release)(&dead);
-            }
+            sweep_ids(&mut gc().swept_ids.lock(), Some(&mut mature), sweeper);
         }
         gc().weak.lock().retain(|weak| {
             if let Some(cell) = weak.upgrade() {
@@ -1992,6 +2139,14 @@ impl vm::Collection<Binding> for Collection {
         for record in &records {
             drain_thread_tracked(gc, record);
             drain_thread_ids(gc, record);
+        }
+        // Ids deferred by the previous cycle are judged by its mark bits, so
+        // they must be swept before this collection prepares or marks anything
+        // (StopMutators runs in the Unconstrained bucket, ahead of Prepare).
+        if let Some(sweeper) = gc.id_sweeper.get() {
+            let started = Instant::now();
+            let _account = ScopeTimer(started, &gc.counters.id_sweep_ns);
+            (sweeper.finish_deferred)();
         }
         for record in records {
             let pointer = unsafe { record.context_ptr() };

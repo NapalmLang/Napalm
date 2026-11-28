@@ -22,6 +22,9 @@ impl Scratch {
         Command::new(env!("CARGO_BIN_EXE_napalm"))
             .current_dir(&self.0)
             .env("NAPALM_NO_JIT", "1")
+            // Debug builds keep MMTk's INFO logs (timestamps, ASLR addresses)
+            // on stderr, which would make stderr comparisons profile-dependent.
+            .env("RUST_LOG", "off")
             .args(args)
             .output()
             .unwrap()

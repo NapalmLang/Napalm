@@ -22,6 +22,9 @@ impl Scratch {
         Command::new(env!("CARGO_BIN_EXE_napalm"))
             .current_dir(&self.0)
             .env("NAPALM_NO_JIT", "1")
+            // Debug builds keep MMTk's INFO logs (timestamps, ASLR addresses)
+            // on stderr, which would make stderr comparisons profile-dependent.
+            .env("RUST_LOG", "off")
             .args(args)
             .output()
             .unwrap()
@@ -96,11 +99,23 @@ fn compiled_executable_reports_runtime_errors_like_napalm() {
     let scratch = Scratch::new();
     std::fs::write(scratch.0.join("fails.napalm"), "System.print('before'); throw 'boom';").unwrap();
     assert_success(&scratch.napalm(&["--compile", "fails.napalm"]));
-    let output = Command::new(scratch.0.join(exe("fails"))).env("NAPALM_NO_JIT", "1").output().unwrap();
+    let output = Command::new(scratch.0.join(exe("fails")))
+        .env("NAPALM_NO_JIT", "1")
+        .env("RUST_LOG", "off")
+        .output()
+        .unwrap();
     let reference = scratch.napalm(&["fails.napalm"]);
     assert_eq!(output.status.code(), Some(4));
     assert_eq!(output.stdout, reference.stdout);
-    assert_eq!(output.stderr, reference.stderr);
+    assert_eq!(output.stderr, without_debug_banner(&reference.stderr));
+}
+
+/// `napalm` debug builds open stderr with a performance notice that
+/// standalone executables (which start straight at their payload) omit.
+fn without_debug_banner(stderr: &[u8]) -> Vec<u8> {
+    const BANNER: &[u8] = b"Debug build: use `cargo run --release -- <file.nap>` for performance measurements.";
+    let Some(rest) = stderr.strip_prefix(BANNER) else { return stderr.to_vec() };
+    rest.strip_prefix(b"\r\n").or_else(|| rest.strip_prefix(b"\n")).unwrap_or(rest).to_vec()
 }
 
 #[test]

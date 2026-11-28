@@ -287,6 +287,12 @@ pub fn alloc_slow_with_options<VM: VMBinding>(
     mutator.alloc_slow_with_options(size, align, offset, semantics, options)
 }
 
+/// Whether [`post_alloc`] does nothing for objects allocated in an Immix space
+/// (Immix, StickyImmix default allocation): `ImmixSpace` only sets the
+/// valid-object bit, which exists with the `vo_bit` feature. Bindings use this
+/// to skip the post-alloc call on their inlined allocation fast path.
+pub const IMMIX_POST_ALLOC_IS_NOOP: bool = !cfg!(feature = "vo_bit");
+
 /// Perform post-allocation actions, usually initializing object metadata. For many allocators none are
 /// required. For performance reasons, a VM should implement the post alloc fast-path on their side
 /// rather than just calling this function.
